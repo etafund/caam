@@ -45,3 +45,9 @@ tmp/
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# ntm runtime logs/pids
+.ntm/
+
+# Scratch / working files
+scratch/
