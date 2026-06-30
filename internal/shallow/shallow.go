@@ -821,8 +821,17 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		// assertIsShallowProfile and delete the entire real HOME. Compare BOTH the
 		// lexical-cleaned forms AND the symlink-resolved forms, so a symlink-equivalent
 		// spelling of the real HOME is caught too. (Mirrors Delete's real-HOME guard.)
-		if m.equalsRealHome(home) {
-			return "", fmt.Errorf("refusing to remove %q: it is your real HOME directory", home)
+		if m.wouldRemoveRealHome(home) {
+			return "", fmt.Errorf("refusing to remove %q: it contains your real HOME directory (%q)", home, m.realHome)
+		}
+		// FIX 2: preflight that the real HOME is an existing, readable directory
+		// BEFORE the RemoveAll. populateSymlinks (run after RemoveAll) reads
+		// m.realHome; if it's missing/unreadable, that read fails AFTER the old
+		// profile is gone and the cleanup defer removes the half-built replacement,
+		// leaving the user with NOTHING. Fail here instead, while the old profile
+		// still exists.
+		if err := m.assertRealHomeReadable(); err != nil {
+			return "", err
 		}
 		if err := os.RemoveAll(home); err != nil {
 			return "", fmt.Errorf("remove existing profile: %w", err)
@@ -1150,6 +1159,55 @@ func (m *Manager) provisionCredentials(home string, layout Layout, opts CreateOp
 	return nil
 }
 
+// assertRealHomeReadable verifies that m.realHome is an existing, readable
+// directory. populateSymlinks reads it; on the --force path that read happens
+// AFTER the RemoveAll of the old profile, so a missing/unreadable real HOME
+// would otherwise destroy the old profile and then fail. This is called before
+// any RemoveAll so the failure leaves the existing profile intact.
+func (m *Manager) assertRealHomeReadable() error {
+	st, err := os.Stat(m.realHome)
+	if err != nil {
+		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+	}
+	if !st.IsDir() {
+		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, syscall.ENOTDIR)
+	}
+	f, err := os.Open(m.realHome)
+	if err != nil {
+		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+	}
+	defer f.Close()
+	// Readdirnames(1) proves the directory is actually enumerable (Open can
+	// succeed on a dir whose entries can't be listed). io.EOF means empty-but-
+	// readable, which is fine.
+	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+	}
+	return nil
+}
+
+// allProviderReservedTops returns the top-level real-HOME components reserved by
+// ANY registered provider layout: the slashTop of every layout's RealDirs,
+// RealFiles, and credential DestRels. populateSymlinks unions this into its skip
+// set so a profile NEVER symlinks another provider's auth root back to the real
+// HOME (cross-provider fail-closed — see FIX 3 in populateSymlinks). It iterates
+// `layouts` (the full registry), not just the active layout.
+func allProviderReservedTops() map[string]bool {
+	tops := map[string]bool{}
+	for _, l := range layouts {
+		for _, d := range l.RealDirs {
+			tops[slashTop(d)] = true
+		}
+		for _, f := range l.RealFiles {
+			tops[slashTop(f)] = true
+		}
+		for _, c := range l.Credentials {
+			tops[slashTop(c.DestRel)] = true
+		}
+	}
+	return tops
+}
+
 // populateSymlinks reads top-level entries in realHome and creates a symlink in
 // home for each, skipping names that collide with the layout's real files/dirs,
 // alwaysSkip, and the CAAM-owned roots (vault, base, $CAAM_HOME).
@@ -1168,6 +1226,17 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 	}
 	for k := range alwaysSkip {
 		skip[k] = true
+	}
+	// FIX 3 (cross-provider fail-closed): withhold EVERY registered provider's auth
+	// roots from every profile. Without this, a Claude profile would symlink
+	// .codex -> real ~/.codex (and a Codex profile .claude/.claude.json), so running
+	// the WRONG harness inside a profile (`shallow-spawn alice -- codex` in a Claude
+	// profile) would land on the REAL Codex auth. The ACTIVE layout still MkdirAll's
+	// its own real dirs and writes its managed/credential files (those tops are in
+	// `skip` above and recreated as real); the OTHER providers' tops are simply
+	// ABSENT here — fail-closed.
+	for t := range allProviderReservedTops() {
+		skip[t] = true
 	}
 	// Shadow CAAM-owned roots (the shallow base, $CAAM_HOME, and the vault root)
 	// when they nest under realHome — so no shallow HOME can reach the vault or
@@ -1391,26 +1460,30 @@ func (m *Manager) protectedRoots() []string {
 // would expose the vault, and a symlink to a descendant of the vault would expose
 // vault contents — both are refused.
 func (m *Manager) isProtectedSource(absSource string) bool {
+	roots := m.protectedRoots() // FIX 4: compute once, reuse for every loop below
 	src := filepath.Clean(absSource)
 	if c, err := resolveExistingSymlinks(absSource); err == nil {
 		c = filepath.Clean(c)
-		for _, root := range m.protectedRoots() {
+		for _, root := range roots {
 			if pathRelatedOrEqual(c, root) {
 				return true
 			}
 		}
 	}
-	for _, root := range m.protectedRoots() {
+	for _, root := range roots {
 		if pathRelatedOrEqual(src, root) {
 			return true
 		}
 	}
 	// Inode/device fallback for EXISTING paths: a case-insensitive-FS or
 	// symlink-equivalent spelling of (or path under) a protected root would evade
-	// the lexical pathRelatedOrEqual checks above. Catch a source that IS, or sits
-	// under, the same dir as a protected root regardless of spelling.
-	for _, root := range m.protectedRoots() {
-		if sameFileOrUnderExisting(src, root) {
+	// the lexical pathRelatedOrEqual checks above. Check BOTH directions (FIX 4):
+	// src is/under root (a symlink INTO the vault), AND root is/under src (src
+	// physically CONTAINS a protected root — e.g. a real-home entry that is an
+	// ancestor of the vault via a symlink alias — which a case-insensitive lexical
+	// check can miss).
+	for _, root := range roots {
+		if sameFileOrUnderExisting(src, root) || sameFileOrUnderExisting(root, src) {
 			return true
 		}
 	}
@@ -1426,14 +1499,14 @@ func (m *Manager) isProtectedSource(absSource string) bool {
 				target = filepath.Join(filepath.Dir(absSource), target)
 			}
 			target = filepath.Clean(target)
-			for _, root := range m.protectedRoots() {
+			for _, root := range roots {
 				if pathRelatedOrEqual(target, root) {
 					return true
 				}
 			}
 			if c, err := resolveExistingSymlinks(target); err == nil {
 				c = filepath.Clean(c)
-				for _, root := range m.protectedRoots() {
+				for _, root := range roots {
 					if pathRelatedOrEqual(c, root) {
 						return true
 					}
@@ -1767,6 +1840,56 @@ func (m *Manager) equalsRealHome(home string) bool {
 	return false
 }
 
+// wouldRemoveRealHome reports whether a RemoveAll(home) would delete the user's
+// real HOME directory — either because home IS the real HOME, OR because home is
+// an ANCESTOR of it (so the real HOME would be removed as a descendant). Unlike
+// equalsRealHome (exact equality only), this is the CONTAINMENT guard the
+// destructive ops (Delete / --force RemoveAll) must use: RemoveAll(home) is
+// equally catastrophic when home contains the real HOME as when it equals it.
+//
+// It checks containment three ways: lexical (pathEqualOrUnder on the cleaned
+// absolute forms), symlink-resolved (the same check on both resolved forms), and
+// an existing-path inode walk (sameFileOrUnderExisting: is realHome at/under home
+// regardless of spelling/casing). Any match → true.
+func (m *Manager) wouldRemoveRealHome(home string) bool {
+	abs, err := filepath.Abs(home)
+	if err != nil {
+		return false
+	}
+	homeClean := filepath.Clean(abs)
+	realClean := filepath.Clean(m.realHome)
+
+	// Lexical: realHome equals or is under home.
+	if pathEqualOrUnder(realClean, homeClean) {
+		return true
+	}
+	// Symlink-resolved forms (so a symlink-equivalent spelling of either side is
+	// caught): compare each resolved form against the other's lexical AND resolved.
+	homeResolved, homeOK := "", false
+	if c, err := resolveExistingSymlinks(homeClean); err == nil {
+		homeResolved, homeOK = filepath.Clean(c), true
+	}
+	realResolved, realOK := "", false
+	if c, err := resolveExistingSymlinks(realClean); err == nil {
+		realResolved, realOK = filepath.Clean(c), true
+	}
+	if homeOK && pathEqualOrUnder(realClean, homeResolved) {
+		return true
+	}
+	if realOK && pathEqualOrUnder(realResolved, homeClean) {
+		return true
+	}
+	if homeOK && realOK && pathEqualOrUnder(realResolved, homeResolved) {
+		return true
+	}
+	// Existing-path inode walk: is realHome the same dir as, or under, home —
+	// regardless of spelling/casing.
+	if sameFileOrUnderExisting(m.realHome, home) {
+		return true
+	}
+	return false
+}
+
 // Delete removes a shallow profile and all its files. It is safe even if the
 // directory contains symlinks: os.RemoveAll never traverses them. A symlinked
 // profile path is rejected, and only a genuine shallow profile (real sidecar) is
@@ -1786,10 +1909,12 @@ func (m *Manager) Delete(name string) error {
 	if !st.IsDir() {
 		return fmt.Errorf("%s is not a directory", home)
 	}
-	// Sanity guard: never delete the user's real HOME by accident.
-	if m.equalsRealHome(home) {
+	// Sanity guard: never delete the user's real HOME by accident — including the
+	// case where home is an ANCESTOR of the real HOME (RemoveAll would nuke real
+	// HOME as a descendant), not just exact equality.
+	if m.wouldRemoveRealHome(home) {
 		abs, _ := filepath.Abs(home)
-		return fmt.Errorf("refusing to delete real HOME (%s)", abs)
+		return fmt.Errorf("refusing to remove %q: it contains your real HOME directory (%q)", abs, m.realHome)
 	}
 	// Only ever RemoveAll a genuine shallow profile (real .caam-shallow.json), so a
 	// symlinked base ANCESTOR (a symlinked leaf is already refused at NewManager)

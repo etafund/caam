@@ -2285,3 +2285,201 @@ func TestInsideProfileCheckUsesSameFile(t *testing.T) {
 		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
 	}
 }
+
+// ancestorOfRealHomeManager builds a Manager whose profile target ("home") is an
+// ANCESTOR of the real HOME, and seeds that target so it looks like a genuine
+// shallow profile (real .caam-shallow.json sidecar). RemoveAll(target) would nuke
+// the real HOME living beneath it. It returns the manager, the profile name (so a
+// HomeFor(name) lands on the ancestor), the real HOME, and a sentinel file path
+// under the real HOME that must survive. (FIX 1)
+func ancestorOfRealHomeManager(t *testing.T) (mgr *Manager, name, realHome, sentinel string) {
+	t.Helper()
+	tree := t.TempDir()
+	base := filepath.Join(tree, "base") // baseDir != realHome and unrelated
+	target := filepath.Join(base, "home")
+	realHome = filepath.Join(target, "subhome") // real HOME is UNDER the profile target
+
+	if err := os.MkdirAll(realHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Seed real HOME with a sentinel that must survive a refused destructive op.
+	sentinel = filepath.Join(realHome, ".bashrc")
+	if err := os.WriteFile(sentinel, []byte("# real shell\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Make `target` look like a genuine shallow profile so assertIsShallowProfile
+	// passes and the destructive path is actually reached (the guard must fire even
+	// for a real-looking profile).
+	if err := os.WriteFile(filepath.Join(target, ProfileMetaFilename), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m, err := NewManager(base, realHome)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return m, "home", realHome, sentinel
+}
+
+// FIX 1: a --force Create whose target CONTAINS the real HOME must refuse before
+// any RemoveAll, leaving the real HOME (and its sentinel) intact.
+func TestForceRefusesToRemoveAncestorOfRealHome(t *testing.T) {
+	mgr, name, _, sentinel := ancestorOfRealHomeManager(t)
+	_, err := mgr.Create(name, CreateOptions{Provider: "claude", Force: true})
+	if err == nil {
+		t.Fatalf("--force Create should refuse to remove an ancestor of the real HOME")
+	}
+	if !strings.Contains(err.Error(), "contains your real HOME") {
+		t.Fatalf("error %q should mention containing the real HOME", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("real HOME sentinel must survive a refused --force: %v", err)
+	}
+}
+
+// FIX 1: Delete of a profile whose path CONTAINS the real HOME must refuse,
+// leaving the real HOME (and its sentinel) intact.
+func TestDeleteRefusesToRemoveAncestorOfRealHome(t *testing.T) {
+	mgr, name, _, sentinel := ancestorOfRealHomeManager(t)
+	err := mgr.Delete(name)
+	if err == nil {
+		t.Fatalf("Delete should refuse to remove an ancestor of the real HOME")
+	}
+	if !strings.Contains(err.Error(), "contains your real HOME") {
+		t.Fatalf("error %q should mention containing the real HOME", err)
+	}
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("real HOME sentinel must survive a refused Delete: %v", err)
+	}
+}
+
+// FIX 2: when the real HOME is unreadable at --force time, Create must fail
+// BEFORE the RemoveAll so the existing profile survives (populateSymlinks reads
+// the real HOME only AFTER the RemoveAll, too late to recover).
+func TestForcePreflightUnreadableRealHome(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	// Create a real profile first.
+	src := credSource(t, `{"v":1}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src}); err != nil {
+		t.Fatalf("initial Create: %v", err)
+	}
+	aliceCred, err := mgr.CredentialPath("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("read alice cred: %v", err)
+	}
+
+	// Now make the real HOME unreadable by pointing the manager at a non-existent
+	// path (NewManager validated a real home; we mutate the field for the test).
+	mgr.realHome = filepath.Join(t.TempDir(), "gone")
+
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", Force: true, CredentialSource: src}); err == nil {
+		t.Fatalf("--force Create should fail when the real HOME is unreadable")
+	} else if !strings.Contains(err.Error(), "cannot read real HOME") {
+		t.Fatalf("error %q should mention an unreadable real HOME", err)
+	}
+
+	// The existing profile must survive (the RemoveAll never happened).
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a refused unreadable-real-HOME --force: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 3: a Claude profile must NOT symlink the real ~/.codex (cross-provider
+// fail-closed) — .claude is real, .codex is absent. Running `codex` inside the
+// profile finds no auth rather than the REAL Codex auth.
+func TestClaudeProfileWithholdsCodexAuth(t *testing.T) {
+	home := fakeHome(t) // seeds both ~/.claude and ~/.codex
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"c":1}`)})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Own provider's auth root is real.
+	assertRealDir(t, filepath.Join(got, ".claude"))
+	assertRealFilePerm(t, filepath.Join(got, ".claude", ".credentials.json"), 0o600)
+	// The OTHER provider's auth root is absent (not a symlink to real ~/.codex).
+	assertAbsent(t, filepath.Join(got, ".codex"))
+}
+
+// FIX 3: a Codex profile must NOT symlink the real ~/.claude or ~/.claude.json —
+// .codex is real, both Claude auth roots are absent.
+func TestCodexProfileWithholdsClaudeAuth(t *testing.T) {
+	home := fakeHome(t) // seeds both ~/.claude(.json) and ~/.codex
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialSource: credSource(t, `{"x":1}`)})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// Own provider's auth root is real.
+	assertRealDir(t, filepath.Join(got, ".codex"))
+	assertRealFilePerm(t, filepath.Join(got, ".codex", "auth.json"), 0o600)
+	// The OTHER provider's auth roots are absent.
+	assertAbsent(t, filepath.Join(got, ".claude"))
+	assertAbsent(t, filepath.Join(got, ".claude.json"))
+}
+
+// FIX 4: isProtectedSource must refuse a real-HOME source that physically
+// CONTAINS a protected root (the vault sits under it), via the new bidirectional
+// inode walk (sameFileOrUnderExisting in BOTH directions).
+//
+// JUDGMENT CALL: the new src-CONTAINS-root direction is only STRICTLY required to
+// add coverage on a CASE-INSENSITIVE filesystem (or hardlinked dir), neither of
+// which is portably constructible on a case-sensitive Linux tmpfs: there,
+// EvalSymlinks canonicalizes every alias to the same physical path, so the
+// existing lexical loops over protectedRoots() (which include the resolved root
+// form) already catch any genuine physical containment. So the end-to-end
+// isProtectedSource assertion below is belt-and-suspenders on this platform; the
+// LOAD-BEARING part of this test is the two direct sameFileOrUnderExisting
+// assertions that pin the directional semantics the fix's `|| ...(root, src)`
+// relies on. (A regression that broke EITHER direction's semantics fails here.)
+//
+// Construction:
+//   - ~/container is a REAL dir; the vault lives at ~/container/caam.
+//   - vaultRoot is set to ~/vlink/caam where ~/vlink -> ~/container.
+//   - src := the REAL ~/container — it physically contains the vault.
+func TestIsProtectedSourceBidirectionalSameFile(t *testing.T) {
+	home := fakeHome(t)
+	container := filepath.Join(home, "container")
+	if err := os.MkdirAll(filepath.Join(container, "caam"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// vlink -> container, so the aliased vault spelling differs lexically.
+	vlink := filepath.Join(home, "vlink")
+	if err := os.Symlink(container, vlink); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newMgr(t, home)
+	mgr.SetVaultRoot(filepath.Join(vlink, "caam")) // ~/vlink/caam
+
+	// Direct helper assertions (portable, no spelling assumptions):
+	//   - root (real vault) IS under src (container) → the NEW direction is true.
+	//   - src (container) is NOT under root          → the OLD direction is false.
+	realVault := filepath.Join(container, "caam")
+	if !sameFileOrUnderExisting(realVault, container) {
+		t.Fatalf("vault must be reported as under the container (root-under-src)")
+	}
+	if sameFileOrUnderExisting(container, realVault) {
+		t.Fatalf("container must NOT be reported as under the vault (src-under-root)")
+	}
+
+	// End-to-end: isProtectedSource must refuse the container source.
+	if !mgr.isProtectedSource(container) {
+		t.Fatalf("isProtectedSource must refuse a source that physically contains the vault")
+	}
+	// Sanity: an unrelated real-HOME entry is NOT protected.
+	if mgr.isProtectedSource(filepath.Join(home, ".bashrc")) {
+		t.Fatalf("an unrelated source must not be protected")
+	}
+}
