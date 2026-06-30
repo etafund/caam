@@ -829,12 +829,15 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		// created under; if that differs from the current m.realHome, the destructive
 		// RemoveAll + rebuild would be operating on another HOME's profile. Load the
 		// meta via the same sidecar assertIsShallowProfile just validated and refuse on
-		// mismatch BEFORE the RemoveAll. (A malformed/unreadable sidecar leaves the old
-		// behavior; assertIsShallowProfile already proved a real sidecar file exists.)
-		if meta, err := readMeta(home); err == nil {
-			if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
-				return "", err
-			}
+		// mismatch BEFORE the RemoveAll. Fail closed: a present-but-unreadable sidecar
+		// means we cannot verify HOME ownership, so refuse to --force-overwrite rather
+		// than risk destroying another HOME's data.
+		meta, merr := readMeta(home)
+		if merr != nil {
+			return "", fmt.Errorf("shallow profile %q has unreadable metadata (%w); refusing to overwrite — remove %q manually if you intend to replace it", name, merr, home)
+		}
+		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+			return "", err
 		}
 		// preflight that the real HOME is an existing, readable directory
 		// BEFORE the RemoveAll. populateSymlinks (run after RemoveAll) reads
@@ -1803,10 +1806,14 @@ func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
 	// here, so this stops a harness being spawned into a profile that was built for
 	// a DIFFERENT $HOME (its symlink farm points back at the OTHER HOME's real
 	// files). A correctly-created profile records the matching RealHome → no-op.
-	if meta, err := readMeta(home); err == nil {
-		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
-			return err
-		}
+	// Fail closed: a present-but-unreadable sidecar can't be verified, so refuse
+	// (spawn/doctor must not run a harness against an unverifiable profile).
+	meta, merr := readMeta(home)
+	if merr != nil {
+		return fmt.Errorf("shallow profile %q has unreadable metadata (%w); recreate it", name, merr)
+	}
+	if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+		return err
 	}
 
 	// FIX 2: reject stale/compromised FOREIGN provider auth roots. populateSymlinks

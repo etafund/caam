@@ -652,6 +652,36 @@ func newMgr(t *testing.T, home string) *Manager {
 	return mgr
 }
 
+// TestDestructiveAndSpawnRefuseUnreadableMetadata verifies the fail-closed
+// behavior: a profile whose sidecar exists but is unparseable cannot be
+// --force-overwritten or spawned/validated (HOME ownership is unverifiable), and
+// the refused --force does not destroy the existing profile.
+func TestDestructiveAndSpawnRefuseUnreadableMetadata(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"claudeAiOauth":{"accessToken":"x"}}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	if err := os.WriteFile(filepath.Join(aliceHome, ProfileMetaFilename), []byte("not json{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src, Force: true}); err == nil || !strings.Contains(err.Error(), "unreadable metadata") {
+		t.Fatalf("expected --force to refuse unreadable metadata, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(aliceHome, ".claude", ".credentials.json")); err != nil {
+		t.Fatalf("profile must survive a refused --force: %v", err)
+	}
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateProfileShape("alice", layout); err == nil || !strings.Contains(err.Error(), "unreadable metadata") {
+		t.Fatalf("expected ValidateProfileShape to refuse unreadable metadata, got %v", err)
+	}
+}
+
 // rewriteRecordedRealHome rewrites the real_home field in an existing profile's
 // metadata sidecar to realHome (preserving the other fields it can read). Used to
 // simulate a profile created under a DIFFERENT HOME, or to keep a profile's
