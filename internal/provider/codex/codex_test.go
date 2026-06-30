@@ -5,12 +5,56 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
 )
+
+// TestEnsureFileCredentialStoreSingleQuoted verifies the broadened regex rewrites a
+// single-quoted cli_auth_credentials_store value in place (rather than appending a
+// duplicate bare key, which is invalid TOML), preserves unrelated keys, and yields
+// exactly one occurrence set to "file". Also covers the double-quoted, missing-key,
+// and already-"file" cases.
+func TestEnsureFileCredentialStoreSingleQuoted(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+	}{
+		{"single-quoted other value", "model = \"gpt-5\"\ncli_auth_credentials_store = 'keyring'\n"},
+		{"double-quoted other value", "model = \"gpt-5\"\ncli_auth_credentials_store = \"keyring\"\n"},
+		{"missing key", "model = \"gpt-5\"\n"},
+		{"already file", "model = \"gpt-5\"\ncli_auth_credentials_store = \"file\"\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := filepath.Join(dir, "config.toml")
+			if err := os.WriteFile(cfg, []byte(tc.in), 0o600); err != nil {
+				t.Fatalf("seed config: %v", err)
+			}
+			if err := EnsureFileCredentialStore(dir); err != nil {
+				t.Fatalf("EnsureFileCredentialStore: %v", err)
+			}
+			data, err := os.ReadFile(cfg)
+			if err != nil {
+				t.Fatalf("read config: %v", err)
+			}
+			got := string(data)
+			if n := strings.Count(got, "cli_auth_credentials_store"); n != 1 {
+				t.Fatalf("expected exactly one cli_auth_credentials_store, got %d:\n%s", n, got)
+			}
+			if !strings.Contains(got, `cli_auth_credentials_store = "file"`) {
+				t.Fatalf("expected the store set to \"file\", got:\n%s", got)
+			}
+			if !strings.Contains(got, `model = "gpt-5"`) {
+				t.Fatalf("expected model key preserved, got:\n%s", got)
+			}
+		})
+	}
+}
 
 // =============================================================================
 // Provider Factory Tests
@@ -576,7 +620,6 @@ func TestFullProfileLifecycle(t *testing.T) {
 		t.Error("should not be logged in after logout")
 	}
 }
-
 
 // =============================================================================
 // DetectExistingAuth Tests

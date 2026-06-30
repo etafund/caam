@@ -1,6 +1,7 @@
 package shallow
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,7 +9,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+
+	authfile "github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 )
 
 // fakeHome lays down a realistic-looking real HOME inside t.TempDir() and
@@ -54,6 +58,42 @@ func fakeHome(t *testing.T) string {
 	}
 	if err := os.WriteFile(filepath.Join(claudeDir, ".credentials.json"), []byte(`{"placeholder":true}`), 0o600); err != nil {
 		t.Fatalf("seed .credentials.json: %v", err)
+	}
+
+	// .codex/ structure: the allow-listed shared state (sessions, history.jsonl)
+	// PLUS the runtime/log/state artifacts the allow-list must keep OUT.
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatalf("mkdir .codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "auth.json"), []byte(`{"placeholder":"real-codex"}`), 0o600); err != nil {
+		t.Fatalf("seed .codex/auth.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte("model = \"gpt-5\"\n"), 0o600); err != nil {
+		t.Fatalf("seed .codex/config.toml: %v", err)
+	}
+	// Allow-listed shared state: a sessions/ dir and a history.jsonl file.
+	if err := os.MkdirAll(filepath.Join(codexDir, "sessions"), 0o700); err != nil {
+		t.Fatalf("mkdir .codex/sessions: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "sessions", "marker"), []byte("sessions"), 0o600); err != nil {
+		t.Fatalf("seed .codex/sessions/marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "history.jsonl"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("seed .codex/history.jsonl: %v", err)
+	}
+	// Runtime/log/state artifacts that must NEVER be symlinked (not in the allow-list).
+	for _, d := range []string{"log", "logs", "app-server-daemon", "app-server-control", "run-1234"} {
+		full := filepath.Join(codexDir, d)
+		if err := os.MkdirAll(full, 0o700); err != nil {
+			t.Fatalf("mkdir .codex/%s: %v", d, err)
+		}
+		if err := os.WriteFile(filepath.Join(full, "marker"), []byte(d), 0o600); err != nil {
+			t.Fatalf("seed .codex/%s/marker: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "state.sqlite"), []byte("SQLITE"), 0o600); err != nil {
+		t.Fatalf("seed .codex/state.sqlite: %v", err)
 	}
 	return home
 }
@@ -593,5 +633,826 @@ func TestCreateProducesNoBrokenSymlinks(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("walk: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10 — engine tests
+// ---------------------------------------------------------------------------
+
+// newMgr builds a Manager rooted at a fresh base dir under realHome's sibling
+// tmp, never under realHome itself.
+func newMgr(t *testing.T, home string) *Manager {
+	t.Helper()
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	return mgr
+}
+
+// assertReal fails unless path is a real (non-symlink) regular file with perm.
+func assertRealFilePerm(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	st, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("%s must be a real file, got symlink", path)
+	}
+	if !st.Mode().IsRegular() {
+		t.Fatalf("%s must be a regular file, mode=%v", path, st.Mode())
+	}
+	if st.Mode().Perm() != perm {
+		t.Fatalf("%s perm = %v, want %v", path, st.Mode().Perm(), perm)
+	}
+}
+
+func assertIsSymlink(t *testing.T, path string) {
+	t.Helper()
+	st, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s must be a symlink, mode=%v", path, st.Mode())
+	}
+}
+
+func assertAbsent(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%s must be absent, err=%v", path, err)
+	}
+}
+
+func assertRealDir(t *testing.T, path string) {
+	t.Helper()
+	st, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("lstat %s: %v", path, err)
+	}
+	if st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+		t.Fatalf("%s must be a real directory, mode=%v", path, st.Mode())
+	}
+}
+
+// 1. Claude layout is behavior-preserving under the refactor.
+func TestCreateClaudeLayoutStillWorks(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"claude":"identity"}`)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assertRealDir(t, filepath.Join(got, ".claude"))
+	credDst := filepath.Join(got, ".claude", ".credentials.json")
+	assertRealFilePerm(t, credDst, 0o600)
+	if body, err := os.ReadFile(credDst); err != nil || string(body) != `{"claude":"identity"}` {
+		t.Fatalf("creds = %q err=%v", body, err)
+	}
+	assertRealFilePerm(t, filepath.Join(got, ".claude", ".credentials.lock"), 0o600)
+	assertRealFilePerm(t, filepath.Join(got, ".claude.json"), 0o600)
+	for _, name := range []string{".bashrc", ".ssh", ".config", ".cargo"} {
+		assertIsSymlink(t, filepath.Join(got, name))
+	}
+	assertIsSymlink(t, filepath.Join(got, ".claude", "projects"))
+}
+
+// 2. Codex from a single credential source.
+func TestCreateCodexLayoutFromCredentialSource(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"codex":"token"}`)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialSource: src})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assertRealDir(t, filepath.Join(got, ".codex"))
+	authDst := filepath.Join(got, ".codex", "auth.json")
+	assertRealFilePerm(t, authDst, 0o600)
+	if body, err := os.ReadFile(authDst); err != nil || string(body) != `{"codex":"token"}` {
+		t.Fatalf("auth.json = %q err=%v", body, err)
+	}
+	cfg := filepath.Join(got, ".codex", "config.toml")
+	assertRealFilePerm(t, cfg, 0o600)
+	cfgBody, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+	if !strings.Contains(string(cfgBody), `cli_auth_credentials_store = "file"`) {
+		t.Fatalf("config.toml missing file credential store: %q", cfgBody)
+	}
+	// Allow-listed shared state is symlinked.
+	assertIsSymlink(t, filepath.Join(got, ".codex", "sessions"))
+	assertIsSymlink(t, filepath.Join(got, ".codex", "history.jsonl"))
+	// Runtime/log/state artifacts must be absent (never symlinked).
+	for _, n := range []string{"log", "logs", "app-server-daemon", "app-server-control", "run-1234", "state.sqlite"} {
+		assertAbsent(t, filepath.Join(got, ".codex", n))
+	}
+}
+
+// 3. Codex writes a FRESH minimal config — not a copy of the real one.
+func TestCreateCodexLayoutWritesFreshMinimalConfig(t *testing.T) {
+	home := fakeHome(t)
+	// Real config carries keys that must NOT leak.
+	realCfg := filepath.Join(home, ".codex", "config.toml")
+	if err := os.WriteFile(realCfg, []byte("model = \"gpt-5\"\nlog_dir = \"/abs/real/log\"\nsqlite_home = \"/abs/real/sqlite\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"codex":"token"}`)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialSource: src})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cfg := filepath.Join(got, ".codex", "config.toml")
+	assertRealFilePerm(t, cfg, 0o600)
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+	s := string(body)
+	if strings.Count(s, "cli_auth_credentials_store") != 1 {
+		t.Fatalf("expected exactly one cli_auth_credentials_store, got %q", s)
+	}
+	if !strings.Contains(s, `cli_auth_credentials_store = "file"`) {
+		t.Fatalf("missing file store directive: %q", s)
+	}
+	for _, leaked := range []string{"model", "log_dir", "sqlite_home"} {
+		if strings.Contains(s, leaked) {
+			t.Fatalf("config.toml leaked copied key %q: %q", leaked, s)
+		}
+	}
+}
+
+// 5. Codex with no credential source → empty real 0600 auth.json.
+func TestCreateCodexLayoutEmptyAuth(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	authDst := filepath.Join(got, ".codex", "auth.json")
+	assertRealFilePerm(t, authDst, 0o600)
+	if body, err := os.ReadFile(authDst); err != nil || len(body) != 0 {
+		t.Fatalf("expected empty auth.json, got %q err=%v", body, err)
+	}
+}
+
+// 6. Metadata records provider + Version 2 + descriptive fields.
+func TestMetaRecordsProvider(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialFromLabel: "vault:codex/alice"}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	meta, err := readMeta(filepath.Join(mgr.BaseDir(), "alice"))
+	if err != nil {
+		t.Fatalf("readMeta: %v", err)
+	}
+	if meta.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", meta.Provider)
+	}
+	if meta.Version != 2 {
+		t.Fatalf("version = %d, want 2", meta.Version)
+	}
+	if meta.CredentialFrom != "vault:codex/alice" {
+		t.Fatalf("credential_from = %q", meta.CredentialFrom)
+	}
+	if meta.RealHome != home {
+		t.Fatalf("real_home = %q, want %q", meta.RealHome, home)
+	}
+}
+
+// 7. CredentialPath/LayoutForProvider are strict on malformed metadata; List
+// still returns the profile (listable/deletable), with Provider verbatim.
+func TestCredentialPathStrictOnMalformedMeta(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	// Profile with NO provider in meta.
+	noProv, err := mgr.Create("noprov", CreateOptions{Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(noProv, ProfileMetaFilename),
+		[]byte(`{"name":"noprov","real_home":"`+home+`","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Profile with an UNKNOWN provider ("codx").
+	badProv, err := mgr.Create("badprov", CreateOptions{Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(badProv, ProfileMetaFilename),
+		[]byte(`{"name":"badprov","provider":"codx","real_home":"`+home+`","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mgr.CredentialPath("noprov"); err == nil {
+		t.Fatalf("CredentialPath should error on missing provider")
+	}
+	if _, err := mgr.CredentialPath("badprov"); err == nil {
+		t.Fatalf("CredentialPath should error on unknown provider")
+	}
+	if _, err := LayoutForProvider(""); err == nil {
+		t.Fatalf("LayoutForProvider(\"\") should error")
+	}
+	if _, err := LayoutForProvider("codx"); err == nil {
+		t.Fatalf("LayoutForProvider(\"codx\") should error")
+	}
+
+	// Both profiles still listable with verbatim provider.
+	profs, err := mgr.List()
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	got := map[string]string{}
+	for _, p := range profs {
+		if p.Meta != nil {
+			got[p.Name] = p.Meta.Provider
+		} else {
+			got[p.Name] = "<nil-meta>"
+		}
+	}
+	if got["noprov"] != "" {
+		t.Fatalf("noprov provider = %q, want empty verbatim", got["noprov"])
+	}
+	if got["badprov"] != "codx" {
+		t.Fatalf("badprov provider = %q, want codx verbatim", got["badprov"])
+	}
+}
+
+// 8. Unsupported provider is rejected with the supported-set message.
+func TestCreateRejectsUnsupportedProvider(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	_, err := mgr.Create("alice", CreateOptions{Provider: "gemini"})
+	if err == nil {
+		t.Fatalf("expected error for unsupported provider")
+	}
+	if !strings.Contains(err.Error(), `unsupported shallow provider "gemini"`) ||
+		!strings.Contains(err.Error(), "claude, codex") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// 9. SourceClaudeJSON for a non-claude provider is rejected.
+func TestCreateRejectsClaudeJSONForNonClaude(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{}`)
+	_, err := mgr.Create("alice", CreateOptions{Provider: "codex", SourceClaudeJSON: src})
+	if err == nil || !strings.Contains(err.Error(), "only valid for provider claude") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// 10. CredentialSource and CredentialSourceDir together are rejected.
+func TestCreateRejectsBothSources(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	f := credSource(t, `{}`)
+	d := t.TempDir()
+	_, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialSource: f, CredentialSourceDir: d})
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+// 11. No broken symlinks for a codex profile.
+func TestCreateProducesNoBrokenSymlinksForCodex(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = filepath.WalkDir(got, func(p string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		target, err := os.Readlink(p)
+		if err != nil {
+			return err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(p), target)
+		}
+		if _, err := os.Stat(target); err != nil {
+			return fmt.Errorf("broken symlink %s -> %s: %w", p, target, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+}
+
+// 12. Mid-create failure cleans up; a later create of the same name succeeds.
+func TestCreateCleansUpOnError(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	// Vault dir missing the required auth.json → provisionCredentials fails.
+	emptyVault := t.TempDir()
+	_, err := mgr.Create("alice", CreateOptions{
+		Provider:            "codex",
+		CredentialSourceDir: emptyVault,
+		CredentialFromLabel: "vault:codex/alice",
+	})
+	if err == nil {
+		t.Fatalf("expected create to fail with missing auth.json")
+	}
+	// No leftover profile dir.
+	if _, err := os.Lstat(filepath.Join(mgr.BaseDir(), "alice")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("half-built profile dir was not removed, err=%v", err)
+	}
+	// A later non-force create succeeds.
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "codex"}); err != nil {
+		t.Fatalf("subsequent create should succeed: %v", err)
+	}
+}
+
+// 13a. Creating profiles never mutates the real ~/ credential files.
+func TestRealHomeUntouched(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	claudeReal := filepath.Join(home, ".claude", ".credentials.json")
+	codexReal := filepath.Join(home, ".codex", "auth.json")
+	claudeBefore, err := os.ReadFile(claudeReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexBefore, err := os.ReadFile(codexReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mgr.Create("c", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"x":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Create("x", CreateOptions{Provider: "codex", CredentialSource: credSource(t, `{"y":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+
+	claudeAfter, err := os.ReadFile(claudeReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexAfter, err := os.ReadFile(codexReal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(claudeBefore, claudeAfter) {
+		t.Fatalf("real ~/.claude/.credentials.json mutated")
+	}
+	if !bytes.Equal(codexBefore, codexAfter) {
+		t.Fatalf("real ~/.codex/auth.json mutated")
+	}
+}
+
+// 13b. Two codex profiles get independent real auth files.
+func TestCredentialsAreIndependentRealFiles(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"identity":"original"}`)
+	for _, n := range []string{"alice", "bob"} {
+		if _, err := mgr.Create(n, CreateOptions{Provider: "codex", CredentialSource: src}); err != nil {
+			t.Fatalf("Create %s: %v", n, err)
+		}
+	}
+	aliceAuth, _ := mgr.CredentialPath("alice")
+	bobAuth, _ := mgr.CredentialPath("bob")
+	assertRealFilePerm(t, aliceAuth, 0o600)
+	assertRealFilePerm(t, bobAuth, 0o600)
+	realAuth := filepath.Join(home, ".codex", "auth.json")
+
+	if err := os.WriteFile(aliceAuth, []byte(`{"identity":"alice-rotated"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(bobAuth); err != nil || string(body) != `{"identity":"original"}` {
+		t.Fatalf("bob auth drifted: %q err=%v", body, err)
+	}
+	if body, err := os.ReadFile(realAuth); err != nil || string(body) != `{"placeholder":"real-codex"}` {
+		t.Fatalf("real codex auth drifted: %q err=%v", body, err)
+	}
+}
+
+// 13c. No credential dest has a symlinked ancestor inside the profile.
+func TestNoRealFileEscapesViaSymlinkedParent(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	for _, prov := range []string{"claude", "codex"} {
+		got, err := mgr.Create(prov+"p", CreateOptions{Provider: prov})
+		if err != nil {
+			t.Fatalf("Create %s: %v", prov, err)
+		}
+		layout, err := LayoutForProvider(prov)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range layout.Credentials {
+			dst := filepath.Join(got, filepath.FromSlash(c.DestRel))
+			if err := assertNoSymlinkAncestor(got, dst); err != nil {
+				t.Fatalf("%s cred %s has symlinked ancestor: %v", prov, c.DestRel, err)
+			}
+		}
+	}
+}
+
+// 14. Concurrent create of N distinct profiles → each well-formed + distinct.
+func TestConcurrentCreateDistinctProfiles(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	const N = 8
+	var wg sync.WaitGroup
+	errs := make([]error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			src := credSource(t, fmt.Sprintf(`{"id":%d}`, i))
+			_, err := mgr.Create(fmt.Sprintf("p%d", i), CreateOptions{Provider: "codex", CredentialSource: src})
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent create p%d: %v", i, err)
+		}
+	}
+	seen := map[string]bool{}
+	for i := 0; i < N; i++ {
+		name := fmt.Sprintf("p%d", i)
+		authDst := filepath.Join(mgr.BaseDir(), name, ".codex", "auth.json")
+		assertRealFilePerm(t, authDst, 0o600)
+		meta, err := readMeta(filepath.Join(mgr.BaseDir(), name))
+		if err != nil || meta.Provider != "codex" || meta.Version != 2 {
+			t.Fatalf("%s meta malformed: %+v err=%v", name, meta, err)
+		}
+		body, err := os.ReadFile(authDst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if seen[string(body)] {
+			t.Fatalf("%s credential not distinct: %q", name, body)
+		}
+		seen[string(body)] = true
+	}
+}
+
+// nestedTestLayout is a test-only layout shaped like Antigravity, used to drive
+// the unexported helpers directly (Manager.Create only accepts registered ids).
+func nestedTestLayout() Layout {
+	return Layout{
+		Provider:   "agytest",
+		DefaultBin: "agytest",
+		RealDirs:   []string{".gemini", ".gemini/antigravity-cli"},
+		Credentials: []AuthFile{
+			{VaultName: "token", DestRel: ".gemini/antigravity-cli/token", Primary: true, Required: true},
+		},
+		InnerSymlinkRoots: []string{".gemini", ".gemini/antigravity-cli"},
+	}
+}
+
+// 15. Nested real-dir layout exercised via the unexported helpers.
+func TestNestedRealDirLayoutWalk(t *testing.T) {
+	home := t.TempDir()
+	// A fake ~/.gemini with extra children + a nested antigravity-cli dir.
+	gem := filepath.Join(home, ".gemini")
+	if err := os.MkdirAll(filepath.Join(gem, "antigravity-cli"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"oauth_creds.json", "google_accounts.json", "settings-gemini.json"} {
+		if err := os.WriteFile(filepath.Join(gem, f), []byte(f), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// extra children under the nested dir
+	if err := os.WriteFile(filepath.Join(gem, "antigravity-cli", "settings.json"), []byte("inner"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newMgr(t, home)
+	layout := nestedTestLayout()
+	profHome := filepath.Join(mgr.BaseDir(), "agy1")
+	for _, d := range layout.RealDirs {
+		if err := os.MkdirAll(filepath.Join(profHome, filepath.FromSlash(d)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := mgr.populateSymlinks(profHome, layout); err != nil {
+		t.Fatalf("populateSymlinks: %v", err)
+	}
+	for _, root := range layout.InnerSymlinkRoots {
+		if err := mgr.populateInnerSymlinks(profHome, layout, root); err != nil {
+			t.Fatalf("populateInnerSymlinks %s: %v", root, err)
+		}
+	}
+	tok := credSource(t, `{"token":"abc"}`)
+	if err := mgr.provisionCredentials(profHome, layout, CreateOptions{CredentialSource: tok}); err != nil {
+		t.Fatalf("provisionCredentials: %v", err)
+	}
+
+	// Both real dirs stay real.
+	assertRealDir(t, filepath.Join(profHome, ".gemini"))
+	assertRealDir(t, filepath.Join(profHome, ".gemini", "antigravity-cli"))
+	// Nested real dir is skipped (not symlinked) when inner-linking .gemini.
+	antiSt, err := os.Lstat(filepath.Join(profHome, ".gemini", "antigravity-cli"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if antiSt.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf(".gemini/antigravity-cli must NOT be a symlink")
+	}
+	// Token is a real file.
+	assertRealFilePerm(t, filepath.Join(profHome, ".gemini", "antigravity-cli", "token"), 0o600)
+	// Unrelated .gemini/* children are symlinks.
+	for _, f := range []string{"oauth_creds.json", "google_accounts.json", "settings-gemini.json"} {
+		assertIsSymlink(t, filepath.Join(profHome, ".gemini", f))
+	}
+	// Unrelated nested child is symlinked too.
+	assertIsSymlink(t, filepath.Join(profHome, ".gemini", "antigravity-cli", "settings.json"))
+}
+
+// 16. validateLayout rejects bad descriptors; mustBuildLayouts panics on bad.
+func TestValidateLayoutRejectsBadDescriptors(t *testing.T) {
+	good := func() Layout {
+		return Layout{
+			Provider:          "good",
+			DefaultBin:        "good",
+			RealDirs:          []string{".g", ".g/sub"},
+			Credentials:       []AuthFile{{VaultName: "tok", DestRel: ".g/sub/tok", Primary: true, Required: true}},
+			InnerSymlinkRoots: []string{".g"},
+		}
+	}
+	if err := validateLayout(good()); err != nil {
+		t.Fatalf("baseline good layout should validate: %v", err)
+	}
+
+	cases := map[string]func(l *Layout){
+		"nested cred parent not RealDir": func(l *Layout) {
+			l.RealDirs = []string{".g"} // drop .g/sub so cred parent isn't a RealDir
+		},
+		"two primaries": func(l *Layout) {
+			l.Credentials = append(l.Credentials, AuthFile{VaultName: "t2", DestRel: ".g/sub/t2", Primary: true, Required: true})
+		},
+		"zero primaries": func(l *Layout) {
+			l.Credentials = []AuthFile{{VaultName: "tok", DestRel: ".g/sub/tok", Required: true}}
+		},
+		"root not RealDir": func(l *Layout) {
+			l.InnerSymlinkRoots = []string{".notreal"}
+		},
+		"both skip and allow": func(l *Layout) {
+			l.InnerSkip = map[string][]string{".g": {"a"}}
+			l.InnerSymlinkAllow = map[string][]string{".g": {"b"}}
+		},
+		"absolute path real dir": func(l *Layout) {
+			l.RealDirs = append(l.RealDirs, "/abs")
+		},
+		"dotdot path real dir": func(l *Layout) {
+			l.RealDirs = append(l.RealDirs, "../escape")
+		},
+		"inner root with no real dirs": func(l *Layout) {
+			// .g is an InnerSymlinkRoot but no longer a RealDir.
+			l.RealDirs = []string{".g/sub"}
+		},
+		"bad vault name": func(l *Layout) {
+			l.Credentials = []AuthFile{{VaultName: "../evil", DestRel: ".g/sub/tok", Primary: true, Required: true}}
+		},
+	}
+	for name, mut := range cases {
+		l := good()
+		mut(&l)
+		if err := validateLayout(l); err == nil {
+			t.Errorf("expected validateLayout error for %q", name)
+		}
+	}
+
+	// mustBuildLayouts panics on a bad descriptor.
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("mustBuildLayouts should panic on a bad layout")
+			}
+		}()
+		bad := good()
+		bad.Credentials = nil // zero primaries
+		_ = mustBuildLayouts(bad)
+	}()
+}
+
+// 17. base-dir with a `..`-prefix child name is not symlinked into the profile.
+func TestBaseDirNestingGuardDotDotPrefix(t *testing.T) {
+	home := fakeHome(t)
+	base := filepath.Join(home, "..orch-homes")
+	if err := os.MkdirAll(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(base, home)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	got, err := mgr.Create("alice", CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertAbsent(t, filepath.Join(got, "..orch-homes"))
+}
+
+// 18. Symlinked-base aliasing: (a) base symlink → realHome rejected; (b) base
+// symlink → a second real dir is honored, never the alias target.
+func TestRejectsSymlinkedBaseAliasingRealHome(t *testing.T) {
+	// (a) base symlink whose target IS realHome.
+	realHome := fakeHome(t)
+	aliasDir := t.TempDir()
+	aliasA := filepath.Join(aliasDir, "alias-a")
+	if err := os.Symlink(realHome, aliasA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewManager(aliasA, realHome); err == nil {
+		t.Fatalf("NewManager should reject a base symlink targeting realHome")
+	}
+
+	// (b) base symlink to a SECOND real dir (not realHome).
+	secondReal := filepath.Join(t.TempDir(), "second")
+	if err := os.MkdirAll(secondReal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasB := filepath.Join(aliasDir, "alias-b")
+	if err := os.Symlink(secondReal, aliasB); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(aliasB, realHome)
+	if err != nil {
+		t.Fatalf("NewManager via second-dir alias should succeed: %v", err)
+	}
+	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
+		t.Fatalf("Create via alias: %v", err)
+	}
+	// The profile is created inside the SECOND real dir, not the alias target.
+	if _, err := os.Lstat(filepath.Join(secondReal, "alice", ProfileMetaFilename)); err != nil {
+		t.Fatalf("profile should live in second real dir: %v", err)
+	}
+	if _, err := mgr.Create("alice", CreateOptions{Force: true}); err != nil {
+		t.Fatalf("force overwrite: %v", err)
+	}
+	if err := mgr.Delete("alice"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	// realHome's data untouched.
+	if _, err := os.Stat(filepath.Join(realHome, ".bashrc")); err != nil {
+		t.Fatalf("realHome .bashrc vanished: %v", err)
+	}
+}
+
+// Phase 3.5: vault is never exposed via a symlink inside the shallow HOME.
+func TestVaultNotExposedInShallowHome(t *testing.T) {
+	home := fakeHome(t)
+	// Place a vault UNDER realHome and seed a "secret" credential in it.
+	vaultRoot := filepath.Join(home, ".caam-vault")
+	if err := os.MkdirAll(filepath.Join(vaultRoot, "claude", "secret"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mgr := newMgr(t, home)
+	mgr.SetVaultRoot(vaultRoot)
+	got, err := mgr.Create("alice", CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The vault's top-level component (.caam-vault) must not appear in the profile.
+	assertAbsent(t, filepath.Join(got, ".caam-vault"))
+	// Belt-and-suspenders: no symlink in the profile resolves to the vault top.
+	vaultResolved, _ := filepath.EvalSymlinks(vaultRoot)
+	err = filepath.WalkDir(got, func(p string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		st, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return nil // dangling resolves elsewhere; ignore
+		}
+		if resolved == vaultResolved || strings.HasPrefix(resolved, vaultResolved+string(os.PathSeparator)) {
+			return fmt.Errorf("symlink %s resolves into the vault: %s", p, resolved)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("vault exposure: %v", err)
+	}
+}
+
+// Phase 3.5: a symlinked profile path (alice -> bob) is rejected by Get/Delete.
+func TestSymlinkedProfilePathRejected(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("bob", CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(mgr.BaseDir(), "alice")
+	if err := os.Symlink(filepath.Join(mgr.BaseDir(), "bob"), alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Get("alice"); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Get should reject symlinked profile path, err=%v", err)
+	}
+	if err := mgr.Delete("alice"); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Delete should reject symlinked profile path, err=%v", err)
+	}
+	// bob remains intact.
+	if _, err := mgr.Get("bob"); err != nil {
+		t.Fatalf("bob should still resolve: %v", err)
+	}
+}
+
+// Phase 3.5: destructive ops refuse a non-profile dir (real dir w/o sidecar).
+func TestDestructiveOpsRefuseNonProfileDir(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if err := os.MkdirAll(mgr.BaseDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	notProfile := filepath.Join(mgr.BaseDir(), "notaprofile")
+	if err := os.MkdirAll(notProfile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(notProfile, "important.txt"), []byte("keep me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Delete("notaprofile"); err == nil {
+		t.Fatalf("Delete should refuse a dir without a real sidecar")
+	}
+	if _, err := mgr.Create("notaprofile", CreateOptions{Force: true}); err == nil {
+		t.Fatalf("Create --force should refuse to clobber a non-profile dir")
+	}
+	// The dir and its data survive.
+	if _, err := os.Stat(filepath.Join(notProfile, "important.txt")); err != nil {
+		t.Fatalf("non-profile data was destroyed: %v", err)
+	}
+}
+
+// Phase 3.5: a canonical-base symlink (/tmp/b -> <realHome>/profiles) does not
+// leave a `profiles` symlink inside the shallow HOME (canonical-base skip).
+func TestCanonicalBaseSymlinkNotExposed(t *testing.T) {
+	home := fakeHome(t)
+	// realHome/profiles is the actual base; the manager is given a symlink to it.
+	realBase := filepath.Join(home, "profiles")
+	if err := os.MkdirAll(realBase, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	aliasBase := filepath.Join(t.TempDir(), "b")
+	if err := os.Symlink(realBase, aliasBase); err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := NewManager(aliasBase, home)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	got, err := mgr.Create("alice", CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No `profiles` symlink (the canonical base component) inside the profile.
+	assertAbsent(t, filepath.Join(got, "profiles"))
+}
+
+// Sanity: the shipped layouts' primary VaultName matches what `caam backup`
+// writes (basename drift would silently break --from-vault).
+func TestLayoutVaultNamesMatchAuthfile(t *testing.T) {
+	claude, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := claude.Primary().VaultName, filepath.Base(authfile.ClaudeAuthFiles().Files[0].Path); got != want {
+		t.Fatalf("claude primary VaultName = %q, want %q", got, want)
+	}
+	codex, err := LayoutForProvider("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := codex.Primary().VaultName, filepath.Base(authfile.CodexAuthFiles().Files[0].Path); got != want {
+		t.Fatalf("codex primary VaultName = %q, want %q", got, want)
 	}
 }

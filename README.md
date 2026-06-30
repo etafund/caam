@@ -138,74 +138,106 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel Claude Code sessions across N Claude Max accounts on the same machine.
+A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel sessions across N subscription accounts on the same machine. Supports **Claude Code** and **Codex** today; **Antigravity (`agy`) is the next planned harness** (the engine is built around a provider-keyed layout registry, so it drops in as one descriptor).
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
 caam backup claude alice@example.com
-caam backup claude bob@example.com
+caam backup codex  bob@example.com
 
-# Create a shallow profile for each identity, copying the credential out of the vault.
-caam shallow-profile create alice --from-vault claude/alice@example.com
-caam shallow-profile create bob   --from-vault claude/bob@example.com
+# Create a shallow profile per identity. The provider is INFERRED from the vault
+# spec, so no --tool flag is needed for --from-vault:
+caam shallow-profile create alice --from-vault claude/alice@example.com   # → claude
+caam shallow-profile create bob   --from-vault codex/bob@example.com      # → codex
 
-# Spawn concurrent Claude sessions, each pinned to its own identity.
-caam shallow-spawn alice -- claude  &   # session 1, alice's quota
-caam shallow-spawn bob   -- claude  &   # session 2, bob's quota
+# Spawn concurrent sessions, each pinned to its own identity and provider.
+caam shallow-spawn alice -- claude  &   # session 1, alice's Claude quota
+caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex quota
 wait
 ```
 
-Layout under `~/orch-homes/<name>/`:
+The provider is only needed explicitly via `--tool` when it can't be inferred — i.e. with `--from-file` (the filename is never inspected, so it defaults to `claude`) or when creating an empty-credential profile:
+
+```bash
+caam shallow-profile create cfile    --tool codex --from-file /path/auth.json  # codex from a file
+caam shallow-profile create cscratch --tool codex                              # codex, empty creds
+caam shallow-profile create scratch                                            # claude (default), empty creds
+```
+
+**Claude layout** under `<base>/<name>/`:
 
 | Path | Real or symlink? | Why |
 |------|------------------|-----|
-| `.claude/.credentials.json` | **real file** | The whole point: per-identity OAuth token. |
-| `.claude/.credentials.lock` | **real file** | Per-identity flock target so two sessions don't serialize on a shared lock. |
-| `.claude.json` | **real file** | Claude Code rewrites this on every run; a symlink would mutate the user's real settings under the shallow identity. |
+| `.claude/` | **real dir** | Holds the real per-identity files; keeps the symlink farm from replacing it with a link to `~/.claude`. |
+| `.claude/.credentials.json` | **real file**, `0600` | The whole point: per-identity OAuth token. |
+| `.claude/.credentials.lock` | **real file**, `0600` | Per-identity flock target so two sessions don't serialize on a shared lock. |
+| `.claude.json` | **real file**, `0600` | Claude Code rewrites this on every run; a symlink would mutate the user's real settings under the shallow identity. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
 | `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.codex/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
 
+**Codex layout** under `<base>/<name>/`:
+
+```
+<shallow-home>/.codex/              real directory
+<shallow-home>/.codex/auth.json     real file, 0600 (per-identity OAuth)
+<shallow-home>/.codex/config.toml   real file, 0600 (fresh minimal: enforces file auth store)
+<shallow-home>/.codex/sessions, history.jsonl   symlink → ~/.codex/… (audited allow-listed shared state)
+<shallow-home>/.codex/<anything else>           NOT shared (allow-list keeps daemon/runtime/log/sqlite dirs out)
+```
+
+The Codex `config.toml` is written **fresh and minimal** — it enforces `cli_auth_credentials_store = "file"` (so caam can manage `auth.json`) and deliberately does *not* copy your real config's `model`/`log_dir`/`sqlite_home`. Sharing is the allow-listed CLI transcript state only (`sessions`, `history.jsonl`); full desktop/sidebar history that lives in SQLite is not guaranteed to carry over.
+
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
-**Use when:** Your orchestrator runs N Claude Code sessions in parallel and each one must hit a different account simultaneously. `caam profile add` would also work, but each profile gets a blank shell history, blank git config, and blank Claude conversation history — painful for real dev work. Shallow profiles preserve everything you'd want to share and isolate only the auth identity.
+> **Codex daemon caveat:** a long-lived Codex daemon caches auth in memory. Shallow Codex sessions set `CODEX_HOME` (and `CODEX_SQLITE_HOME`) to the shallow `.codex` **and** use the allow-list above, so a daemon started inside a shallow session is *designed* to belong to that shallow `CODEX_HOME`. This relies on Codex rooting its daemon/socket discovery under `CODEX_HOME`; the exact runtime-dir names are an external Codex artifact and should be verified against your installed Codex.
+
+**Env isolation:** `shallow-spawn` clears the active harness's repointing vars (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `GEMINI_HOME`), inherited credential-override vars (`OPENAI_API_KEY`, `CODEX_API_KEY`, the `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` vars, …), and caam's own discovery vars (`CAAM_HOME`, `CAAM_SHALLOW_HOMES_DIR`), then sets the active harness's own env (e.g. Codex's `CODEX_HOME`/`CODEX_SQLITE_HOME`). So a shallow profile uses its vaulted subscription identity, not an inherited key. To intentionally use env-key auth, inject it past caam:
+
+```bash
+caam shallow-spawn p -- env OPENAI_API_KEY=… codex
+```
+
+**Use when:** Your orchestrator runs N sessions in parallel and each must hit a different account simultaneously. `caam profile add` would also work, but each profile gets a blank shell history, blank git config, and blank conversation history — painful for real dev work. Shallow profiles preserve everything you'd want to share and isolate only the auth identity.
+
+**Limitations — this is cooperative, same-UID, path-based isolation, NOT a sandbox.** All profiles run as the same Unix user as sibling directories under one base, so a hostile or buggy same-UID process can always read a sibling profile (`$BASE/<other>/...`) or any real `~/` file directly — no `HOME` trick prevents that. For true adversarial isolation use separate users / containers / namespaces. Additionally:
+
+- A profile isolates the **harness recorded in its metadata**. Launching a *different* harness from its shell is **not** isolated (its root passes through the symlink farm) — use a profile of the right provider.
+- Claude's **secondary** auth (`~/.config/claude-code/auth.json`) and the **macOS Keychain** are **not** isolated in this version; isolation is file-based.
 
 **Subcommands:**
 
 ```bash
-caam shallow-profile create <name> [--from-vault <tool>/<profile>] [--from-file <path>] [--force] [--json]
+caam shallow-profile create <name> [--from-vault <tool>/<profile>] [--from-file <path>] [--tool <provider>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
 caam shallow-spawn <name> -- <cmd> [args...]
-caam shallow-spawn <name> --print-env       # print HOME=... without exec
+caam shallow-spawn <name> --print-env       # emit eval-able export/unset lines, no exec
 ```
 
-The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests).
+`--tool` (`claude` or `codex`) is inferred from `--from-vault`; pass it only when not inferable (with `--from-file`, or for an empty-cred profile). The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests). `--print-env` emits shell-quoted `export KEY='value'` lines for the vars it sets and `unset KEY` for every var it clears, so a wrapper can reproduce the exec path's isolation with `eval "$(caam shallow-spawn <name> --print-env)"`.
 
-**Worked example — 3-way Claude orchestration on a VPS:**
+**Worked example — mixed Claude + Codex orchestration on a VPS:**
 
 ```bash
-# One-time setup: log in once on each account through the normal Claude flow,
+# One-time setup: log in once on each account through the normal flow,
 # back each one up to caam's vault.
-for who in alice bob charlie; do
-  /login                                # in claude → $who's google account
-  caam backup claude "$who"
-done
+/login                                       # in claude → alice's account
+caam backup claude alice
+codex login                                  # → bob's OpenAI account
+caam backup codex bob
 
-# Create three shallow identities pointing at those vault profiles.
-for who in alice bob charlie; do
-  caam shallow-profile create "$who" --from-vault "claude/$who"
-done
+# Create the shallow identities — provider inferred from each vault spec.
+caam shallow-profile create alice --from-vault claude/alice
+caam shallow-profile create bob   --from-vault codex/bob
 
-# Fan three concurrent claude sessions. Each lands on its own quota,
-# but all three share your real ~/.bashrc, ~/.gitconfig, ~/.ssh, AND
-# ~/.claude/projects (so any session can see/resume any conversation).
-caam shallow-spawn alice   -- claude --print "audit pkg/auth for race conditions"   &
-caam shallow-spawn bob     -- claude --print "write tests for internal/shallow"     &
-caam shallow-spawn charlie -- claude --print "draft release notes for v0.4.0"       &
+# Fan two concurrent sessions. Each lands on its own quota, but both share
+# your real ~/.bashrc, ~/.gitconfig, ~/.ssh AND each harness's own history.
+caam shallow-spawn alice -- claude --print "audit pkg/auth for race conditions"   &
+caam shallow-spawn bob   -- codex exec "write tests for internal/shallow"         &
 wait
 ```
 
-> **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered Anthropic endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
+> **Note:** `caam shallow-profile` does not (yet) call any reverse-engineered endpoints to display per-account live usage data. That's a separate concern tracked in the original report (issue #16) and intentionally deferred.
 
 ---
 

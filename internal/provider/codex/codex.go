@@ -81,7 +81,11 @@ func ResolveHome() string {
 	return codexHome()
 }
 
-var codexCredentialsStoreRe = regexp.MustCompile(`(?m)^\s*cli_auth_credentials_store\s*=\s*\"[^\"]*\"`)
+// Matches the cli_auth_credentials_store assignment with either a double- or
+// single-quoted value, so a valid TOML config using single quotes (e.g.
+// cli_auth_credentials_store = 'keyring') is detected and rewritten in place
+// rather than having a duplicate (invalid) bare key appended.
+var codexCredentialsStoreRe = regexp.MustCompile(`(?m)^\s*cli_auth_credentials_store\s*=\s*(?:"[^"]*"|'[^']*')`)
 
 // EnsureFileCredentialStore ensures Codex uses file-based credential storage.
 // This is required for CAAM to manage auth.json reliably.
