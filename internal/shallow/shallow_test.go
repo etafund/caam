@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1696,4 +1697,131 @@ func TestLayoutForProviderReturnsIndependentCopy(t *testing.T) {
 	if second.Credentials[0].VaultName != "auth.json" {
 		t.Fatalf("Credentials leaked mutation: %v", second.Credentials[0])
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz tests — prove the security-sensitive string/path validators never
+// green-light an escaping input. These also run as normal corpus-seeded tests
+// under `go test` (each seed becomes a t.Run subtest).
+// ---------------------------------------------------------------------------
+
+// posixSingleUnquote is a tiny POSIX single-quote *unquoter* used only by the
+// fuzz test. It reverses exactly what shellQuote produces: a string wrapped in
+// single quotes where every literal `'` was rendered as the 4-char sequence
+//
+//	'\''   (close-quote, backslash-escaped quote, re-open-quote)
+//
+// It returns the decoded literal and ok=false if s is not a well-formed
+// single-quoted POSIX word (which shellQuote must never emit).
+func posixSingleUnquote(s string) (string, bool) {
+	// A single-quoted word always starts with ' and ends with ' (the empty
+	// string '' decodes to "").
+	if len(s) < 2 || s[0] != '\'' || s[len(s)-1] != '\'' {
+		return "", false
+	}
+	var b strings.Builder
+	i := 1 // skip the opening quote
+	end := len(s) - 1
+	for i < end {
+		c := s[i]
+		if c == '\'' {
+			// Inside a single-quoted region a bare ' can only appear as the
+			// start of the `'\''` escape: ' (we're here) \ ' '.
+			if i+3 <= end && s[i+1] == '\\' && s[i+2] == '\'' && s[i+3] == '\'' {
+				b.WriteByte('\'')
+				i += 4
+				continue
+			}
+			return "", false // a bare unescaped quote that isn't the closer
+		}
+		b.WriteByte(c)
+		i++
+	}
+	return b.String(), true
+}
+
+// FuzzShellQuote asserts shellQuote round-trips for arbitrary input (the
+// quoted form decodes back to the original) and that the quoted form has no
+// quote that could break out of the single-quoted word.
+func FuzzShellQuote(f *testing.F) {
+	for _, seed := range []string{
+		"''", "a", "a b", "it's", "$(x)", "`backtick`", "with`tick",
+		"line\nbreak", `back\slash`, "ünïcode", "", "'", "''''", "a'b'c",
+		"\t", "rm -rf /", "x'\\''y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		q := shellQuote(s)
+
+		// 1. Round-trip: decoding the quoted form yields the original string.
+		got, ok := posixSingleUnquote(q)
+		if !ok {
+			t.Fatalf("shellQuote(%q) = %q is not a well-formed single-quoted word", s, q)
+		}
+		if got != s {
+			t.Fatalf("round-trip mismatch: shellQuote(%q)=%q decoded to %q", s, q, got)
+		}
+
+		// 2. No unescaped break-out quote. The ONLY quote literal shellQuote may
+		// emit inside the word is the exact 4-char escape `'\''`. After removing
+		// every such escape the remainder must be a single contiguous
+		// single-quoted region — i.e. it starts and ends with the outer quotes and
+		// contains NO other quote. If any bare ' survived removal, a value could
+		// terminate the quoting early and inject shell.
+		if len(q) < 2 || q[0] != '\'' || q[len(q)-1] != '\'' {
+			t.Fatalf("shellQuote(%q)=%q not wrapped in single quotes", s, q)
+		}
+		stripped := strings.ReplaceAll(q, `'\''`, "")
+		// What remains is the literal payload bracketed by the outer quotes; with
+		// every escape removed, exactly the two outer quotes may stay. Any
+		// additional quote is a break-out.
+		if strings.Count(stripped, "'") > 2 {
+			t.Fatalf("shellQuote(%q)=%q has an unescaped break-out quote (stripped=%q)", s, q, stripped)
+		}
+	})
+}
+
+// FuzzCheckSlashRel proves checkSlashRel never accepts an escaping path: any
+// accepted input, when cleaned, stays relative, contains no `..` component, is
+// not absolute, and is filepath.IsLocal-safe.
+func FuzzCheckSlashRel(f *testing.F) {
+	for _, seed := range []string{
+		".claude", "a/b", "/abs", "../x", "a/../b", "", "C:\\x", "a//b",
+		".", "..", "a/", "a/./b", "a/..", "foo/bar/baz", "\\\\unc\\share",
+		"a\\b", "./a", "x/../../y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		if checkSlashRel(s) != nil {
+			return // rejected — nothing to prove
+		}
+		// Accepted: the safety property must hold.
+		if path.IsAbs(s) {
+			t.Fatalf("checkSlashRel accepted slash-absolute path %q", s)
+		}
+		osp := filepath.FromSlash(s)
+		if filepath.IsAbs(osp) {
+			t.Fatalf("checkSlashRel accepted OS-absolute path %q", s)
+		}
+		if filepath.VolumeName(osp) != "" {
+			t.Fatalf("checkSlashRel accepted volume-prefixed path %q", s)
+		}
+		// filepath.IsLocal is the canonical "stays within the current dir, no
+		// escape, no absolute, no volume" predicate. An accepted path MUST be local.
+		if !filepath.IsLocal(osp) {
+			t.Fatalf("checkSlashRel accepted non-local path %q (FromSlash=%q)", s, osp)
+		}
+		// No `..` component survives, and Clean doesn't reveal an escape.
+		for _, seg := range strings.Split(filepath.ToSlash(s), "/") {
+			if seg == ".." {
+				t.Fatalf("checkSlashRel accepted path %q containing a .. component", s)
+			}
+		}
+		cleaned := path.Clean(filepath.ToSlash(s))
+		if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			t.Fatalf("checkSlashRel accepted path %q that cleans to an escaping %q", s, cleaned)
+		}
+	})
 }

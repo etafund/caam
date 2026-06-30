@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -909,4 +910,156 @@ func TestShallowDeletePromptOnStderr(t *testing.T) {
 	if strings.Contains(stdout.String(), "Delete shallow profile") {
 		t.Fatalf("prompt should NOT be on stdout, got stdout=%q", stdout.String())
 	}
+}
+
+// TestShallowPrintEnvGolden locks the exact eval-able --print-env contract for
+// both a claude and a codex profile. The non-deterministic base path is
+// normalized to the literal <BASE> before comparing against an inline golden.
+func TestShallowPrintEnvGolden(t *testing.T) {
+	base, _ := shallowEnv(t)
+
+	for _, name := range []string{"cgold", "claude-gold"} {
+		args := []string{"shallow-profile", "create", name, "--json"}
+		if name == "cgold" {
+			args = []string{"shallow-profile", "create", name, "--tool", "codex", "--json"}
+		}
+		if _, _, err := runCmdCaptured(t, args...); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+	}
+
+	// normalize replaces the test's per-run base dir prefix with <BASE> so the
+	// golden is stable across runs, and splits into a sorted line set.
+	normalize := func(out string) []string {
+		out = strings.ReplaceAll(out, base, "<BASE>")
+		var lines []string
+		for _, l := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+			if l != "" {
+				lines = append(lines, l)
+			}
+		}
+		sort.Strings(lines)
+		return lines
+	}
+
+	// --- codex golden -------------------------------------------------------
+	codexOut, _, err := runCmdCaptured(t, "shallow-spawn", "cgold", "--print-env")
+	if err != nil {
+		t.Fatalf("codex print-env: %v", err)
+	}
+	wantCodex := []string{
+		"export CODEX_HOME='<BASE>/cgold/.codex'",
+		"export CODEX_SQLITE_HOME='<BASE>/cgold/.codex'",
+		"export HOME='<BASE>/cgold'",
+		"export SHALLOW_PROFILE='cgold'",
+		"unset ANTHROPIC_API_KEY",
+		"unset ANTHROPIC_AUTH_TOKEN",
+		"unset CAAM_HOME",
+		"unset CAAM_SHALLOW_HOMES_DIR",
+		"unset CLAUDE_CODE_OAUTH_TOKEN",
+		"unset CLAUDE_CODE_USE_BEDROCK",
+		"unset CLAUDE_CODE_USE_FOUNDRY",
+		"unset CLAUDE_CODE_USE_VERTEX",
+		"unset CLAUDE_CONFIG_DIR",
+		"unset CODEX_ACCESS_TOKEN",
+		"unset CODEX_API_KEY",
+		"unset GEMINI_HOME",
+		"unset OPENAI_API_KEY",
+	}
+	sort.Strings(wantCodex)
+	if got := normalize(codexOut); !equalStringSlices(got, wantCodex) {
+		t.Fatalf("codex --print-env golden mismatch:\n got: %#v\nwant: %#v", got, wantCodex)
+	}
+	// Belt-and-suspenders on the load-bearing properties.
+	if strings.Contains(codexOut, "unset CODEX_HOME") || strings.Contains(codexOut, "unset CODEX_SQLITE_HOME") {
+		t.Fatalf("codex print-env must NOT unset the SET codex vars:\n%s", codexOut)
+	}
+
+	// --- claude golden ------------------------------------------------------
+	claudeOut, _, err := runCmdCaptured(t, "shallow-spawn", "claude-gold", "--print-env")
+	if err != nil {
+		t.Fatalf("claude print-env: %v", err)
+	}
+	wantClaude := []string{
+		"export HOME='<BASE>/claude-gold'",
+		"export SHALLOW_PROFILE='claude-gold'",
+		"unset ANTHROPIC_API_KEY",
+		"unset ANTHROPIC_AUTH_TOKEN",
+		"unset CAAM_HOME",
+		"unset CAAM_SHALLOW_HOMES_DIR",
+		"unset CLAUDE_CODE_OAUTH_TOKEN",
+		"unset CLAUDE_CODE_USE_BEDROCK",
+		"unset CLAUDE_CODE_USE_FOUNDRY",
+		"unset CLAUDE_CODE_USE_VERTEX",
+		"unset CLAUDE_CONFIG_DIR",
+		"unset CODEX_ACCESS_TOKEN",
+		"unset CODEX_API_KEY",
+		"unset CODEX_HOME",
+		"unset CODEX_SQLITE_HOME",
+		"unset GEMINI_HOME",
+		"unset OPENAI_API_KEY",
+	}
+	sort.Strings(wantClaude)
+	if got := normalize(claudeOut); !equalStringSlices(got, wantClaude) {
+		t.Fatalf("claude --print-env golden mismatch:\n got: %#v\nwant: %#v", got, wantClaude)
+	}
+	// Claude sets no CODEX_HOME and MUST unset it.
+	if strings.Contains(claudeOut, "export CODEX_HOME") {
+		t.Fatalf("claude print-env must NOT export CODEX_HOME:\n%s", claudeOut)
+	}
+	if !strings.Contains(claudeOut, "unset CODEX_HOME") {
+		t.Fatalf("claude print-env must unset CODEX_HOME:\n%s", claudeOut)
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// FuzzParseShallowVaultRef proves parseShallowVaultRef never accepts a
+// reference whose Profile could escape a vault path: any accepted input yields
+// a Profile with no path separator, not `.`/`..`, and a non-empty Tool.
+func FuzzParseShallowVaultRef(f *testing.F) {
+	for _, seed := range []string{
+		"claude/alice", "codex/bob", "x", "a/b/c", "claude/../etc",
+		"claude/a b", "", "claude/", "/alice", "claude/.", "claude/..",
+		"CLAUDE/Alice", "claude/a\\b", "claude/a/b", " claude / bob ",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, spec string) {
+		ref, err := parseShallowVaultRef(spec)
+		if err != nil {
+			return // rejected — nothing to prove
+		}
+		if ref.Tool == "" {
+			t.Fatalf("parseShallowVaultRef(%q) accepted with empty Tool", spec)
+		}
+		if ref.Profile == "" {
+			t.Fatalf("parseShallowVaultRef(%q) accepted with empty Profile", spec)
+		}
+		if ref.Profile == "." || ref.Profile == ".." {
+			t.Fatalf("parseShallowVaultRef(%q) accepted dot Profile %q", spec, ref.Profile)
+		}
+		if strings.ContainsAny(ref.Profile, `/\`) {
+			t.Fatalf("parseShallowVaultRef(%q) accepted Profile %q containing a separator", spec, ref.Profile)
+		}
+		// Mirror the real downstream use: Profile is joined into a vault path; the
+		// joined leaf must remain a single component under the tool dir (no escape).
+		joined := filepath.Join("vault", ref.Tool, ref.Profile)
+		if filepath.Base(joined) != ref.Profile {
+			t.Fatalf("parseShallowVaultRef(%q): Profile %q does not survive as a single path component (joined=%q)", spec, ref.Profile, joined)
+		}
+		if filepath.Dir(joined) != filepath.Join("vault", ref.Tool) {
+			t.Fatalf("parseShallowVaultRef(%q): Profile %q escapes its tool dir (joined=%q)", spec, ref.Profile, joined)
+		}
+	})
 }
