@@ -127,6 +127,7 @@ func newShallowTestRoot() *cobra.Command {
 	}
 	spawn.Flags().String("base", "", "")
 	spawn.Flags().Bool("print-env", false, "")
+	spawn.Flags().Bool("json", false, "")
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
@@ -238,8 +239,8 @@ func TestShallowCreateRejectsBothCredentialSources(t *testing.T) {
 	_, _ = shallowEnv(t)
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice",
 		"--from-vault", "claude/alice", "--from-file", "/tmp/nope", "--json")
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
 	if !strings.Contains(stdout, "mutually exclusive") {
 		t.Fatalf("expected mutual-exclusivity error, got %q", stdout)
@@ -250,8 +251,8 @@ func TestShallowCreateUnknownVaultProfile(t *testing.T) {
 	_, _ = shallowEnv(t)
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice",
 		"--from-vault", "claude/missing", "--json")
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
 	if !strings.Contains(stdout, "missing .credentials.json") {
 		t.Fatalf("expected missing-creds error, got %q", stdout)
@@ -277,8 +278,8 @@ func TestShallowDelete(t *testing.T) {
 func TestShallowDeleteNotFound(t *testing.T) {
 	_, _ = shallowEnv(t)
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "delete", "ghost", "--force", "--json")
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
 	if !strings.Contains(stdout, "does not exist") {
 		t.Fatalf("expected not-exist error, got %q", stdout)
@@ -490,8 +491,8 @@ func TestShallowCreateVaultToolMismatch(t *testing.T) {
 	_, _ = shallowEnv(t)
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "create", "bad",
 		"--tool", "codex", "--from-vault", "claude/alice", "--json")
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
 	var resp struct {
 		Success bool   `json:"success"`
@@ -514,8 +515,8 @@ func TestShallowCreateUnsupportedVaultTool(t *testing.T) {
 	_, _ = shallowEnv(t)
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "create", "bad",
 		"--from-vault", "gemini/alice", "--json")
-	if err != nil {
-		t.Fatalf("create: %v", err)
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
 	if !strings.Contains(stdout, "not supported for shallow profiles (supported: claude, codex)") {
 		t.Fatalf("expected unsupported-tool error, got %q", stdout)
@@ -766,5 +767,146 @@ func TestShallowLayoutVaultNamesMatchAuthFiles(t *testing.T) {
 	}
 	if wantClaude != ".credentials.json" {
 		t.Fatalf("unexpected claude authfile basename %q", wantClaude)
+	}
+}
+
+// TestShallowListJSONError asserts `list --json` always produces valid JSON.
+// An empty base can't easily force mgr.List() to fail (NewManager creates the
+// base dir), so this covers the success-shape side: count:0 with a parseable
+// envelope. The error path now routes through the same shallowListOutput struct
+// (Error field) so a forced failure would emit {"...","error":...}, not a bare
+// string — see runShallowProfileList's emitErr.
+func TestShallowListJSONError(t *testing.T) {
+	_, _ = shallowEnv(t)
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "list", "--json")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	var resp struct {
+		BaseDir  string `json:"base_dir"`
+		Count    int    `json:"count"`
+		Error    string `json:"error"`
+		Profiles []struct {
+			Name string `json:"name"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("list --json must emit valid JSON, got %q: %v", stdout, err)
+	}
+	if resp.Count != 0 || len(resp.Profiles) != 0 {
+		t.Fatalf("expected empty list, got %+v", resp)
+	}
+	if resp.Error != "" {
+		t.Fatalf("unexpected error on clean list: %q", resp.Error)
+	}
+}
+
+// TestShallowSpawnJSONError verifies that a spawn error under --json is emitted
+// as {"success":false,"error":...} on stdout rather than a bare returned error.
+func TestShallowSpawnJSONError(t *testing.T) {
+	_, _ = shallowEnv(t)
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "ghost", "--json", "--", "sh")
+	if err == nil {
+		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
+	}
+	var resp struct {
+		Success bool   `json:"success"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	if resp.Success {
+		t.Fatalf("expected success=false, got %q", stdout)
+	}
+	if !strings.Contains(resp.Error, "does not exist") {
+		t.Fatalf("expected 'does not exist' in error, got %q", resp.Error)
+	}
+}
+
+// TestShallowSpawnPrintEnvJSON verifies the --print-env --json shape for a codex
+// profile: HOME/SHALLOW_PROFILE + the codex provider sets land in `set`, while
+// the cleared (but not re-set) vars land in `unset`.
+func TestShallowSpawnPrintEnvJSON(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-alice",
+		"--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "codex-alice", "--print-env", "--json")
+	if err != nil {
+		t.Fatalf("spawn print-env --json: %v", err)
+	}
+	var resp struct {
+		Success        bool              `json:"success"`
+		Home           string            `json:"home"`
+		ShallowProfile string            `json:"shallow_profile"`
+		Set            map[string]string `json:"set"`
+		Unset          []string          `json:"unset"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success, got %q", stdout)
+	}
+	homePath := filepath.Join(base, "codex-alice")
+	if resp.Home != homePath {
+		t.Fatalf("home %q != %q", resp.Home, homePath)
+	}
+	if resp.ShallowProfile != "codex-alice" {
+		t.Fatalf("shallow_profile %q", resp.ShallowProfile)
+	}
+	if !strings.HasSuffix(resp.Set["CODEX_HOME"], "/.codex") {
+		t.Fatalf("set CODEX_HOME %q does not end in /.codex", resp.Set["CODEX_HOME"])
+	}
+	if resp.Set["HOME"] != homePath {
+		t.Fatalf("set HOME %q != %q", resp.Set["HOME"], homePath)
+	}
+	if resp.Set["SHALLOW_PROFILE"] != "codex-alice" {
+		t.Fatalf("set SHALLOW_PROFILE %q", resp.Set["SHALLOW_PROFILE"])
+	}
+	unsetHas := func(k string) bool {
+		for _, u := range resp.Unset {
+			if u == k {
+				return true
+			}
+		}
+		return false
+	}
+	if !unsetHas("CLAUDE_CONFIG_DIR") {
+		t.Fatalf("unset should contain CLAUDE_CONFIG_DIR, got %v", resp.Unset)
+	}
+	if !unsetHas("OPENAI_API_KEY") {
+		t.Fatalf("unset should contain OPENAI_API_KEY, got %v", resp.Unset)
+	}
+	if unsetHas("CODEX_HOME") {
+		t.Fatalf("CODEX_HOME is set, must not also be in unset: %v", resp.Unset)
+	}
+}
+
+// TestShallowDeletePromptOnStderr verifies the non-force, non-json delete prompt
+// is written to stderr (not stdout), so a caller capturing stdout sees only the
+// command's real output.
+func TestShallowDeletePromptOnStderr(t *testing.T) {
+	_, _ = shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	// Build a root we can drive stdin on (decline the prompt with "n").
+	root := newShallowTestRoot()
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetIn(strings.NewReader("n\n"))
+	root.SetArgs([]string{"shallow-profile", "delete", "alice"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "Delete shallow profile") {
+		t.Fatalf("prompt should be on stderr, got stderr=%q", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Delete shallow profile") {
+		t.Fatalf("prompt should NOT be on stdout, got stdout=%q", stdout.String())
 	}
 }

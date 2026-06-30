@@ -56,6 +56,32 @@ func TestEnsureFileCredentialStoreSingleQuoted(t *testing.T) {
 	}
 }
 
+// TestEnsureFileCredentialStoreIdempotentSingleQuotedFile verifies that a config
+// already set to single-quoted 'file' is left BYTE-IDENTICAL (no redundant rewrite),
+// matching the double-quoted "file" short-circuit.
+func TestEnsureFileCredentialStoreIdempotentSingleQuotedFile(t *testing.T) {
+	for _, in := range []string{
+		"model = \"gpt-5\"\ncli_auth_credentials_store = 'file'\n",
+		"model = \"gpt-5\"\ncli_auth_credentials_store = \"file\"\n",
+	} {
+		dir := t.TempDir()
+		cfg := filepath.Join(dir, "config.toml")
+		if err := os.WriteFile(cfg, []byte(in), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := EnsureFileCredentialStore(dir); err != nil {
+			t.Fatalf("EnsureFileCredentialStore: %v", err)
+		}
+		got, err := os.ReadFile(cfg)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(got) != in {
+			t.Fatalf("expected no rewrite for already-file config.\n in: %q\nout: %q", in, string(got))
+		}
+	}
+}
+
 // =============================================================================
 // Provider Factory Tests
 // =============================================================================

@@ -112,7 +112,8 @@ func EnsureFileCredentialStore(home string) error {
 	}
 
 	if match := codexCredentialsStoreRe.Find(data); match != nil {
-		if strings.Contains(string(match), `"file"`) {
+		// Already set to "file" (either quote style) → no rewrite needed.
+		if m := string(match); strings.Contains(m, `"file"`) || strings.Contains(m, `'file'`) {
 			return nil
 		}
 		updated := codexCredentialsStoreRe.ReplaceAll(data, []byte(settingLine))

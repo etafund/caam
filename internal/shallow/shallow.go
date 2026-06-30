@@ -367,7 +367,14 @@ func validateLayout(l Layout) error {
 		}
 		return nil
 	}
+	// Build the normalized InnerSkip key set up front so the mutual-exclusion
+	// check below compares NORMALIZED keys (a root present as ".g" in one map and
+	// "./.g"/".g" form in the other must still be caught).
+	skipKeys := map[string]bool{}
 	for k, names := range l.InnerSkip {
+		if err := checkSlashRel(k); err != nil {
+			return fmt.Errorf("%s InnerSkip key %q: %w", l.Provider, k, err)
+		}
 		rk := filepath.ToSlash(k) // normalize the map key before the root lookup
 		if !roots[rk] {
 			return fmt.Errorf("%s: InnerSkip root %q is not an InnerSymlinkRoot", l.Provider, k)
@@ -375,13 +382,17 @@ func validateLayout(l Layout) error {
 		if err := checkNames("InnerSkip", rk, names); err != nil {
 			return err
 		}
+		skipKeys[rk] = true
 	}
 	for k, names := range l.InnerSymlinkAllow {
+		if err := checkSlashRel(k); err != nil {
+			return fmt.Errorf("%s InnerSymlinkAllow key %q: %w", l.Provider, k, err)
+		}
 		rk := filepath.ToSlash(k)
 		if !roots[rk] {
 			return fmt.Errorf("%s: InnerSymlinkAllow root %q is not an InnerSymlinkRoot", l.Provider, k)
 		}
-		if len(l.InnerSkip[k]) > 0 {
+		if skipKeys[rk] {
 			return fmt.Errorf("%s: root %q sets both InnerSkip and InnerSymlinkAllow", l.Provider, k)
 		}
 		if err := checkNames("InnerSymlinkAllow", rk, names); err != nil {
@@ -512,7 +523,35 @@ func LayoutForProvider(p string) (Layout, error) {
 		}
 		return Layout{}, fmt.Errorf("unsupported shallow provider %q (supported: %s)", p, supportedList())
 	}
-	return l, nil
+	// Return a deep copy so a caller mutating the returned Layout's slices/maps
+	// can't corrupt the immutable global registry (or race another reader).
+	return cloneLayout(l), nil
+}
+
+// cloneLayout deep-copies a Layout's mutable backing storage (slices and maps) so
+// the returned value is independent of the registry. Function fields and scalar
+// fields are copied by value (their referents are immutable / stateless).
+func cloneLayout(l Layout) Layout {
+	out := l // copies scalars + function fields by value
+	out.RealDirs = append([]string(nil), l.RealDirs...)
+	out.RealFiles = append([]string(nil), l.RealFiles...)
+	out.Credentials = append([]AuthFile(nil), l.Credentials...)
+	out.InnerSymlinkRoots = append([]string(nil), l.InnerSymlinkRoots...)
+	if l.InnerSkip != nil {
+		m := make(map[string][]string, len(l.InnerSkip))
+		for k, v := range l.InnerSkip {
+			m[k] = append([]string(nil), v...)
+		}
+		out.InnerSkip = m
+	}
+	if l.InnerSymlinkAllow != nil {
+		m := make(map[string][]string, len(l.InnerSymlinkAllow))
+		for k, v := range l.InnerSymlinkAllow {
+			m[k] = append([]string(nil), v...)
+		}
+		out.InnerSymlinkAllow = m
+	}
+	return out
 }
 
 func ClaudeLayout() Layout {
@@ -644,6 +683,16 @@ func NewManager(baseDir, realHome string) (*Manager, error) {
 	if abs == rabs {
 		return nil, fmt.Errorf("shallow base dir cannot be the user's real home")
 	}
+	// Reject a symlinked base LEAF: `--base ~/link` where ~/link -> ~/Documents
+	// would let destructive ops (Delete / --force RemoveAll) operate under the
+	// alias target. We reject only the leaf, NOT symlinked ANCESTORS — legitimate
+	// setups (macOS /var -> /private/var, symlinked tmpdirs) have symlinked
+	// ancestors and must keep working.
+	if st, err := os.Lstat(abs); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("shallow base dir %q is a symlink; refusing", abs)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat base dir: %w", err)
+	}
 	canonBase := abs
 	if cb, err := resolveExistingSymlinks(abs); err == nil {
 		rhome := rabs
@@ -741,6 +790,15 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 
 	home, err := m.HomeFor(name)
 	if err != nil {
+		return "", err
+	}
+
+	// Preflight source paths BEFORE the --force RemoveAll below. Otherwise a bad
+	// --from-file / --from-claude-json / --from-vault path would destroy the
+	// existing profile and THEN fail in provisionCredentials/CreateManagedFiles,
+	// leaving the user with nothing. (provisionCredentials still does the real
+	// copy later; this is purely a "fail before we delete anything" check.)
+	if err := m.preflightSources(layout, opts); err != nil {
 		return "", err
 	}
 
@@ -847,6 +905,45 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 	return home, nil
 }
 
+// preflightSources verifies that every credential/managed-file SOURCE the caller
+// supplied actually exists as a regular file, WITHOUT mutating anything. It runs
+// before the --force RemoveAll so a bad source never destroys an existing profile.
+// (provisionCredentials / CreateManagedFiles perform the actual copies later.)
+func (m *Manager) preflightSources(layout Layout, opts CreateOptions) error {
+	mustRegular := func(kind, p string) error {
+		st, err := os.Stat(p)
+		if err != nil {
+			return fmt.Errorf("%s %q is missing or unreadable: %w", kind, p, err)
+		}
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("%s %q is not a regular file", kind, p)
+		}
+		return nil
+	}
+	if opts.CredentialSource != "" {
+		if err := mustRegular("--from-file source", opts.CredentialSource); err != nil {
+			return err
+		}
+	}
+	if opts.SourceClaudeJSON != "" {
+		if err := mustRegular("--from-claude-json source", opts.SourceClaudeJSON); err != nil {
+			return err
+		}
+	}
+	if opts.CredentialSourceDir != "" {
+		for _, c := range layout.Credentials {
+			if !c.Required {
+				continue // optional artifacts may be absent in the vault dir
+			}
+			src := filepath.Join(opts.CredentialSourceDir, c.VaultName)
+			if err := mustRegular("vault credential", src); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // provisionCredentials copies auth artifacts into the shallow HOME per the layout.
 // Priority: CredentialSourceDir (vault, multi-file) > CredentialSource (single file → Primary)
 // > none (empty Primary placeholder).
@@ -942,6 +1039,13 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 		}
 		src := filepath.Join(m.realHome, name)
 		dst := filepath.Join(home, name)
+		// Never expose a CAAM-owned root (vault / base / $CAAM_HOME) even if it
+		// nests under realHome at this top level. This is in ADDITION to the
+		// caamShadowTops skip set above (which also covers the not-yet-existing
+		// case where the root has no real-home entry to skip by name).
+		if m.isProtectedSource(src) {
+			continue
+		}
 		// If the source has vanished mid-iteration, skip silently.
 		if _, err := os.Lstat(src); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1008,6 +1112,11 @@ func (m *Manager) populateInnerSymlinks(home string, layout Layout, root string)
 	link := func(n string) error {
 		src := filepath.Join(srcDir, n)
 		dst := filepath.Join(dstDir, n)
+		// Never expose a CAAM-owned root nested under this inner root (e.g.
+		// CAAM_HOME=~/.claude/caam → don't mirror ~/.claude/caam into the profile).
+		if m.isProtectedSource(src) {
+			return nil
+		}
 		if _, err := os.Lstat(src); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
@@ -1101,6 +1210,69 @@ func (m *Manager) caamShadowTops() map[string]bool {
 	return tops
 }
 
+// protectedRoots returns the absolute CAAM-owned roots that no shallow-HOME
+// symlink may point at, equal, contain, or be contained by: the shallow base,
+// $CAAM_HOME, and the vault root — each in BOTH its lexical and symlink-resolved
+// form (a symlinked ancestor could otherwise hide the nesting).
+func (m *Manager) protectedRoots() []string {
+	var roots []string
+	add := func(p string) {
+		if strings.TrimSpace(p) == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			roots = append(roots, filepath.Clean(abs))
+		}
+		if c, err := resolveExistingSymlinks(p); err == nil {
+			roots = append(roots, filepath.Clean(c))
+		}
+	}
+	add(m.baseDir)
+	add(m.canonBase)
+	add(os.Getenv("CAAM_HOME"))
+	add(m.vaultRoot)
+	return roots
+}
+
+// isProtectedSource reports whether absSource (a REAL-HOME path that a symlink
+// would point at) equals, is inside, or contains any protected root. Containment
+// is component-aware in BOTH directions: a symlink to an ancestor of the vault
+// would expose the vault, and a symlink to a descendant of the vault would expose
+// vault contents — both are refused.
+func (m *Manager) isProtectedSource(absSource string) bool {
+	src := filepath.Clean(absSource)
+	if c, err := resolveExistingSymlinks(absSource); err == nil {
+		c = filepath.Clean(c)
+		for _, root := range m.protectedRoots() {
+			if pathRelatedOrEqual(c, root) {
+				return true
+			}
+		}
+	}
+	for _, root := range m.protectedRoots() {
+		if pathRelatedOrEqual(src, root) {
+			return true
+		}
+	}
+	return false
+}
+
+// pathRelatedOrEqual reports whether a and b are equal, a is inside b, or b is
+// inside a — using filepath.Rel so the check is component-aware (".claudex" is
+// NOT inside ".claude").
+func pathRelatedOrEqual(a, b string) bool {
+	return pathEqualOrUnder(a, b) || pathEqualOrUnder(b, a)
+}
+
+// pathEqualOrUnder reports whether child equals parent or is a descendant of it.
+func pathEqualOrUnder(child, parent string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
 // resolveExistingSymlinks canonicalizes the longest EXISTING ancestor of p
 // (EvalSymlinks errors on a non-existent path) then rejoins the not-yet-existing
 // tail — so a base that doesn't exist yet still resolves its existing symlinked
@@ -1129,7 +1301,10 @@ func resolveExistingSymlinks(p string) (string, error) {
 
 // assertIsShallowProfile verifies home is a real directory containing a real
 // regular .caam-shallow.json sidecar — the precondition for any destructive op
-// (Delete / --force RemoveAll), so a symlinked base can't make caam rm real data.
+// (Delete / --force RemoveAll). A symlinked base LEAF is already refused at
+// NewManager; this guards the residual case (a symlinked base ANCESTOR, which
+// is intentionally allowed) so a destructive op still only ever removes a
+// genuine shallow profile, never arbitrary real data reached through the alias.
 func (m *Manager) assertIsShallowProfile(home string) error {
 	st, err := os.Lstat(home) // Lstat — a symlinked profile path is never a profile
 	if err != nil {
@@ -1143,6 +1318,93 @@ func (m *Manager) assertIsShallowProfile(home string) error {
 	mst, err := os.Lstat(filepath.Join(home, ProfileMetaFilename))
 	if err != nil || mst.Mode()&os.ModeSymlink != 0 || !mst.Mode().IsRegular() {
 		return fmt.Errorf("%s has no real %s; refusing to remove (not a shallow profile)", home, ProfileMetaFilename)
+	}
+	return nil
+}
+
+// ValidateProfileShape verifies that a shallow profile's auth-bearing shape is
+// intact and uncompromised BEFORE a harness is spawned into it. Unlike a plain
+// credential Lstat, it also rejects symlinked PARENTS within the home (a
+// component swapped for a symlink could redirect a "real" file to the wrong
+// auth). It is exported because the CLI calls it as a pre-spawn check (including
+// on the --print-env path, which otherwise skips validation).
+//
+// It checks, for the named profile under this manager's base dir:
+//   - the profile home is a real directory (not a symlink);
+//   - each layout.RealDirs entry exists as a real dir, is itself not a symlink,
+//     and has no symlinked ancestor within home;
+//   - each layout.RealFiles entry is a real regular file, not a symlink, no
+//     symlinked ancestor;
+//   - each REQUIRED credential is a real regular file, not a symlink, no
+//     symlinked ancestor; each OPTIONAL credential, IF present, the same;
+//   - the metadata sidecar is a real regular file.
+func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return err
+	}
+	fail := func(component, p string) error {
+		return fmt.Errorf("shallow profile %q: %s %s is missing or compromised (symlinked); recreate it", name, component, p)
+	}
+
+	// Profile home must be a real directory, not a symlink.
+	st, err := os.Lstat(home)
+	if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+		return fail("home", home)
+	}
+
+	checkRealDir := func(component, abs string) error {
+		if err := assertNoSymlinkAncestor(home, abs); err != nil {
+			return fail(component, abs)
+		}
+		st, err := os.Lstat(abs)
+		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.IsDir() {
+			return fail(component, abs)
+		}
+		return nil
+	}
+	checkRealFile := func(component, abs string) error {
+		if err := assertNoSymlinkAncestor(home, abs); err != nil {
+			return fail(component, abs)
+		}
+		st, err := os.Lstat(abs)
+		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
+			return fail(component, abs)
+		}
+		return nil
+	}
+
+	for _, d := range layout.RealDirs {
+		abs := filepath.Join(home, filepath.FromSlash(d))
+		if err := checkRealDir("real dir "+d, abs); err != nil {
+			return err
+		}
+	}
+	for _, f := range layout.RealFiles {
+		abs := filepath.Join(home, filepath.FromSlash(f))
+		if err := checkRealFile("real file "+f, abs); err != nil {
+			return err
+		}
+	}
+	for _, c := range layout.Credentials {
+		abs := filepath.Join(home, filepath.FromSlash(c.DestRel))
+		if !c.Required {
+			// Optional: only validate if present (absent is allowed). Distinguish a
+			// genuinely-absent leaf from a symlinked ancestor by checking the ancestor
+			// chain first.
+			if err := assertNoSymlinkAncestor(home, abs); err != nil {
+				return fail("credential "+c.DestRel, abs)
+			}
+			if _, err := os.Lstat(abs); errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+		}
+		if err := checkRealFile("credential "+c.DestRel, abs); err != nil {
+			return err
+		}
+	}
+	if err := checkRealFile("metadata "+ProfileMetaFilename, filepath.Join(home, ProfileMetaFilename)); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1260,7 +1522,8 @@ func (m *Manager) Delete(name string) error {
 		return fmt.Errorf("refusing to delete real HOME (%s)", abs)
 	}
 	// Only ever RemoveAll a genuine shallow profile (real .caam-shallow.json), so a
-	// symlinked base can't make this delete arbitrary real-home data.
+	// symlinked base ANCESTOR (a symlinked leaf is already refused at NewManager)
+	// can't make this delete arbitrary real-home data.
 	if err := m.assertIsShallowProfile(home); err != nil {
 		return err
 	}

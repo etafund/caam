@@ -203,6 +203,7 @@ caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 
 - A profile isolates the **harness recorded in its metadata**. Launching a *different* harness from its shell is **not** isolated (its root passes through the symlink farm) — use a profile of the right provider.
 - Claude's **secondary** auth (`~/.config/claude-code/auth.json`) and the **macOS Keychain** are **not** isolated in this version; isolation is file-based.
+- A Codex `config.toml` with a custom `[model_providers.*] env_key` is **not** sanitized — an inherited value of that key could still authenticate. Shallow create writes a fresh minimal `config.toml` (so the user's other Codex settings aren't carried into the shallow session).
 
 **Subcommands:**
 

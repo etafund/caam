@@ -1235,6 +1235,19 @@ func TestValidateLayoutRejectsBadDescriptors(t *testing.T) {
 		"bad vault name": func(l *Layout) {
 			l.Credentials = []AuthFile{{VaultName: "../evil", DestRel: ".g/sub/tok", Primary: true, Required: true}}
 		},
+		"root in both skip and allow (FIX 6)": func(l *Layout) {
+			l.InnerSkip = map[string][]string{".g": {"a"}}
+			l.InnerSymlinkAllow = map[string][]string{".g": {"b"}}
+		},
+		"bad InnerSkip key abs (FIX 6)": func(l *Layout) {
+			l.InnerSkip = map[string][]string{"/abs": {"a"}}
+		},
+		"bad InnerSymlinkAllow key backslash (FIX 6)": func(l *Layout) {
+			l.InnerSymlinkAllow = map[string][]string{`.g\sub`: {"a"}}
+		},
+		"bad InnerSkip key dotdot (FIX 6)": func(l *Layout) {
+			l.InnerSkip = map[string][]string{"..": {"a"}}
+		},
 	}
 	for name, mut := range cases {
 		l := good()
@@ -1275,8 +1288,10 @@ func TestBaseDirNestingGuardDotDotPrefix(t *testing.T) {
 	assertAbsent(t, filepath.Join(got, "..orch-homes"))
 }
 
-// 18. Symlinked-base aliasing: (a) base symlink → realHome rejected; (b) base
-// symlink → a second real dir is honored, never the alias target.
+// 18. Symlinked-base aliasing: BOTH a base symlink → realHome AND a base symlink
+// → a second real dir are now rejected (FIX 3): a symlinked base LEAF lets
+// destructive ops operate under the alias target, so NewManager refuses it
+// regardless of where the alias points.
 func TestRejectsSymlinkedBaseAliasingRealHome(t *testing.T) {
 	// (a) base symlink whose target IS realHome.
 	realHome := fakeHome(t)
@@ -1289,7 +1304,8 @@ func TestRejectsSymlinkedBaseAliasingRealHome(t *testing.T) {
 		t.Fatalf("NewManager should reject a base symlink targeting realHome")
 	}
 
-	// (b) base symlink to a SECOND real dir (not realHome).
+	// (b) base symlink to a SECOND real dir (not realHome) is ALSO rejected now —
+	// a symlinked base leaf is refused outright (FIX 3).
 	secondReal := filepath.Join(t.TempDir(), "second")
 	if err := os.MkdirAll(secondReal, 0o700); err != nil {
 		t.Fatal(err)
@@ -1298,22 +1314,8 @@ func TestRejectsSymlinkedBaseAliasingRealHome(t *testing.T) {
 	if err := os.Symlink(secondReal, aliasB); err != nil {
 		t.Fatal(err)
 	}
-	mgr, err := NewManager(aliasB, realHome)
-	if err != nil {
-		t.Fatalf("NewManager via second-dir alias should succeed: %v", err)
-	}
-	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
-		t.Fatalf("Create via alias: %v", err)
-	}
-	// The profile is created inside the SECOND real dir, not the alias target.
-	if _, err := os.Lstat(filepath.Join(secondReal, "alice", ProfileMetaFilename)); err != nil {
-		t.Fatalf("profile should live in second real dir: %v", err)
-	}
-	if _, err := mgr.Create("alice", CreateOptions{Force: true}); err != nil {
-		t.Fatalf("force overwrite: %v", err)
-	}
-	if err := mgr.Delete("alice"); err != nil {
-		t.Fatalf("Delete: %v", err)
+	if _, err := NewManager(aliasB, realHome); err == nil {
+		t.Fatalf("NewManager should reject a symlinked base leaf even when it targets a second real dir")
 	}
 	// realHome's data untouched.
 	if _, err := os.Stat(filepath.Join(realHome, ".bashrc")); err != nil {
@@ -1413,19 +1415,24 @@ func TestDestructiveOpsRefuseNonProfileDir(t *testing.T) {
 	}
 }
 
-// Phase 3.5: a canonical-base symlink (/tmp/b -> <realHome>/profiles) does not
-// leave a `profiles` symlink inside the shallow HOME (canonical-base skip).
+// Phase 3.5: a canonical-base whose ANCESTOR is a symlink into realHome does not
+// leave the resolved top-level component as a symlink inside the shallow HOME
+// (canonical-base skip). The base LEAF itself is a real dir (FIX 3 rejects only
+// symlinked leaves), so the symlink lives one level up.
 func TestCanonicalBaseSymlinkNotExposed(t *testing.T) {
 	home := fakeHome(t)
-	// realHome/profiles is the actual base; the manager is given a symlink to it.
-	realBase := filepath.Join(home, "profiles")
-	if err := os.MkdirAll(realBase, 0o700); err != nil {
+	// realHome/realdir is the real target; the base is <alias>/profiles where the
+	// alias is a symlink to realHome/realdir. The base leaf (profiles) is a real
+	// dir, but its canonical form resolves under realHome/realdir.
+	realDir := filepath.Join(home, "realdir")
+	if err := os.MkdirAll(filepath.Join(realDir, "profiles"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	aliasBase := filepath.Join(t.TempDir(), "b")
-	if err := os.Symlink(realBase, aliasBase); err != nil {
+	alias := filepath.Join(t.TempDir(), "b")
+	if err := os.Symlink(realDir, alias); err != nil {
 		t.Fatal(err)
 	}
+	aliasBase := filepath.Join(alias, "profiles")
 	mgr, err := NewManager(aliasBase, home)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
@@ -1434,8 +1441,9 @@ func TestCanonicalBaseSymlinkNotExposed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No `profiles` symlink (the canonical base component) inside the profile.
-	assertAbsent(t, filepath.Join(got, "profiles"))
+	// No `realdir` symlink (the canonical base's top-level component under
+	// realHome) inside the profile.
+	assertAbsent(t, filepath.Join(got, "realdir"))
 }
 
 // Sanity: the shipped layouts' primary VaultName matches what `caam backup`
@@ -1454,5 +1462,238 @@ func TestLayoutVaultNamesMatchAuthfile(t *testing.T) {
 	}
 	if got, want := codex.Primary().VaultName, filepath.Base(authfile.CodexAuthFiles().Files[0].Path); got != want {
 		t.Fatalf("codex primary VaultName = %q, want %q", got, want)
+	}
+}
+
+// FIX 1: a vault/CAAM_HOME nested UNDER a layout RealDir (e.g. ~/.claude/caam)
+// must NOT be mirrored into the profile by populateInnerSymlinks. Without the
+// per-candidate isProtectedSource check, <profile>/.claude/caam would become a
+// symlink to ~/.claude/caam, exposing the vault/base/sibling profiles.
+func TestVaultUnderRealDirNotExposed(t *testing.T) {
+	home := fakeHome(t)
+	// Seed CAAM_HOME (and the vault) UNDER the real ~/.claude dir.
+	caamHome := filepath.Join(home, ".claude", "caam")
+	vaultRoot := filepath.Join(caamHome, "vault")
+	if err := os.MkdirAll(filepath.Join(vaultRoot, "claude", "secret"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CAAM_HOME", caamHome)
+
+	mgr := newMgr(t, home)
+	mgr.SetVaultRoot(vaultRoot)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The nested vault component must be ABSENT inside .claude (not a symlink).
+	assertAbsent(t, filepath.Join(got, ".claude", "caam"))
+	// Belt-and-suspenders: no symlink anywhere in the profile resolves into the vault.
+	vaultResolved, _ := filepath.EvalSymlinks(vaultRoot)
+	err = filepath.WalkDir(got, func(p string, _ os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		st, err := os.Lstat(p)
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		resolved, err := filepath.EvalSymlinks(p)
+		if err != nil {
+			return nil
+		}
+		if resolved == vaultResolved || strings.HasPrefix(resolved, vaultResolved+string(os.PathSeparator)) {
+			return fmt.Errorf("symlink %s resolves into the vault: %s", p, resolved)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("vault exposure: %v", err)
+	}
+}
+
+// FIX 2: ValidateProfileShape rejects a profile whose RealDir was swapped for a
+// symlink to the real ~/.codex, and passes for a freshly-created profile. It
+// also errors when a required credential or config.toml is deleted.
+func TestValidateProfileShapeRejectsSymlinkedParent(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	layout, err := LayoutForProvider("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Positive: a fresh profile passes.
+	if err := mgr.ValidateProfileShape("alice", layout); err != nil {
+		t.Fatalf("fresh profile should pass ValidateProfileShape: %v", err)
+	}
+
+	// Replace <home>/.codex with a symlink to the real ~/.codex.
+	codexDir := filepath.Join(got, ".codex")
+	if err := os.RemoveAll(codexDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(home, ".codex"), codexDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateProfileShape("alice", layout); err == nil {
+		t.Fatalf("ValidateProfileShape should reject a symlinked .codex dir")
+	}
+
+	// Fresh profile, then delete the required credential → error.
+	got2, err := mgr.Create("bob", CreateOptions{Provider: "codex", Force: true})
+	_ = got2
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobHome := filepath.Join(mgr.BaseDir(), "bob")
+	if err := os.Remove(filepath.Join(bobHome, ".codex", "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateProfileShape("bob", layout); err == nil {
+		t.Fatalf("ValidateProfileShape should reject a missing required credential")
+	}
+
+	// Fresh profile, then delete config.toml (a RealFile) → error.
+	if _, err := mgr.Create("carol", CreateOptions{Provider: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	carolHome := filepath.Join(mgr.BaseDir(), "carol")
+	if err := os.Remove(filepath.Join(carolHome, ".codex", "config.toml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.ValidateProfileShape("carol", layout); err == nil {
+		t.Fatalf("ValidateProfileShape should reject a missing config.toml")
+	}
+}
+
+// FIX 3: NewManager rejects a symlinked base LEAF (but not symlinked ancestors).
+func TestRejectsSymlinkedBaseLeaf(t *testing.T) {
+	home := fakeHome(t)
+	realDir := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(realDir, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewManager(link, home); err == nil {
+		t.Fatalf("NewManager should reject a symlinked base leaf")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error = %v, want a symlink-refusal", err)
+	}
+
+	// A symlinked ANCESTOR with a real leaf is fine (e.g. symlinked tmpdir).
+	ancestorLink := filepath.Join(t.TempDir(), "anc")
+	if err := os.Symlink(realDir, ancestorLink); err != nil {
+		t.Fatal(err)
+	}
+	leaf := filepath.Join(ancestorLink, "base") // base leaf is a real dir under the alias
+	if err := os.MkdirAll(filepath.Join(realDir, "base"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewManager(leaf, home); err != nil {
+		t.Fatalf("NewManager should accept a symlinked ANCESTOR with a real leaf: %v", err)
+	}
+}
+
+// FIX 4: a --force create with a bad source must NOT destroy the existing
+// profile — the source preflight fails before the RemoveAll.
+func TestForcePreflightDoesNotDestroyOnBadSource(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	// Create a real claude profile with a custom .claude.json so we can detect survival.
+	src := credSource(t, `{"v":"original"}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", SourceClaudeJSON: src}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	before, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force-recreate with a nonexistent --from-claude-json source → must error.
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		SourceClaudeJSON: "/nonexistent/claude.json",
+	}); err == nil {
+		t.Fatalf("expected error for nonexistent --from-claude-json source")
+	}
+	// The original profile must still exist intact.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("original profile should survive a bad-source --force: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatalf("original .claude.json destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf(".claude.json changed: before=%q after=%q", before, after)
+	}
+
+	// Also: a bad --from-file source.
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		CredentialSource: "/nonexistent/creds.json",
+	}); err == nil {
+		t.Fatalf("expected error for nonexistent --from-file source")
+	}
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("original profile should survive a bad --from-file --force: %v", err)
+	}
+
+	// Also: a --from-vault dir missing the required credential.
+	emptyVault := t.TempDir()
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:            "codex",
+		Force:               true,
+		CredentialSourceDir: emptyVault,
+		CredentialFromLabel: "vault:codex/alice",
+	}); err == nil {
+		t.Fatalf("expected error for vault dir missing required credential")
+	}
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("original profile should survive a bad --from-vault --force: %v", err)
+	}
+}
+
+// FIX 5: LayoutForProvider returns a deep copy — mutating it must not affect a
+// later fetch of the same provider.
+func TestLayoutForProviderReturnsIndependentCopy(t *testing.T) {
+	first, err := LayoutForProvider("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mutate the returned layout's maps/slices.
+	first.InnerSymlinkAllow[".codex"] = append(first.InnerSymlinkAllow[".codex"], "POISON")
+	first.InnerSymlinkAllow["EVIL_ROOT"] = []string{"x"}
+	first.RealDirs = append(first.RealDirs, "EVIL_DIR")
+	first.RealDirs[0] = "MUTATED"
+	first.Credentials[0].VaultName = "MUTATED"
+
+	second, err := LayoutForProvider("codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := second.InnerSymlinkAllow[".codex"]; len(got) != 2 || got[0] != "sessions" || got[1] != "history.jsonl" {
+		t.Fatalf("InnerSymlinkAllow[.codex] leaked mutation: %v", got)
+	}
+	if _, bad := second.InnerSymlinkAllow["EVIL_ROOT"]; bad {
+		t.Fatalf("InnerSymlinkAllow gained EVIL_ROOT from a prior mutation")
+	}
+	if len(second.RealDirs) != 1 || second.RealDirs[0] != ".codex" {
+		t.Fatalf("RealDirs leaked mutation: %v", second.RealDirs)
+	}
+	if second.Credentials[0].VaultName != "auth.json" {
+		t.Fatalf("Credentials leaked mutation: %v", second.Credentials[0])
 	}
 }

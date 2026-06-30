@@ -230,7 +230,15 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 			}
 			enc := json.NewEncoder(cmd.OutOrStdout())
 			enc.SetIndent("", "  ")
-			return enc.Encode(output)
+			_ = enc.Encode(output)
+			// Emit the JSON error envelope on stdout but still exit non-zero
+			// (so automation checking $? isn't misled), and silence cobra so it
+			// doesn't also print the human error after the JSON.
+			if err != nil {
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+			return err
 		}
 		return err
 	}
@@ -347,17 +355,33 @@ type shallowListOutput struct {
 	BaseDir  string            `json:"base_dir"`
 	Profiles []shallowListItem `json:"profiles"`
 	Count    int               `json:"count"`
+	Error    string            `json:"error,omitempty"`
 }
 
 func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 	jsonOut, _ := cmd.Flags().GetBool("json")
+	// emitErr surfaces an early-return error as JSON (mirroring the list output
+	// struct, so a `--json` consumer always gets valid JSON) when --json is set;
+	// otherwise it returns the bare error for the human path.
+	emitErr := func(err error) error {
+		if jsonOut {
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(shallowListOutput{Error: err.Error()})
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return err
+		}
+		return err
+	}
+
 	mgr, err := resolveShallowManager(cmd)
 	if err != nil {
-		return fmt.Errorf("init shallow manager: %w", err)
+		return emitErr(fmt.Errorf("init shallow manager: %w", err))
 	}
 	profiles, err := mgr.List()
 	if err != nil {
-		return fmt.Errorf("list shallow profiles: %w", err)
+		return emitErr(fmt.Errorf("list shallow profiles: %w", err))
 	}
 
 	if jsonOut {
@@ -447,7 +471,12 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 			}
 			enc := json.NewEncoder(cmd.OutOrStdout())
 			enc.SetIndent("", "  ")
-			return enc.Encode(out)
+			_ = enc.Encode(out)
+			if err != nil {
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+			return err
 		}
 		return err
 	}
@@ -465,7 +494,9 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if !force && !jsonOut {
-		fmt.Fprintf(cmd.OutOrStdout(), "Delete shallow profile %q? [y/N]: ", name)
+		// Prompt on stderr (consistent with the create empty-cred nudge) so a
+		// caller capturing stdout doesn't conflate the prompt with output.
+		fmt.Fprintf(cmd.ErrOrStderr(), "Delete shallow profile %q? [y/N]: ", name)
 		var confirm string
 		_, _ = fmt.Fscanln(cmd.InOrStdin(), &confirm)
 		if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
@@ -506,7 +537,15 @@ Examples:
 Use 'caam shallow-spawn <name> --print-env' to print eval-able shell statements
 (export KEY='value' for the vars set, unset KEY for the vars cleared) that
 WOULD be applied without executing anything (useful for shell wrappers:
-eval "$(caam shallow-spawn <name> --print-env)").`,
+eval "$(caam shallow-spawn <name> --print-env)").
+
+Note: on a malformed or missing profile, --print-env prints NOTHING and exits
+non-zero, so wrappers should check $? before eval'ing its output:
+out="$(caam shallow-spawn <name> --print-env)" && eval "$out".
+
+Pass --json to get machine-readable output instead: errors become
+{"success":false,"error":...} on stdout, and --print-env --json emits
+{"success":true,"home":...,"shallow_profile":...,"set":{...},"unset":[...]}.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runShallowSpawn,
 }
@@ -514,24 +553,55 @@ eval "$(caam shallow-spawn <name> --print-env)").`,
 func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print eval-able export/unset statements and exit (no exec)")
+	shallowSpawnCmd.Flags().Bool("json", false, "output as JSON (errors and --print-env)")
+}
+
+// shallowSpawnPrintEnvOutput is the --print-env --json shape: the env transform
+// rendered as data instead of shell statements.
+type shallowSpawnPrintEnvOutput struct {
+	Success        bool              `json:"success"`
+	Home           string            `json:"home"`
+	ShallowProfile string            `json:"shallow_profile"`
+	Set            map[string]string `json:"set"`
+	Unset          []string          `json:"unset"`
 }
 
 func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	rest := args[1:]
 	printEnv, _ := cmd.Flags().GetBool("print-env")
+	jsonOut, _ := cmd.Flags().GetBool("json")
+
+	// emit surfaces a pre-exec error as {"success":false,"error":...} on stdout
+	// (returning nil so the JSON is the sole output) when --json is set; otherwise
+	// it returns the bare error for the human/exit-code path.
+	emit := func(err error) error {
+		if jsonOut {
+			out := struct {
+				Success bool   `json:"success"`
+				Error   string `json:"error"`
+			}{Success: false, Error: err.Error()}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(out)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return err
+		}
+		return err
+	}
 
 	mgr, err := resolveShallowManager(cmd)
 	if err != nil {
-		return fmt.Errorf("init shallow manager: %w", err)
+		return emit(fmt.Errorf("init shallow manager: %w", err))
 	}
 
 	prof, err := mgr.Get(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("shallow profile %q does not exist (try `caam shallow-profile create %s`)", name, name)
+			return emit(fmt.Errorf("shallow profile %q does not exist (try `caam shallow-profile create %s`)", name, name))
 		}
-		return fmt.Errorf("load shallow profile: %w", err)
+		return emit(fmt.Errorf("load shallow profile: %w", err))
 	}
 
 	// STRICT: a profile with missing/unreadable metadata (Meta == nil) or no
@@ -541,15 +611,49 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// LayoutForProvider error — its wording differs and tests depend on the
 	// exact spawn phrasing).
 	if prof.Meta == nil || prof.Meta.Provider == "" {
-		return fmt.Errorf("shallow profile %q has no recorded provider (missing or malformed metadata); recreate it", name)
+		return emit(fmt.Errorf("shallow profile %q has no recorded provider (missing or malformed metadata); recreate it", name))
 	}
 	layout, err := shallow.LayoutForProvider(prof.Meta.Provider) // strict: empty/unknown → error
 	if err != nil {
-		return fmt.Errorf("shallow profile %q uses unsupported provider %q (supported: %s)",
-			name, prof.Meta.Provider, strings.Join(shallow.SupportedProviders(), ", "))
+		return emit(fmt.Errorf("shallow profile %q uses unsupported provider %q (supported: %s)",
+			name, prof.Meta.Provider, strings.Join(shallow.SupportedProviders(), ", ")))
+	}
+
+	// Full pre-spawn integrity check, BEFORE both --print-env and exec: every
+	// real dir / real file / required credential must be present, regular, and
+	// free of a symlinked ancestor. This refuses a profile whose .codex/.claude
+	// directory was swapped for a symlink (which would repoint the session at
+	// another identity's real auth via HOME/CODEX_HOME) — Lstat on the leaf alone
+	// would miss that because it follows symlinked parents.
+	if err := mgr.ValidateProfileShape(name, layout); err != nil {
+		return emit(err)
 	}
 
 	if printEnv {
+		if jsonOut {
+			// Render the env transform as data: `set` mirrors SpawnEnv's writes
+			// (HOME/SHALLOW_PROFILE + provider sets), `unset` is parsed from the
+			// SpawnEnvLines `unset KEY` lines (single source of truth for the
+			// cleared-but-not-reset vars).
+			set := map[string]string{}
+			layout.SpawnEnv(prof.Path, name, set)
+			var unset []string
+			for _, line := range layout.SpawnEnvLines(prof.Path, name) {
+				if k, ok := strings.CutPrefix(line, "unset "); ok {
+					unset = append(unset, k)
+				}
+			}
+			out := shallowSpawnPrintEnvOutput{
+				Success:        true,
+				Home:           prof.Path,
+				ShallowProfile: name,
+				Set:            set,
+				Unset:          unset,
+			}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
+		}
 		// SpawnEnvLines is the single source of truth shared with the exec path:
 		// export KEY='value' for HOME/SHALLOW_PROFILE/provider-sets, then
 		// `unset KEY` for every cleared var not re-set — so a shell wrapper built
@@ -561,32 +665,12 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(rest) == 0 {
-		return fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, layout.DefaultBin)
-	}
-
-	// Cheap pre-spawn integrity check (cooperative-isolation hardening): a
-	// managed credential/policy file must not have been swapped for a symlink
-	// (which could repoint the session at another identity's auth), and each
-	// REQUIRED credential must actually be present as a regular file.
-	for _, p := range layout.ManagedFilePaths(prof.Path) { // managed files that exist
-		if st, err := os.Lstat(p); err == nil && st.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("shallow profile %q has a symlinked managed file %s; refusing (potential identity leak)", name, p)
-		}
-	}
-	for _, c := range layout.Credentials {
-		if !c.Required {
-			continue
-		}
-		cp := filepath.Join(prof.Path, filepath.FromSlash(c.DestRel))
-		st, err := os.Lstat(cp)
-		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
-			return fmt.Errorf("shallow profile %q is missing or has a non-regular credential %s; recreate it", name, c.DestRel)
-		}
+		return emit(fmt.Errorf("missing command after %q (use `caam shallow-spawn %s -- %s`)", name, name, layout.DefaultBin))
 	}
 
 	binPath, err := exec.LookPath(rest[0])
 	if err != nil {
-		return fmt.Errorf("lookup %q: %w", rest[0], err)
+		return emit(fmt.Errorf("lookup %q: %w", rest[0], err))
 	}
 
 	// Build environment: inherit, then apply the layout's spawn transform
