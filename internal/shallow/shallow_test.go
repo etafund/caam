@@ -1667,6 +1667,249 @@ func TestForcePreflightDoesNotDestroyOnBadSource(t *testing.T) {
 	}
 }
 
+// FIX A: a --force create whose source path lives INSIDE the profile being
+// recreated must be rejected BEFORE the RemoveAll — copying it later would fail
+// with the old profile already destroyed and no replacement.
+func TestForceRejectsSourceInsideProfile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	// Create alice with a real credential we can detect surviving.
+	cred := credSource(t, `{"v":"original-alice-cred"}`)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:            "claude",
+		CredentialSource:    cred,
+		CredentialFromLabel: "vault:claude/alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	insideSource := filepath.Join(aliceHome, ".claude", ".credentials.json")
+	before, err := os.ReadFile(insideSource)
+	if err != nil {
+		t.Fatalf("read alice credential: %v", err)
+	}
+
+	// Force-recreate alice using a source that lives INSIDE alice's own profile.
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		CredentialSource: insideSource,
+	}); err == nil {
+		t.Fatalf("expected error for --from-file source inside the profile being recreated")
+	} else if !strings.Contains(err.Error(), "inside the profile being recreated") {
+		t.Fatalf("error %q should mention 'inside the profile being recreated'", err)
+	}
+
+	// alice must still be intact.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a source-inside-profile --force: %v", err)
+	}
+	after, err := os.ReadFile(insideSource)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX B: a present-but-bad IMPLICIT Claude seed (real ~/.claude.json is a
+// DIRECTORY) must fail in preflight, BEFORE the --force RemoveAll, so the old
+// profile survives.
+func TestForcePreflightImplicitClaudeJSONBad(t *testing.T) {
+	home := fakeHome(t)
+	// Replace the real ~/.claude.json (seeded as a file by fakeHome) with a DIR.
+	realClaudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.Remove(realClaudeJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(realClaudeJSON, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := newMgr(t, home)
+	// First create alice with an EXPLICIT good seed so the bad real ~/.claude.json
+	// isn't consulted on the initial create.
+	goodSeed := credSource(t, `{"v":"explicit-good-seed"}`)
+	goodCred := credSource(t, `{"v":"alice-cred"}`)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		SourceClaudeJSON: goodSeed,
+		CredentialSource: goodCred,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	before, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force-recreate WITHOUT an explicit seed → preflight must reject the bad
+	// implicit real ~/.claude.json before the RemoveAll.
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		CredentialSource: goodCred,
+	}); err == nil {
+		t.Fatalf("expected error for a directory real ~/.claude.json seed")
+	}
+	// alice must survive intact.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a bad implicit seed --force: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatalf("alice .claude.json destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice .claude.json changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX B: an OPTIONAL vault artifact that is PRESENT but bad (a directory) must
+// fail in preflight, before the --force RemoveAll. Driven through the unexported
+// preflightSources with a test-only layout that has an optional credential.
+func TestForcePreflightOptionalVaultBad(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	layout := Layout{
+		Provider:   "optvault",
+		DefaultBin: "optvault",
+		RealDirs:   []string{".opt"},
+		Credentials: []AuthFile{
+			{VaultName: "primary", DestRel: ".opt/primary", Primary: true, Required: true},
+			{VaultName: "extra", DestRel: ".opt/extra", Required: false},
+		},
+	}
+
+	vaultDir := t.TempDir()
+	// Required artifact present and good.
+	if err := os.WriteFile(filepath.Join(vaultDir, "primary"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Optional artifact PRESENT but bad (a directory).
+	if err := os.MkdirAll(filepath.Join(vaultDir, "extra"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	profHome := filepath.Join(mgr.BaseDir(), "opt1")
+	err := mgr.preflightSources(profHome, layout, CreateOptions{
+		Provider:            "optvault",
+		CredentialSourceDir: vaultDir,
+	})
+	if err == nil {
+		t.Fatalf("expected preflight to reject a present-but-directory optional vault artifact")
+	}
+
+	// Absent optional artifact must be tolerated.
+	if err := os.RemoveAll(filepath.Join(vaultDir, "extra")); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.preflightSources(profHome, layout, CreateOptions{
+		Provider:            "optvault",
+		CredentialSourceDir: vaultDir,
+	}); err != nil {
+		t.Fatalf("preflight should tolerate an absent optional artifact: %v", err)
+	}
+}
+
+// FIX C: the multi-required mode validation must run BEFORE any RemoveAll. The
+// registry only holds claude/codex (1 required cred each), so we drive the rule
+// through preflightSources / validateCredentialMode directly with a test-only
+// 2-required layout, asserting the mode error fires without touching the dir.
+func TestForceMultiRequiredModeValidatedEarly(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	layout := Layout{
+		Provider:   "multi",
+		DefaultBin: "multi",
+		RealDirs:   []string{".multi"},
+		Credentials: []AuthFile{
+			{VaultName: "a", DestRel: ".multi/a", Primary: true, Required: true},
+			{VaultName: "b", DestRel: ".multi/b", Required: true},
+		},
+	}
+
+	// A would-be existing profile dir; preflight must NOT remove or touch it.
+	existing := filepath.Join(mgr.BaseDir(), "multi1")
+	if err := os.MkdirAll(existing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(existing, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Single --from-file can't satisfy 2 required creds.
+	cred := credSource(t, `{}`)
+	if err := mgr.preflightSources(existing, layout, CreateOptions{
+		Provider:         "multi",
+		CredentialSource: cred,
+	}); err == nil {
+		t.Fatalf("expected --from-file to be rejected for a 2-required layout")
+	} else if !strings.Contains(err.Error(), "multiple required credentials") {
+		t.Fatalf("error %q should mention multiple required credentials", err)
+	}
+
+	// Empty (no-source) create can't satisfy 2 required creds either.
+	if err := mgr.preflightSources(existing, layout, CreateOptions{Provider: "multi"}); err == nil {
+		t.Fatalf("expected empty create to be rejected for a 2-required layout")
+	} else if !strings.Contains(err.Error(), "requires multiple credentials") {
+		t.Fatalf("error %q should mention requiring multiple credentials", err)
+	}
+
+	// Direct unit check of the shared validator.
+	if err := validateCredentialMode(layout, CreateOptions{CredentialSource: cred}); err == nil {
+		t.Fatalf("validateCredentialMode should reject --from-file for 2-required layout")
+	}
+	if err := validateCredentialMode(layout, CreateOptions{}); err == nil {
+		t.Fatalf("validateCredentialMode should reject empty create for 2-required layout")
+	}
+	// A vault dir mode is allowed by validateCredentialMode (per-file checks elsewhere).
+	if err := validateCredentialMode(layout, CreateOptions{CredentialSourceDir: t.TempDir()}); err != nil {
+		t.Fatalf("validateCredentialMode should allow --from-vault for 2-required layout: %v", err)
+	}
+
+	// The existing dir + sentinel must be completely untouched.
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "keep" {
+		t.Fatalf("preflight must not touch the existing dir; sentinel=%q err=%v", got, err)
+	}
+}
+
+// FIX D: a real-home symlink whose target is a not-yet-existing PROTECTED root
+// (e.g. ~/vaultlink -> <vault> before <vault> exists) must be detected by
+// isProtectedSource and NOT mirrored into a created profile.
+func TestDanglingSymlinkToProtectedRootSkipped(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	// A vault root that does NOT exist yet.
+	vaultRoot := filepath.Join(t.TempDir(), "vault-not-yet")
+	mgr.SetVaultRoot(vaultRoot)
+
+	// A top-level real-home symlink pointing at the not-yet-existing vault root.
+	dangler := filepath.Join(home, "vaultlink")
+	if err := os.Symlink(vaultRoot, dangler); err != nil {
+		t.Fatal(err)
+	}
+
+	// Direct check: isProtectedSource catches the dangling alias.
+	if !mgr.isProtectedSource(dangler) {
+		t.Fatalf("isProtectedSource should flag a symlink to a not-yet-existing protected root")
+	}
+
+	got, err := mgr.Create("alice", CreateOptions{Provider: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The dangling alias must be ABSENT in the profile (not mirrored in).
+	assertAbsent(t, filepath.Join(got, "vaultlink"))
+}
+
 // FIX 5: LayoutForProvider returns a deep copy — mutating it must not affect a
 // later fetch of the same provider.
 func TestLayoutForProviderReturnsIndependentCopy(t *testing.T) {

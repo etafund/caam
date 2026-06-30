@@ -84,6 +84,7 @@ func init() {
 	shallowProfileCmd.AddCommand(shallowProfileCreateCmd)
 	shallowProfileCmd.AddCommand(shallowProfileListCmd)
 	shallowProfileCmd.AddCommand(shallowProfileDeleteCmd)
+	shallowProfileCmd.AddCommand(shallowProfileDoctorCmd)
 	rootCmd.AddCommand(shallowProfileCmd)
 	rootCmd.AddCommand(shallowSpawnCmd)
 }
@@ -518,6 +519,181 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// shallowProfileDoctorCmd runs the same pre-spawn integrity check that
+// shallow-spawn performs, but read-only, so you can verify a profile (or all of
+// them) before fanning out parallel sessions.
+var shallowProfileDoctorCmd = &cobra.Command{
+	Use:     "doctor [name]",
+	Aliases: []string{"check"},
+	Short:   "Health-check shallow profiles (read-only pre-spawn integrity check)",
+	Long: `Diagnose one or all shallow profiles. With a name, checks that single
+profile; with no name, checks every profile under the base dir.
+
+For each profile this runs the SAME integrity check that shallow-spawn performs
+right before exec'ing a harness: the recorded provider must be supported, the
+auth-bearing directories/files must be real (not symlinked, no symlinked
+ancestor), and the required credential must be present. It is completely safe
+and read-only — nothing is created, moved, or modified.
+
+Use it before fanning out parallel sessions to catch a profile whose .claude or
+.codex directory was swapped for a symlink, whose credential went missing, or
+whose metadata no longer records a usable provider.
+
+Exit status is non-zero if ANY diagnosed profile is unhealthy (or a named
+profile does not exist), so it composes in scripts. Pass --json for a
+machine-readable report.
+
+Examples:
+  caam shallow-profile doctor                 # check all profiles
+  caam shallow-profile doctor alice           # check one
+  caam shallow-profile doctor --json          # machine-readable, all profiles
+  caam shallow-profile check alice            # alias`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runShallowProfileDoctor,
+}
+
+func init() {
+	shallowProfileDoctorCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+// shallowDoctorResult is one profile's diagnosis.
+type shallowDoctorResult struct {
+	Name     string `json:"name"`
+	Provider string `json:"provider"`
+	Healthy  bool   `json:"healthy"`
+	Error    string `json:"error"`
+}
+
+type shallowDoctorOutput struct {
+	Profiles []shallowDoctorResult `json:"profiles"`
+	Healthy  bool                  `json:"healthy"`
+}
+
+// diagnoseShallowProfile computes the health of a single named profile using the
+// same checks shallow-spawn applies. It never returns an error; a problem is
+// captured in the result's Error field with Healthy=false.
+func diagnoseShallowProfile(mgr *shallow.Manager, name string) shallowDoctorResult {
+	res := shallowDoctorResult{Name: name}
+	prof, err := mgr.Get(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			res.Error = "does not exist"
+		} else {
+			res.Error = err.Error()
+		}
+		return res
+	}
+	if prof.Meta == nil || prof.Meta.Provider == "" {
+		res.Error = "malformed metadata (no recorded provider); recreate it"
+		return res
+	}
+	res.Provider = prof.Meta.Provider
+	layout, err := shallow.LayoutForProvider(prof.Meta.Provider)
+	if err != nil {
+		res.Error = fmt.Sprintf("unsupported provider %q (supported: %s)",
+			prof.Meta.Provider, strings.Join(shallow.SupportedProviders(), ", "))
+		return res
+	}
+	if err := mgr.ValidateProfileShape(name, layout); err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	res.Healthy = true
+	return res
+}
+
+func runShallowProfileDoctor(cmd *cobra.Command, args []string) error {
+	jsonOut, _ := cmd.Flags().GetBool("json")
+
+	emitErr := func(err error) error {
+		if jsonOut {
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(shallowDoctorOutput{Profiles: []shallowDoctorResult{}, Healthy: false})
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return err
+		}
+		return err
+	}
+
+	mgr, err := resolveShallowManager(cmd)
+	if err != nil {
+		return emitErr(fmt.Errorf("init shallow manager: %w", err))
+	}
+
+	// Build the list of names to diagnose: one named arg, or all profiles in
+	// listed order.
+	var names []string
+	single := len(args) == 1
+	if single {
+		names = []string{args[0]}
+	} else {
+		profiles, err := mgr.List()
+		if err != nil {
+			return emitErr(fmt.Errorf("list shallow profiles: %w", err))
+		}
+		for _, p := range profiles {
+			names = append(names, p.Name)
+		}
+	}
+
+	results := make([]shallowDoctorResult, 0, len(names))
+	unhealthy := 0
+	for _, n := range names {
+		r := diagnoseShallowProfile(mgr, n)
+		if !r.Healthy {
+			unhealthy++
+		}
+		results = append(results, r)
+	}
+	allHealthy := unhealthy == 0
+
+	if jsonOut {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(shallowDoctorOutput{Profiles: results, Healthy: allHealthy})
+		if !allHealthy {
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			if single {
+				return fmt.Errorf("shallow profile %q is unhealthy", args[0])
+			}
+			return fmt.Errorf("%d of %d shallow profiles are unhealthy", unhealthy, len(results))
+		}
+		return nil
+	}
+
+	// HUMAN output.
+	if !single && len(results) == 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "No shallow profiles found in %s — nothing to check.\n", mgr.BaseDir())
+		fmt.Fprintln(cmd.OutOrStdout(), "Create one with:")
+		fmt.Fprintln(cmd.OutOrStdout(), "  caam shallow-profile create <name> --from-vault <tool>/<profile>")
+		return nil
+	}
+	for _, r := range results {
+		if r.Healthy {
+			fmt.Fprintf(cmd.OutOrStdout(), "✓ %s (%s): healthy — ready to spawn\n", r.Name, r.Provider)
+			continue
+		}
+		if r.Provider != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "✗ %s (%s): %s\n", r.Name, r.Provider, r.Error)
+		} else {
+			fmt.Fprintf(cmd.OutOrStdout(), "✗ %s: %s\n", r.Name, r.Error)
+		}
+	}
+
+	if !allHealthy {
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		if single {
+			return fmt.Errorf("shallow profile %q is unhealthy", args[0])
+		}
+		return fmt.Errorf("%d of %d shallow profiles are unhealthy", unhealthy, len(results))
+	}
+	return nil
+}
+
 // shallowSpawnCmd sets HOME=<orch-homes>/<name> (plus the provider's env) and
 // execs the requested command.
 var shallowSpawnCmd = &cobra.Command{
@@ -573,8 +749,9 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	jsonOut, _ := cmd.Flags().GetBool("json")
 
 	// emit surfaces a pre-exec error as {"success":false,"error":...} on stdout
-	// (returning nil so the JSON is the sole output) when --json is set; otherwise
-	// it returns the bare error for the human/exit-code path.
+	// when --json is set, then silences cobra and still returns the error so the
+	// process exits non-zero (automation checking $? isn't misled); otherwise it
+	// returns the bare error for the human/exit-code path.
 	emit := func(err error) error {
 		if jsonOut {
 			out := struct {

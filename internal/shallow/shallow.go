@@ -798,7 +798,7 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 	// existing profile and THEN fail in provisionCredentials/CreateManagedFiles,
 	// leaving the user with nothing. (provisionCredentials still does the real
 	// copy later; this is purely a "fail before we delete anything" check.)
-	if err := m.preflightSources(layout, opts); err != nil {
+	if err := m.preflightSources(home, layout, opts); err != nil {
 		return "", err
 	}
 
@@ -905,40 +905,159 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 	return home, nil
 }
 
+// requiredCredCount returns how many of a layout's credentials are Required.
+func requiredCredCount(layout Layout) int {
+	n := 0
+	for _, c := range layout.Credentials {
+		if c.Required {
+			n++
+		}
+	}
+	return n
+}
+
+// validateCredentialMode rejects source/mode combinations that the layout's
+// credential set can't satisfy, INDEPENDENT of any filesystem state. It is the
+// single source of truth for "this source mode can't provision this layout":
+// it runs in preflightSources (before the --force RemoveAll) AND in
+// provisionCredentials (the real copy), so the rule can never drift between the
+// two. The concrete rule: a single --from-file or an empty (no-source) create
+// cannot satisfy a layout with MORE THAN ONE required credential.
+func validateCredentialMode(layout Layout, opts CreateOptions) error {
+	if opts.CredentialSourceDir != "" {
+		return nil // a vault dir can supply every artifact; per-file checks happen elsewhere.
+	}
+	required := requiredCredCount(layout)
+	if required <= 1 {
+		return nil
+	}
+	if opts.CredentialSource != "" {
+		return fmt.Errorf("--from-file is not supported for provider %q (it has multiple required credentials); use --from-vault", layout.Provider)
+	}
+	return fmt.Errorf("provider %q requires multiple credentials; create with --from-vault (empty create unsupported)", layout.Provider)
+}
+
 // preflightSources verifies that every credential/managed-file SOURCE the caller
-// supplied actually exists as a regular file, WITHOUT mutating anything. It runs
-// before the --force RemoveAll so a bad source never destroys an existing profile.
-// (provisionCredentials / CreateManagedFiles perform the actual copies later.)
-func (m *Manager) preflightSources(layout Layout, opts CreateOptions) error {
-	mustRegular := func(kind, p string) error {
-		st, err := os.Stat(p)
+// supplied is actually a readable regular file, and that the chosen source mode
+// can provision the layout — WITHOUT mutating anything. It runs before the
+// --force RemoveAll so neither a bad source nor an unsatisfiable mode ever
+// destroys an existing profile. (provisionCredentials / CreateManagedFiles
+// perform the actual copies later.)
+//
+// home is the profile dir the --force RemoveAll is about to delete; any source
+// path inside it is rejected (copying it later would fail post-RemoveAll, with
+// the old profile already gone and no replacement).
+func (m *Manager) preflightSources(home string, layout Layout, opts CreateOptions) error {
+	// Mode validation first — cheapest, filesystem-independent, and the most
+	// important "fail before we delete anything" guard for multi-required layouts.
+	if err := validateCredentialMode(layout, opts); err != nil {
+		return err
+	}
+
+	// rejectInsideProfile fails if a source path equals or is inside `home`.
+	// We compare BOTH the lexical-cleaned path AND (when it exists) the
+	// symlink-resolved path, so neither a literal nor a symlink-aliased source
+	// inside the about-to-be-deleted profile slips through.
+	rejectInsideProfile := func(kind, p string) error {
+		homeClean := filepath.Clean(home)
+		homeResolved, homeResolvedOK := "", false
+		if c, err := resolveExistingSymlinks(home); err == nil {
+			homeResolved, homeResolvedOK = filepath.Clean(c), true
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return fmt.Errorf("%s %s could not be resolved: %w", kind, p, err)
+		}
+		candidates := []string{filepath.Clean(abs)}
+		if c, err := resolveExistingSymlinks(abs); err == nil {
+			candidates = append(candidates, filepath.Clean(c))
+		}
+		for _, cand := range candidates {
+			if pathEqualOrUnder(cand, homeClean) {
+				return fmt.Errorf("%s source %s is inside the profile being recreated; copy it elsewhere first", kind, p)
+			}
+			if homeResolvedOK && pathEqualOrUnder(cand, homeResolved) {
+				return fmt.Errorf("%s source %s is inside the profile being recreated; copy it elsewhere first", kind, p)
+			}
+		}
+		return nil
+	}
+
+	// mustReadable opens the path (proving os.Open will succeed for the later
+	// copy — Stat alone does not) and requires it be a regular file.
+	mustReadable := func(kind, p string) error {
+		f, err := os.Open(p)
 		if err != nil {
 			return fmt.Errorf("%s %q is missing or unreadable: %w", kind, p, err)
+		}
+		st, statErr := f.Stat()
+		_ = f.Close()
+		if statErr != nil {
+			return fmt.Errorf("%s %q is unreadable: %w", kind, p, statErr)
 		}
 		if !st.Mode().IsRegular() {
 			return fmt.Errorf("%s %q is not a regular file", kind, p)
 		}
 		return nil
 	}
+
 	if opts.CredentialSource != "" {
-		if err := mustRegular("--from-file source", opts.CredentialSource); err != nil {
+		if err := rejectInsideProfile("--from-file", opts.CredentialSource); err != nil {
+			return err
+		}
+		if err := mustReadable("--from-file source", opts.CredentialSource); err != nil {
 			return err
 		}
 	}
 	if opts.SourceClaudeJSON != "" {
-		if err := mustRegular("--from-claude-json source", opts.SourceClaudeJSON); err != nil {
+		if err := rejectInsideProfile("--from-claude-json", opts.SourceClaudeJSON); err != nil {
+			return err
+		}
+		if err := mustReadable("--from-claude-json source", opts.SourceClaudeJSON); err != nil {
 			return err
 		}
 	}
 	if opts.CredentialSourceDir != "" {
+		if err := rejectInsideProfile("--from-vault", opts.CredentialSourceDir); err != nil {
+			return err
+		}
 		for _, c := range layout.Credentials {
-			if !c.Required {
-				continue // optional artifacts may be absent in the vault dir
-			}
 			src := filepath.Join(opts.CredentialSourceDir, c.VaultName)
-			if err := mustRegular("vault credential", src); err != nil {
+			if c.Required {
+				if err := mustReadable("vault credential", src); err != nil {
+					return err
+				}
+				continue
+			}
+			// Optional artifact: absent is fine, but a present one will be copied
+			// later, so require it be a readable regular file (Lstat first so a
+			// dangling symlink is "present but bad", not silently absent).
+			if _, err := os.Lstat(src); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return fmt.Errorf("vault credential %q is unreadable: %w", src, err)
+			}
+			if err := mustReadable("vault credential", src); err != nil {
 				return err
 			}
+		}
+	}
+
+	// IMPLICIT Claude seed: createClaudeManagedFiles, when no explicit
+	// SourceClaudeJSON is given, copies the real ~/.claude.json if it EXISTS
+	// (an absent real seed is tolerated — it writes a {} skeleton). Mirror that
+	// exact condition: only when present do we require it be a readable regular
+	// file, so a directory / special / unreadable real ~/.claude.json fails here
+	// BEFORE the RemoveAll, not after in CreateManagedFiles.
+	if opts.Provider == ProviderClaude && opts.SourceClaudeJSON == "" {
+		realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
+		if _, err := os.Lstat(realClaudeJSON); err == nil {
+			if err := mustReadable("real ~/.claude.json seed", realClaudeJSON); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("real ~/.claude.json seed is unreadable: %w", err)
 		}
 	}
 	return nil
@@ -973,15 +1092,10 @@ func (m *Manager) provisionCredentials(home string, layout Layout, opts CreateOp
 	case opts.CredentialSource != "":
 		// A single --from-file maps to the Primary only. Forbid it when the layout
 		// has MORE THAN ONE Required credential — otherwise a single file would
-		// silently leave other required artifacts absent.
-		required := 0
-		for _, c := range layout.Credentials {
-			if c.Required {
-				required++
-			}
-		}
-		if required > 1 {
-			return fmt.Errorf("--from-file is not supported for provider %q (it has multiple required credentials); use --from-vault", layout.Provider)
+		// silently leave other required artifacts absent. (Same rule preflight runs
+		// before the --force RemoveAll; validateCredentialMode is the shared source.)
+		if err := validateCredentialMode(layout, opts); err != nil {
+			return err
 		}
 		if err := copyFileMode(opts.CredentialSource, primDst, 0o600); err != nil {
 			return fmt.Errorf("copy credentials: %w", err)
@@ -989,15 +1103,9 @@ func (m *Manager) provisionCredentials(home string, layout Layout, opts CreateOp
 	default:
 		// No source: write only an empty Primary placeholder. Reject this for a layout
 		// with MORE THAN ONE required credential — an empty-create can't satisfy
-		// multiple required artifacts.
-		required := 0
-		for _, c := range layout.Credentials {
-			if c.Required {
-				required++
-			}
-		}
-		if required > 1 {
-			return fmt.Errorf("provider %q requires multiple credentials; create with --from-vault (empty create unsupported)", layout.Provider)
+		// multiple required artifacts. (Shared rule via validateCredentialMode.)
+		if err := validateCredentialMode(layout, opts); err != nil {
+			return err
 		}
 		if err := writeFileAtomic(primDst, []byte(""), 0o600); err != nil {
 			return fmt.Errorf("write empty credentials: %w", err)
@@ -1039,10 +1147,14 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 		}
 		src := filepath.Join(m.realHome, name)
 		dst := filepath.Join(home, name)
-		// Never expose a CAAM-owned root (vault / base / $CAAM_HOME) even if it
-		// nests under realHome at this top level. This is in ADDITION to the
-		// caamShadowTops skip set above (which also covers the not-yet-existing
-		// case where the root has no real-home entry to skip by name).
+		// Don't create a DIRECT symlink whose target is (or contains/is inside) a
+		// CAAM-owned root (vault / base / $CAAM_HOME), so those aren't enumerable
+		// entries in the shallow HOME. In ADDITION to the caamShadowTops skip set
+		// above (which also covers the not-yet-existing by-name case). NOTE: this
+		// is not full path isolation — `..` traversal through ANY directory
+		// passthrough symlink (e.g. .ssh/../.local/share/caam) can still reach a
+		// protected root. That's accepted under the cooperative, not-a-sandbox
+		// model (see README "Limitations").
 		if m.isProtectedSource(src) {
 			continue
 		}
@@ -1112,8 +1224,11 @@ func (m *Manager) populateInnerSymlinks(home string, layout Layout, root string)
 	link := func(n string) error {
 		src := filepath.Join(srcDir, n)
 		dst := filepath.Join(dstDir, n)
-		// Never expose a CAAM-owned root nested under this inner root (e.g.
-		// CAAM_HOME=~/.claude/caam → don't mirror ~/.claude/caam into the profile).
+		// Don't create a DIRECT symlink to a CAAM-owned root nested under this
+		// inner root (e.g. CAAM_HOME=~/.claude/caam → don't mirror ~/.claude/caam
+		// into the profile), so it isn't an enumerable entry. As at the top level,
+		// this does NOT stop `..` traversal through a sibling directory symlink
+		// (e.g. .codex/sessions/../auth.json) — accepted per the cooperative model.
 		if m.isProtectedSource(src) {
 			return nil
 		}
@@ -1252,6 +1367,33 @@ func (m *Manager) isProtectedSource(absSource string) bool {
 	for _, root := range m.protectedRoots() {
 		if pathRelatedOrEqual(src, root) {
 			return true
+		}
+	}
+	// Dangling-symlink case: absSource is itself a symlink whose target does
+	// NOT yet exist (so resolveExistingSymlinks above never reached it via the
+	// real-home entry). Read the link explicitly and compare its target — both
+	// lexically and (best-effort) symlink-resolved — against the protected
+	// roots, so e.g. `~/vaultlink -> ~/.local/share/caam` is refused even before
+	// that dir exists.
+	if st, err := os.Lstat(absSource); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		if target, err := os.Readlink(absSource); err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(absSource), target)
+			}
+			target = filepath.Clean(target)
+			for _, root := range m.protectedRoots() {
+				if pathRelatedOrEqual(target, root) {
+					return true
+				}
+			}
+			if c, err := resolveExistingSymlinks(target); err == nil {
+				c = filepath.Clean(c)
+				for _, root := range m.protectedRoots() {
+					if pathRelatedOrEqual(c, root) {
+						return true
+					}
+				}
+			}
 		}
 	}
 	return false

@@ -204,6 +204,8 @@ caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 - A profile isolates the **harness recorded in its metadata**. Launching a *different* harness from its shell is **not** isolated (its root passes through the symlink farm) — use a profile of the right provider.
 - Claude's **secondary** auth (`~/.config/claude-code/auth.json`) and the **macOS Keychain** are **not** isolated in this version; isolation is file-based.
 - A Codex `config.toml` with a custom `[model_providers.*] env_key` is **not** sanitized — an inherited value of that key could still authenticate. Shallow create writes a fresh minimal `config.toml` (so the user's other Codex settings aren't carried into the shallow session).
+- **Directory pass-through symlinks can be traversed with `..`.** Shared directories like `.claude/projects` or `.codex/sessions` are symlinks to your real `~/`, so a path like `$HOME/.claude/projects/../.credentials.json` resolves into the *real* `~/.claude`. caam refuses to create a *direct* symlink whose target is the vault / another profile / `$CAAM_HOME` / the base dir (so they aren't enumerable entries in the shallow HOME), but it cannot stop deliberate `..` traversal — again, this is path isolation for **cooperative** tools, not a sandbox.
+- **A real-HOME top-level directory that *contains* CAAM's vault or base is not passed through.** With no `$CAAM_HOME` set the vault defaults to `~/.local/share/caam`, so `~/.local` is dropped from the shallow HOME (fail-closed, to avoid exposing every account's credentials). If you rely on `~/.local` (or similar) inside shallow sessions, set `$CAAM_HOME` to a dedicated directory (e.g. `~/.caam`) so only that caam-specific dir is withheld.
 
 **Subcommands:**
 
@@ -211,9 +213,12 @@ caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 caam shallow-profile create <name> [--from-vault <tool>/<profile>] [--from-file <path>] [--tool <provider>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
+caam shallow-profile doctor [name] [--json]                                    # health-check
 caam shallow-spawn <name> -- <cmd> [args...]
 caam shallow-spawn <name> --print-env       # emit eval-able export/unset lines, no exec
 ```
+
+`shallow-profile doctor` runs the same read-only integrity check that `shallow-spawn` performs right before exec — the recorded provider must be supported, the auth-bearing dirs/files must be real (not symlinked), and the required credential must be present. With no name it checks every profile; run it before fanning out parallel sessions to catch a corrupted profile early. Pass `--json` for automation. It exits non-zero if any diagnosed profile is unhealthy (or a named one doesn't exist).
 
 `--tool` (`claude` or `codex`) is inferred from `--from-vault`; pass it only when not inferable (with `--from-file`, or for an empty-cred profile). The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests). `--print-env` emits shell-quoted `export KEY='value'` lines for the vars it sets and `unset KEY` for every var it clears, so a wrapper can reproduce the exec path's isolation with `eval "$(caam shallow-spawn <name> --print-env)"`.
 

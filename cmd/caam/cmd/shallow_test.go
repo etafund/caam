@@ -117,9 +117,16 @@ func newShallowTestRoot() *cobra.Command {
 	del.Flags().Bool("force", false, "")
 	del.Flags().Bool("json", false, "")
 
+	doctor := &cobra.Command{
+		Use:  "doctor [name]",
+		Args: shallowProfileDoctorCmd.Args,
+		RunE: shallowProfileDoctorCmd.RunE,
+	}
+	doctor.Flags().Bool("json", false, "")
+
 	parent := &cobra.Command{Use: "shallow-profile"}
 	parent.PersistentFlags().String("base", "", "")
-	parent.AddCommand(create, list, del)
+	parent.AddCommand(create, list, del, doctor)
 
 	spawn := &cobra.Command{
 		Use:  "shallow-spawn <name> -- <cmd>",
@@ -1022,6 +1029,126 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestShallowDoctorHealthy creates a codex profile and asserts doctor reports it
+// healthy and exits zero.
+func TestShallowDoctorHealthy(t *testing.T) {
+	_, _ = shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-alice",
+		"--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "codex-alice")
+	if err != nil {
+		t.Fatalf("doctor: expected exit 0, got %v (stdout=%q)", err, stdout)
+	}
+	if !strings.Contains(stdout, "healthy") {
+		t.Fatalf("expected 'healthy' in output, got %q", stdout)
+	}
+	if !strings.Contains(stdout, "codex-alice") {
+		t.Fatalf("expected profile name in output, got %q", stdout)
+	}
+}
+
+// TestShallowDoctorUnhealthy corrupts a codex profile by deleting its required
+// credential and asserts doctor exits non-zero and names the problem.
+func TestShallowDoctorUnhealthy(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-alice",
+		"--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	// Remove the required credential to make the shape invalid.
+	if err := os.Remove(filepath.Join(base, "codex-alice", ".codex", "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "codex-alice")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for unhealthy profile; stdout=%q", stdout)
+	}
+	if !strings.Contains(stdout, "✗") || !strings.Contains(stdout, "codex-alice") {
+		t.Fatalf("expected a failing line naming the profile, got %q", stdout)
+	}
+}
+
+// TestShallowDoctorMalformedMeta deletes a profile's metadata sidecar and
+// asserts doctor flags it as malformed / no recorded provider.
+func TestShallowDoctorMalformedMeta(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "nometa", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(base, "nometa", ".caam-shallow.json")); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "nometa")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for malformed metadata; stdout=%q", stdout)
+	}
+	if !strings.Contains(stdout, "malformed") || !strings.Contains(stdout, "no recorded provider") {
+		t.Fatalf("expected malformed/no-recorded-provider message, got %q", stdout)
+	}
+}
+
+// TestShallowDoctorJSON diagnoses all profiles (one healthy, one unhealthy) in
+// --json mode and asserts the per-profile flags, the overall healthy=false, and
+// the non-zero exit.
+func TestShallowDoctorJSON(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "good", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "bad",
+		"--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt "bad" by removing its required credential.
+	if err := os.Remove(filepath.Join(base, "bad", ".codex", "auth.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "--json")
+	if err == nil {
+		t.Fatalf("expected non-zero exit when a profile is unhealthy; stdout=%q", stdout)
+	}
+	var resp struct {
+		Healthy  bool `json:"healthy"`
+		Profiles []struct {
+			Name    string `json:"name"`
+			Healthy bool   `json:"healthy"`
+			Error   string `json:"error"`
+		} `json:"profiles"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("unmarshal doctor JSON %q: %v", stdout, err)
+	}
+	if resp.Healthy {
+		t.Fatalf("expected overall healthy=false, got %q", stdout)
+	}
+	byName := map[string]bool{}
+	for _, p := range resp.Profiles {
+		byName[p.Name] = p.Healthy
+	}
+	if !byName["good"] {
+		t.Fatalf("expected 'good' healthy=true, got %q", stdout)
+	}
+	if byName["bad"] {
+		t.Fatalf("expected 'bad' healthy=false, got %q", stdout)
+	}
+}
+
+// TestShallowDoctorAllEmpty runs doctor with no profiles and asserts a friendly
+// message and a zero exit (nothing is unhealthy).
+func TestShallowDoctorAllEmpty(t *testing.T) {
+	_, _ = shallowEnv(t)
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor")
+	if err != nil {
+		t.Fatalf("expected exit 0 with no profiles, got %v (stdout=%q)", err, stdout)
+	}
+	if !strings.Contains(stdout, "No shallow profiles found") {
+		t.Fatalf("expected friendly empty message, got %q", stdout)
+	}
 }
 
 // FuzzParseShallowVaultRef proves parseShallowVaultRef never accepts a
