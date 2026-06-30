@@ -138,7 +138,7 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel sessions across N subscription accounts on the same machine. Supports **Claude Code** and **Codex** today; **Antigravity (`agy`) is the next planned harness** (the engine is built around a provider-keyed layout registry, so it drops in as one descriptor).
+A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel sessions across N subscription accounts on the same machine. Supports **Claude Code**, **Codex**, and **Antigravity (`agy`)** (the engine is built around a provider-keyed layout registry, so a new harness drops in as one descriptor).
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
@@ -187,6 +187,21 @@ caam shallow-profile create scratch                                            #
 
 The Codex `config.toml` is written **fresh and minimal** — it enforces `cli_auth_credentials_store = "file"` (so caam can manage `auth.json`) and deliberately does *not* copy your real config's `model`/`log_dir`/`sqlite_home`. Sharing is the allow-listed CLI transcript state only (`sessions`, `history.jsonl`); full desktop/sidebar history that lives in SQLite is not guaranteed to carry over.
 
+**Antigravity (`agy`) layout** under `<base>/<name>/`:
+
+```
+<shallow-home>/.gemini/                                          real directory
+<shallow-home>/.gemini/antigravity-cli/                           real directory
+<shallow-home>/.gemini/antigravity-cli/antigravity-oauth-token    real file, 0600 (the sole auth artifact; not device-bound)
+<shallow-home>/.gemini/antigravity-cli/settings.json              real file, 0600 (optional — default model + telemetry pref)
+<shallow-home>/.gemini/google_accounts.json                       real file, 0600 (optional — active Google identity)
+<shallow-home>/.gemini/oauth_creds.json                           real file, 0600 (optional — shared Google OAuth cache)
+<shallow-home>/.gemini/...                                        symlink → ~/.gemini/... (legacy gmi state passes through)
+<shallow-home>/.gemini/antigravity-cli/...                        symlink → ~/.gemini/antigravity-cli/... (non-auth state)
+```
+
+Only the oauth token is required; the other three are optional companions copied when present in the vault profile (or skipped otherwise). agy authenticates entirely off that on-disk token file — on Linux it does **not** use the OS keyring, so file-based isolation is effective there; caam treats the file as authoritative on every platform.
+
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
 > **Codex daemon caveat:** a long-lived Codex daemon caches auth in memory. Shallow Codex sessions set `CODEX_HOME` (and `CODEX_SQLITE_HOME`) to the shallow `.codex` **and** use the allow-list above, so a daemon started inside a shallow session is *designed* to belong to that shallow `CODEX_HOME`. This relies on Codex rooting its daemon/socket discovery under `CODEX_HOME`; the exact runtime-dir names are an external Codex artifact and should be verified against your installed Codex.
@@ -201,7 +216,7 @@ caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 
 **Limitations — this is cooperative, same-UID, path-based isolation, NOT a sandbox.** All profiles run as the same Unix user as sibling directories under one base, so a hostile or buggy same-UID process can always read a sibling profile (`$BASE/<other>/...`) or any real `~/` file directly — no `HOME` trick prevents that. For true adversarial isolation use separate users / containers / namespaces. Additionally:
 
-- A profile isolates the **harness recorded in its metadata**. Every registered provider's auth roots (e.g. `.claude`/`.claude.json`, `.codex`) are **withheld** from *every* shallow profile — the active provider's are recreated as real per-identity files, and the others are simply **absent**. So launching a *different* harness from a profile's shell finds **no** auth (fail-closed: it won't silently use your real account) rather than the wrong real credentials — use a profile of the right provider.
+- A profile isolates the **harness recorded in its metadata**. Every registered provider's auth roots (e.g. `.claude`/`.claude.json`, `.codex`, `.gemini`) are **withheld** from *every* shallow profile — the active provider's are recreated as real per-identity files, and the others are simply **absent**. So launching a *different* harness from a profile's shell finds **no** auth (fail-closed: it won't silently use your real account) rather than the wrong real credentials — use a profile of the right provider.
 - Claude shallow auth isolation is **file-based, so it is effective on Linux/Windows** (where the subscription credential lives at `~/.claude/.credentials.json`). On **macOS** the credential is in the encrypted **Keychain**, which a per-profile `.credentials.json` + `HOME` redirect does **not** isolate — do not rely on Claude shallow profiles for per-account isolation on macOS. Claude's **secondary** auth (`~/.config/claude-code/auth.json`) is likewise not isolated.
 - **Credential-bearing Claude *settings* are out of scope.** A real `~/.claude/settings.json` is symlinked into shallow profiles, so a settings-based credential mechanism such as `apiKeyHelper` (which Claude Code prefers over the subscription OAuth credential) would make every shallow profile authenticate the same way, defeating per-account isolation. If you use `apiKeyHelper` (or `ANTHROPIC_API_KEY`/`CLAUDE_CODE_OAUTH_TOKEN` via settings), shallow profiles will not isolate those accounts. (Env-var overrides like `ANTHROPIC_API_KEY` ARE stripped at spawn; file/settings-based ones are not.)
 - A Codex `config.toml` with a custom `[model_providers.*] env_key` is **not** sanitized — an inherited value of that key could still authenticate. Shallow create writes a fresh minimal `config.toml` (so the user's other Codex settings aren't carried into the shallow session).
@@ -222,7 +237,7 @@ caam shallow-spawn <name> --print-env       # emit eval-able export/unset lines,
 
 `shallow-profile doctor` runs the same read-only integrity check that `shallow-spawn` performs right before exec — the recorded provider must be supported, the auth-bearing dirs/files must be real (not symlinked), and the required credential must be present. With no name it checks every profile; run it before fanning out parallel sessions to catch a corrupted profile early. Pass `--json` for automation. It exits non-zero if any diagnosed profile is unhealthy (or a named one doesn't exist).
 
-`--tool` (`claude` or `codex`) is inferred from `--from-vault`; pass it only when not inferable (with `--from-file`, or for an empty-cred profile). The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests). `--print-env` emits shell-quoted `export KEY='value'` lines for the vars it sets and `unset KEY` for every var it clears, so a wrapper can reproduce the exec path's isolation with `eval "$(caam shallow-spawn <name> --print-env)"`.
+`--tool` (`claude`, `codex`, or `agy`) is inferred from `--from-vault`; pass it only when not inferable (with `--from-file`, or for an empty-cred profile). The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests). `--print-env` emits shell-quoted `export KEY='value'` lines for the vars it sets and `unset KEY` for every var it clears, so a wrapper can reproduce the exec path's isolation with `eval "$(caam shallow-spawn <name> --print-env)"`.
 
 **Worked example — mixed Claude + Codex orchestration on a VPS:**
 

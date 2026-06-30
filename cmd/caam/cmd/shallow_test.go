@@ -49,6 +49,15 @@ func fakeShallowHome(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(codexDir, "config.toml"), []byte("# real config\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	// Seed a representative ~/.gemini so agy shallow profiles have a realistic
+	// real HOME to mirror from.
+	antigravityDir := filepath.Join(home, ".gemini", "antigravity-cli")
+	if err := os.MkdirAll(antigravityDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(antigravityDir, "antigravity-oauth-token"), []byte(`{"real":"agy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return home
 }
 
@@ -411,6 +420,78 @@ func stageCodexVault(t *testing.T, profile string) string {
 	return body
 }
 
+// stageAgyVault writes agy's required oauth token plus its optional companion
+// files into the vault profile dir for the given profile.
+func stageAgyVault(t *testing.T, profile string) string {
+	t.Helper()
+	caamHome := os.Getenv("CAAM_HOME")
+	vaultDir := filepath.Join(caamHome, "data", "vault", "agy", profile)
+	if err := os.MkdirAll(vaultDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"auth_method":"oauth","token":"agy-fake"}`
+	if err := os.WriteFile(filepath.Join(vaultDir, "antigravity-oauth-token"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultDir, "google_accounts.json"), []byte(`{"active":"`+profile+`@example.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+// TestShallowCreateAgyFromVault stages an agy vault profile and creates a
+// shallow profile from it, asserting provider/credential routing and that
+// both the required token and the present optional companion are copied.
+func TestShallowCreateAgyFromVault(t *testing.T) {
+	base, _ := shallowEnv(t)
+	body := stageAgyVault(t, "agatha")
+
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "create", "agy-agatha",
+		"--from-vault", "agy/agatha", "--json")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	var resp struct {
+		Success        bool   `json:"success"`
+		Provider       string `json:"provider"`
+		CredentialFrom string `json:"credential_from"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
+		t.Fatalf("unmarshal %q: %v", stdout, err)
+	}
+	if !resp.Success {
+		t.Fatalf("expected success: %q", stdout)
+	}
+	if resp.Provider != "agy" {
+		t.Fatalf("provider %q != agy", resp.Provider)
+	}
+	if resp.CredentialFrom != "vault:agy/agatha" {
+		t.Fatalf("credential_from %q", resp.CredentialFrom)
+	}
+
+	homePath := filepath.Join(base, "agy-agatha")
+	gotToken, err := os.ReadFile(filepath.Join(homePath, ".gemini", "antigravity-cli", "antigravity-oauth-token"))
+	if err != nil {
+		t.Fatalf("read antigravity-oauth-token: %v", err)
+	}
+	if string(gotToken) != body {
+		t.Fatalf("token content %q != %q", gotToken, body)
+	}
+	if _, err := os.ReadFile(filepath.Join(homePath, ".gemini", "google_accounts.json")); err != nil {
+		t.Fatalf("read google_accounts.json: %v", err)
+	}
+	// oauth_creds.json and settings.json were never staged in the vault —
+	// optional + absent must be skipped, not fabricated.
+	for _, rel := range []string{
+		filepath.Join(".gemini", "oauth_creds.json"),
+		filepath.Join(".gemini", "antigravity-cli", "settings.json"),
+	} {
+		if _, err := os.Stat(filepath.Join(homePath, rel)); !os.IsNotExist(err) {
+			t.Fatalf("expected %s to be absent, stat err=%v", rel, err)
+		}
+	}
+}
+
 // TestShallowCreateCodexFromVault stages a codex vault profile and creates a
 // shallow profile from it, asserting provider/credential routing and the
 // codex config.toml normalization.
@@ -526,7 +607,7 @@ func TestShallowCreateUnsupportedVaultTool(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected non-zero exit on error, got nil; stdout=%q", stdout)
 	}
-	if !strings.Contains(stdout, "not supported for shallow profiles (supported: claude, codex)") {
+	if !strings.Contains(stdout, "not supported for shallow profiles (supported: claude, codex, agy)") {
 		t.Fatalf("expected unsupported-tool error, got %q", stdout)
 	}
 }
@@ -613,6 +694,87 @@ func TestShallowSpawnCodexStripsLeakyEnv(t *testing.T) {
 	}
 	if !foundCodexHome {
 		t.Fatalf("env missing %s; got %v", wantCodexHome, gotEnv)
+	}
+	for k, present := range forbidden {
+		if present {
+			t.Fatalf("env should not contain %s; got %v", k, gotEnv)
+		}
+	}
+}
+
+// TestShallowSpawnPrintEnvAgy verifies the agy --print-env output sets only
+// HOME/SHALLOW_PROFILE and UNSETS GEMINI_HOME (agy has no ProviderEnvSet —
+// the redirected HOME alone is enough, so GEMINI_HOME must be cleared, not
+// repointed, unlike codex's CODEX_HOME).
+func TestShallowSpawnPrintEnvAgy(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "agy-alice",
+		"--tool", "agy", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-spawn", "agy-alice", "--print-env")
+	if err != nil {
+		t.Fatalf("spawn print-env: %v", err)
+	}
+	homePath := filepath.Join(base, "agy-alice")
+	mustContain := []string{
+		"export HOME='" + homePath + "'",
+		"export SHALLOW_PROFILE='agy-alice'",
+		"unset GEMINI_HOME",
+		"unset CLAUDE_CONFIG_DIR",
+		"unset CODEX_HOME",
+		"unset CAAM_HOME",
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("print-env missing %q in:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "export GEMINI_HOME") {
+		t.Fatalf("agy must not set GEMINI_HOME explicitly; got:\n%s", stdout)
+	}
+}
+
+// TestShallowSpawnAgyStripsLeakyEnv asserts the exec env redirects HOME to the
+// shallow agy dir and clears an inherited GEMINI_HOME rather than leaking it.
+func TestShallowSpawnAgyStripsLeakyEnv(t *testing.T) {
+	base, _ := shallowEnv(t)
+	t.Setenv("GEMINI_HOME", "/bogus")
+	t.Setenv("CODEX_HOME", "/bogus")
+	t.Setenv("CAAM_HOME", "/bogus")
+
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "agy-alice",
+		"--tool", "agy", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	var gotEnv []string
+	origExec := spawnExec
+	spawnExec = func(bin string, args []string, env []string) error {
+		gotEnv = env
+		return nil
+	}
+	t.Cleanup(func() { spawnExec = origExec })
+
+	if _, _, err := runCmdCaptured(t, "shallow-spawn", "agy-alice", "--", "sh", "-c", "echo hi"); err != nil {
+		t.Fatalf("spawn: %v", err)
+	}
+
+	wantHome := "HOME=" + filepath.Join(base, "agy-alice")
+	foundHome := false
+	forbidden := map[string]bool{"GEMINI_HOME": false, "CODEX_HOME": false, "CAAM_HOME": false}
+	for _, e := range gotEnv {
+		if e == wantHome {
+			foundHome = true
+		}
+		if idx := strings.IndexByte(e, '='); idx > 0 {
+			if _, ok := forbidden[e[:idx]]; ok {
+				forbidden[e[:idx]] = true
+			}
+		}
+	}
+	if !foundHome {
+		t.Fatalf("env missing %s; got %v", wantHome, gotEnv)
 	}
 	for k, present := range forbidden {
 		if present {

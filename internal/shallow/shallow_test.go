@@ -96,6 +96,38 @@ func fakeHome(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(codexDir, "state.sqlite"), []byte("SQLITE"), 0o600); err != nil {
 		t.Fatalf("seed .codex/state.sqlite: %v", err)
 	}
+
+	// .gemini/ structure: agy's auth files plus legacy gmi (Gemini CLI) state
+	// that must still pass through as symlinks for an agy profile.
+	geminiDir := filepath.Join(home, ".gemini")
+	antigravityDir := filepath.Join(geminiDir, "antigravity-cli")
+	if err := os.MkdirAll(antigravityDir, 0o700); err != nil {
+		t.Fatalf("mkdir .gemini/antigravity-cli: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(antigravityDir, "antigravity-oauth-token"), []byte(`{"placeholder":"real-agy"}`), 0o600); err != nil {
+		t.Fatalf("seed antigravity-oauth-token: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(antigravityDir, "settings.json"), []byte(`{"model":"real"}`), 0o600); err != nil {
+		t.Fatalf("seed agy settings.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(geminiDir, "google_accounts.json"), []byte(`{"active":"real@example.com"}`), 0o600); err != nil {
+		t.Fatalf("seed google_accounts.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(geminiDir, "oauth_creds.json"), []byte(`{"access_token":"real"}`), 0o600); err != nil {
+		t.Fatalf("seed oauth_creds.json: %v", err)
+	}
+	// Legacy gmi (Gemini CLI) state, unrelated to agy auth, must still pass
+	// through as a symlink for an agy profile.
+	if err := os.MkdirAll(filepath.Join(geminiDir, "tmp"), 0o700); err != nil {
+		t.Fatalf("mkdir .gemini/tmp: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(geminiDir, "tmp", "marker"), []byte("gmi"), 0o600); err != nil {
+		t.Fatalf("seed .gemini/tmp/marker: %v", err)
+	}
+	// Non-auth antigravity-cli state (cache/logs) must also pass through.
+	if err := os.WriteFile(filepath.Join(antigravityDir, "cache.log"), []byte("log"), 0o600); err != nil {
+		t.Fatalf("seed .gemini/antigravity-cli/cache.log: %v", err)
+	}
 	return home
 }
 
@@ -848,6 +880,127 @@ func TestCreateCodexLayoutEmptyAuth(t *testing.T) {
 	if body, err := os.ReadFile(authDst); err != nil || len(body) != 0 {
 		t.Fatalf("expected empty auth.json, got %q err=%v", body, err)
 	}
+}
+
+// agyVaultDir builds a vault profile dir containing the requested subset of
+// agy's four credential artifacts.
+func agyVaultDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("seed vault file %s: %v", name, err)
+		}
+	}
+	return dir
+}
+
+// Create from a vault dir containing all four agy artifacts: the required
+// token plus the three optional companions, all copied with real 0600 perms.
+func TestCreateAgyLayoutFromVaultDirAllFiles(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	vaultDir := agyVaultDir(t, map[string]string{
+		"antigravity-oauth-token": `{"auth_method":"oauth","token":"agy-token"}`,
+		"google_accounts.json":    `{"active":"alice@example.com"}`,
+		"oauth_creds.json":        `{"access_token":"abc"}`,
+		"settings.json":           `{"model":"Gemini 3.1 Pro"}`,
+	})
+	got, err := mgr.Create("alice", CreateOptions{Provider: "agy", CredentialSourceDir: vaultDir})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assertRealDir(t, filepath.Join(got, ".gemini"))
+	assertRealDir(t, filepath.Join(got, ".gemini", "antigravity-cli"))
+
+	cases := map[string]string{
+		filepath.Join(".gemini", "antigravity-cli", "antigravity-oauth-token"): `{"auth_method":"oauth","token":"agy-token"}`,
+		filepath.Join(".gemini", "google_accounts.json"):                       `{"active":"alice@example.com"}`,
+		filepath.Join(".gemini", "oauth_creds.json"):                           `{"access_token":"abc"}`,
+		filepath.Join(".gemini", "antigravity-cli", "settings.json"):           `{"model":"Gemini 3.1 Pro"}`,
+	}
+	for rel, want := range cases {
+		dst := filepath.Join(got, rel)
+		assertRealFilePerm(t, dst, 0o600)
+		if body, err := os.ReadFile(dst); err != nil || string(body) != want {
+			t.Fatalf("%s = %q err=%v, want %q", rel, body, err, want)
+		}
+	}
+	// Legacy gmi state and non-auth antigravity-cli state still pass through.
+	assertIsSymlink(t, filepath.Join(got, ".gemini", "tmp"))
+	assertIsSymlink(t, filepath.Join(got, ".gemini", "antigravity-cli", "cache.log"))
+}
+
+// Optional companions absent from the vault are skipped, not fabricated —
+// only the required oauth token is written.
+func TestCreateAgyLayoutOptionalFilesAbsentWhenNotInVault(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	vaultDir := agyVaultDir(t, map[string]string{
+		"antigravity-oauth-token": `{"token":"only-token"}`,
+	})
+	got, err := mgr.Create("alice", CreateOptions{Provider: "agy", CredentialSourceDir: vaultDir})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assertRealFilePerm(t, filepath.Join(got, ".gemini", "antigravity-cli", "antigravity-oauth-token"), 0o600)
+	for _, rel := range []string{
+		filepath.Join(".gemini", "google_accounts.json"),
+		filepath.Join(".gemini", "oauth_creds.json"),
+		filepath.Join(".gemini", "antigravity-cli", "settings.json"),
+	} {
+		assertAbsent(t, filepath.Join(got, rel))
+	}
+}
+
+// No credential source: agy gets an empty 0600 token placeholder and no
+// optional companions.
+func TestCreateAgyLayoutEmptyAuth(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "agy"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	tokenDst := filepath.Join(got, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+	assertRealFilePerm(t, tokenDst, 0o600)
+	if body, err := os.ReadFile(tokenDst); err != nil || len(body) != 0 {
+		t.Fatalf("expected empty token, got %q err=%v", body, err)
+	}
+	assertAbsent(t, filepath.Join(got, ".gemini", "google_accounts.json"))
+}
+
+// An agy profile withholds Claude's and Codex's auth roots, and a Claude or
+// Codex profile withholds agy's .gemini — the cross-provider fail-closed
+// guard applies symmetrically to every registered provider.
+func TestAgyProfileWithholdsClaudeAndCodexAuth(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "agy"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	assertRealDir(t, filepath.Join(got, ".gemini"))
+	assertAbsent(t, filepath.Join(got, ".claude"))
+	assertAbsent(t, filepath.Join(got, ".claude.json"))
+	assertAbsent(t, filepath.Join(got, ".codex"))
+}
+
+func TestClaudeAndCodexProfilesWithholdAgyAuth(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	claudeHome, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"c":1}`)})
+	if err != nil {
+		t.Fatalf("Create claude: %v", err)
+	}
+	assertAbsent(t, filepath.Join(claudeHome, ".gemini"))
+
+	codexHome, err := mgr.Create("bob", CreateOptions{Provider: "codex", CredentialSource: credSource(t, `{"x":1}`)})
+	if err != nil {
+		t.Fatalf("Create codex: %v", err)
+	}
+	assertAbsent(t, filepath.Join(codexHome, ".gemini"))
 }
 
 // 6. Metadata records provider + Version 2 + descriptive fields.

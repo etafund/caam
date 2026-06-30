@@ -445,18 +445,19 @@ func checkBasename(n string) error {
 const (
 	ProviderClaude = "claude"
 	ProviderCodex  = "codex"
+	ProviderAgy    = "agy"
 )
 
 // providerOrder is the display order (Claude first, then Codex, then any others
 // alphabetically). All "supported: ..." strings derive from SupportedProviders(),
 // so adding a layout auto-updates every message — in a stable, ergonomic order.
-var providerOrder = []string{ProviderClaude, ProviderCodex}
+var providerOrder = []string{ProviderClaude, ProviderCodex, ProviderAgy}
 
-// layouts is built once and never mutated. Adding Antigravity = add AntigravityLayout()
-// to this call (the single line referenced throughout the plan).
+// layouts is built once and never mutated.
 var layouts = mustBuildLayouts(
 	ClaudeLayout(),
 	CodexLayout(),
+	AgyLayout(),
 )
 
 func mustBuildLayouts(ls ...Layout) map[string]Layout {
@@ -592,6 +593,34 @@ func CodexLayout() Layout {
 			return []EnvVar{{Key: "CODEX_HOME", Value: cx}, {Key: "CODEX_SQLITE_HOME", Value: cx}}
 		},
 		CreateManagedFiles: createCodexManagedFiles,
+	}
+}
+
+func AgyLayout() Layout {
+	return Layout{
+		Provider:   ProviderAgy,
+		DefaultBin: "agy",
+		// Both levels are real dirs: ~/.gemini holds shared Google OAuth state
+		// (legacy Gemini CLI + Antigravity) and ~/.gemini/antigravity-cli holds the
+		// Antigravity-specific token, matching internal/provider/agy's own layout.
+		RealDirs: []string{".gemini", ".gemini/antigravity-cli"},
+		// The oauth token is the sole REQUIRED artifact (it alone authenticates agy).
+		// The other three are optional companions: copied when present in the vault
+		// profile / real HOME, silently skipped otherwise (validateCredentialMode
+		// only enforces this for the single *required* primary).
+		Credentials: []AuthFile{
+			{VaultName: "antigravity-oauth-token", DestRel: ".gemini/antigravity-cli/antigravity-oauth-token", Primary: true, Required: true},
+			{VaultName: "google_accounts.json", DestRel: ".gemini/google_accounts.json"},
+			{VaultName: "oauth_creds.json", DestRel: ".gemini/oauth_creds.json"},
+			{VaultName: "settings.json", DestRel: ".gemini/antigravity-cli/settings.json"},
+		},
+		InnerSymlinkRoots: []string{".gemini", ".gemini/antigravity-cli"},
+		// No ProviderEnvSet: GEMINI_HOME is already in repointingEnvVars, so it's
+		// cleared on every spawn; the redirected HOME alone then makes agy's own
+		// geminiHome() resolve to <home>/.gemini, same as claude needs nothing extra
+		// beyond the HOME redirect. No CreateManagedFiles: agy has no non-credential
+		// real file (no lock file, no config.toml) — all of its real files above are
+		// Credentials entries, so the generic provisioning path covers them.
 	}
 }
 

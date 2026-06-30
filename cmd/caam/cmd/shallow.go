@@ -24,9 +24,10 @@ import (
 // EXCEPT the auth-bearing files for ONE harness. Which files are real, where
 // they live, what env vars to set, and where the credential comes from is
 // captured by a provider-keyed Layout in internal/shallow, so these commands
-// are harness-agnostic: Claude and Codex today, Antigravity-ready. The provider
-// is resolved from --from-vault / --tool at create time (defaulting to claude)
-// and recorded in metadata; shallow-spawn reads it back from metadata.
+// are harness-agnostic: Claude, Codex, and Antigravity (agy) today. The
+// provider is resolved from --from-vault / --tool at create time (defaulting
+// to claude) and recorded in metadata; shallow-spawn reads it back from
+// metadata.
 
 // resolveShallowManager returns a shallow.Manager rooted at the path implied by
 // (in priority order): --base flag, $CAAM_SHALLOW_HOMES_DIR, $CAAM_HOME/shallow-homes,
@@ -61,9 +62,9 @@ own conversation history). Unlike 'caam profile add' which gives each profile
 a blank, fully-isolated HOME, shallow profiles only isolate what MUST differ
 (the credentials).
 
-Shallow profiles support Claude Code and Codex CLI. The provider is inferred
-from --from-vault <tool>/<profile>, set explicitly with --tool, or defaults to
-claude.
+Shallow profiles support Claude Code, Codex CLI, and Antigravity (agy). The
+provider is inferred from --from-vault <tool>/<profile>, set explicitly with
+--tool, or defaults to claude.
 
 Layout under ~/orch-homes/<name>/ for Claude:
 
@@ -77,6 +78,7 @@ Spawn under a shallow identity with:
 
   caam shallow-spawn <name> -- claude
   caam shallow-spawn <name> -- codex
+  caam shallow-spawn <name> -- agy
 
 which sets HOME=~/orch-homes/<name> (plus the provider's env) and execs the command.`,
 }
@@ -99,7 +101,7 @@ var shallowProfileCreateCmd = &cobra.Command{
 credential file into the provider's auth path inside the shallow HOME.
 
 Provider resolution:
-  --from-vault <tool>/<profile>   provider is <tool> (claude or codex)
+  --from-vault <tool>/<profile>   provider is <tool> (claude, codex, or agy)
   --tool <provider>               explicit provider; must agree with --from-vault
   (neither)                       defaults to claude
 
@@ -111,6 +113,7 @@ Credential source (one of):
 Examples:
   caam shallow-profile create alice --from-vault claude/alice@example.com
   caam shallow-profile create cbob  --from-vault codex/bob@example.com
+  caam shallow-profile create agatha --from-vault agy/agatha@example.com
   caam shallow-profile create cbob  --tool codex --from-file /tmp/bob.auth.json
   caam shallow-profile create scratch                 # claude, empty credentials
   caam shallow-profile create cscratch --tool codex   # codex, empty credentials
