@@ -49,9 +49,11 @@ func resolveShallowManager(cmd *cobra.Command) (*shallow.Manager, error) {
 var shallowProfileCmd = &cobra.Command{
 	Use:   "shallow-profile",
 	Short: "Manage shallow profiles for concurrent multi-account use",
-	Long: `Manage shallow profiles — per-identity HOME directories where ONLY the
-auth files of one harness are real and everything else is a symlink back to
-your real HOME.
+	Long: `Manage shallow profiles — per-identity HOME directories where the auth
+files of one harness are real and MOST other entries are symlinks back to your
+real HOME (CAAM-owned roots like the vault/base are withheld, Codex shares only
+an allow-listed subset of ~/.codex, and some credential-bearing config may be
+withheld). It is cooperative path isolation, not a sandbox — see README.
 
 This enables N parallel sessions, each pinned to a different account, while
 preserving shared state (shell history, git config, ssh keys, the harness's

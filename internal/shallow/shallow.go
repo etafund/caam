@@ -815,6 +815,15 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		if err := m.assertIsShallowProfile(home); err != nil {
 			return "", err
 		}
+		// Catastrophic-blast guard: never let a --force RemoveAll target the real
+		// HOME. A pathological --base $(dirname $HOME) + name $(basename $HOME) with a
+		// stray ~/.caam-shallow.json present would otherwise satisfy
+		// assertIsShallowProfile and delete the entire real HOME. Compare BOTH the
+		// lexical-cleaned forms AND the symlink-resolved forms, so a symlink-equivalent
+		// spelling of the real HOME is caught too. (Mirrors Delete's real-HOME guard.)
+		if m.equalsRealHome(home) {
+			return "", fmt.Errorf("refusing to remove %q: it is your real HOME directory", home)
+		}
 		if err := os.RemoveAll(home); err != nil {
 			return "", fmt.Errorf("remove existing profile: %w", err)
 		}
@@ -979,6 +988,15 @@ func (m *Manager) preflightSources(home string, layout Layout, opts CreateOption
 			if homeResolvedOK && pathEqualOrUnder(cand, homeResolved) {
 				return fmt.Errorf("%s source %s is inside the profile being recreated; copy it elsewhere first", kind, p)
 			}
+			// Inode/device fallback for EXISTING paths: a same-file source spelled
+			// differently (case-insensitive FS, symlink-equivalent ancestor) evades the
+			// lexical checks above but would still be deleted by RemoveAll(home).
+			if sameFileOrUnderExisting(cand, homeClean) {
+				return fmt.Errorf("%s source %s is inside the profile being recreated; copy it elsewhere first", kind, p)
+			}
+			if homeResolvedOK && sameFileOrUnderExisting(cand, homeResolved) {
+				return fmt.Errorf("%s source %s is inside the profile being recreated; copy it elsewhere first", kind, p)
+			}
 		}
 		return nil
 	}
@@ -1024,6 +1042,14 @@ func (m *Manager) preflightSources(home string, layout Layout, opts CreateOption
 		for _, c := range layout.Credentials {
 			src := filepath.Join(opts.CredentialSourceDir, c.VaultName)
 			if c.Required {
+				// Reject a required vault credential whose path (lexically OR via a
+				// symlink target) lands back inside the about-to-be-deleted profile —
+				// e.g. vault/<name>/.credentials.json -> <home>/.claude/.credentials.json.
+				// Without this, RemoveAll(home) deletes the symlink target and the
+				// later copy fails with the old profile already gone.
+				if err := rejectInsideProfile("vault credential", src); err != nil {
+					return err
+				}
 				if err := mustReadable("vault credential", src); err != nil {
 					return err
 				}
@@ -1037,6 +1063,10 @@ func (m *Manager) preflightSources(home string, layout Layout, opts CreateOption
 					continue
 				}
 				return fmt.Errorf("vault credential %q is unreadable: %w", src, err)
+			}
+			// Present optional artifact: same inside-profile rejection as required.
+			if err := rejectInsideProfile("vault credential", src); err != nil {
+				return err
 			}
 			if err := mustReadable("vault credential", src); err != nil {
 				return err
@@ -1053,6 +1083,12 @@ func (m *Manager) preflightSources(home string, layout Layout, opts CreateOption
 	if opts.Provider == ProviderClaude && opts.SourceClaudeJSON == "" {
 		realClaudeJSON := filepath.Join(m.realHome, ".claude.json")
 		if _, err := os.Lstat(realClaudeJSON); err == nil {
+			// Reject when the real ~/.claude.json (lexically OR via a symlink target)
+			// resolves into the about-to-be-deleted profile — RemoveAll(home) would
+			// otherwise delete the seed's target before createClaudeManagedFiles copies it.
+			if err := rejectInsideProfile("real ~/.claude.json seed", realClaudeJSON); err != nil {
+				return err
+			}
 			if err := mustReadable("real ~/.claude.json seed", realClaudeJSON); err != nil {
 				return err
 			}
@@ -1369,6 +1405,15 @@ func (m *Manager) isProtectedSource(absSource string) bool {
 			return true
 		}
 	}
+	// Inode/device fallback for EXISTING paths: a case-insensitive-FS or
+	// symlink-equivalent spelling of (or path under) a protected root would evade
+	// the lexical pathRelatedOrEqual checks above. Catch a source that IS, or sits
+	// under, the same dir as a protected root regardless of spelling.
+	for _, root := range m.protectedRoots() {
+		if sameFileOrUnderExisting(src, root) {
+			return true
+		}
+	}
 	// Dangling-symlink case: absSource is itself a symlink whose target does
 	// NOT yet exist (so resolveExistingSymlinks above never reached it via the
 	// real-home entry). Read the link explicitly and compare its target — both
@@ -1413,6 +1458,46 @@ func pathEqualOrUnder(child, parent string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+// sameFileOrUnderExisting reports whether `child` IS (the same inode/device as)
+// `parent`, or sits under a directory that is. It is an inode/device fallback for
+// the purely-lexical pathEqualOrUnder: on a case-insensitive filesystem (or via a
+// symlink/hardlink-equivalent existing path) a same-file path with different
+// spelling/casing evades a lexical Rel comparison. Both child and parent must
+// EXIST; for non-existing/dangling paths it returns false (the caller keeps the
+// lexical check for those).
+//
+// It Stats child and walks its existing PHYSICAL ancestors (filepath.Dir of the
+// symlink-resolved path, so a symlinked ancestor spelling is followed) up to the
+// filesystem root, os.SameFile-comparing each against parent. Climbing all the way
+// up is safe: os.SameFile only matches when two paths are the very same inode on
+// the same device; since a directory cannot be hardlinked, an ancestor ABOVE
+// parent can never spuriously SameFile-match parent — so there is no sibling
+// false-positive risk, and the walk simply catches "child is, or lives under, the
+// same directory as parent" regardless of spelling.
+func sameFileOrUnderExisting(child, parent string) bool {
+	pinfo, err := os.Stat(parent)
+	if err != nil {
+		return false
+	}
+	// Resolve the child's existing symlinks so we walk its PHYSICAL ancestor chain
+	// (e.g. a source reached via a symlinked ancestor resolves to the real path
+	// under parent). Fall back to the lexical path if resolution fails.
+	cur := filepath.Clean(child)
+	if c, err := resolveExistingSymlinks(child); err == nil {
+		cur = filepath.Clean(c)
+	}
+	for {
+		if cinfo, err := os.Stat(cur); err == nil && os.SameFile(cinfo, pinfo) {
+			return true
+		}
+		next := filepath.Dir(cur)
+		if next == cur {
+			return false
+		}
+		cur = next
+	}
 }
 
 // resolveExistingSymlinks canonicalizes the longest EXISTING ancestor of p
@@ -1640,6 +1725,48 @@ func (m *Manager) Get(name string) (*Profile, error) {
 	return p, nil
 }
 
+// equalsRealHome reports whether `home` is the user's real HOME directory,
+// comparing BOTH the lexical-cleaned absolute forms AND the symlink-resolved
+// forms (so a symlink-equivalent spelling of the real HOME is also caught) and,
+// when both exist, an inode/device os.SameFile comparison (so a case-insensitive
+// or hardlink-equivalent spelling is caught too). Shared by Delete and the
+// --force RemoveAll guard so neither destructive op can target the real HOME.
+func (m *Manager) equalsRealHome(home string) bool {
+	abs, err := filepath.Abs(home)
+	if err != nil {
+		return false
+	}
+	abs = filepath.Clean(abs)
+	realClean := filepath.Clean(m.realHome)
+	if abs == realClean {
+		return true
+	}
+	homeResolved, homeOK := "", false
+	if c, err := resolveExistingSymlinks(abs); err == nil {
+		homeResolved, homeOK = filepath.Clean(c), true
+	}
+	realResolved, realOK := "", false
+	if c, err := resolveExistingSymlinks(realClean); err == nil {
+		realResolved, realOK = filepath.Clean(c), true
+	}
+	if homeOK && homeResolved == realClean {
+		return true
+	}
+	if realOK && abs == realResolved {
+		return true
+	}
+	if homeOK && realOK && homeResolved == realResolved {
+		return true
+	}
+	// Inode/device fallback for existing paths.
+	if hi, herr := os.Stat(abs); herr == nil {
+		if ri, rerr := os.Stat(realClean); rerr == nil && os.SameFile(hi, ri) {
+			return true
+		}
+	}
+	return false
+}
+
 // Delete removes a shallow profile and all its files. It is safe even if the
 // directory contains symlinks: os.RemoveAll never traverses them. A symlinked
 // profile path is rejected, and only a genuine shallow profile (real sidecar) is
@@ -1660,7 +1787,8 @@ func (m *Manager) Delete(name string) error {
 		return fmt.Errorf("%s is not a directory", home)
 	}
 	// Sanity guard: never delete the user's real HOME by accident.
-	if abs, err := filepath.Abs(home); err == nil && abs == m.realHome {
+	if m.equalsRealHome(home) {
+		abs, _ := filepath.Abs(home)
 		return fmt.Errorf("refusing to delete real HOME (%s)", abs)
 	}
 	// Only ever RemoveAll a genuine shallow profile (real .caam-shallow.json), so a

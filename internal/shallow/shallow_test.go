@@ -2068,3 +2068,220 @@ func FuzzCheckSlashRel(f *testing.F) {
 		}
 	})
 }
+
+// FIX 1: a --from-vault create whose REQUIRED vault credential is a SYMLINK
+// pointing back INTO the profile being recreated must be rejected BEFORE the
+// --force RemoveAll. Otherwise RemoveAll(home) deletes the symlink target and the
+// later copy fails with the old profile already gone.
+func TestForceRejectsVaultCredSymlinkedIntoProfile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	// Create alice with a real credential we can detect surviving.
+	cred := credSource(t, `{"v":"original-alice-cred"}`)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:            "claude",
+		CredentialSource:    cred,
+		CredentialFromLabel: "vault:claude/alice",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	aliceCred := filepath.Join(aliceHome, ".claude", ".credentials.json")
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("read alice credential: %v", err)
+	}
+
+	// Stage a vault dir OUTSIDE the profile whose .credentials.json is a SYMLINK
+	// pointing INTO alice's own credential.
+	vault := t.TempDir()
+	if err := os.Symlink(aliceCred, filepath.Join(vault, ".credentials.json")); err != nil {
+		t.Fatalf("symlink vault cred: %v", err)
+	}
+
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:            "claude",
+		Force:               true,
+		CredentialSourceDir: vault,
+		CredentialFromLabel: "vault:claude/alice",
+	}); err == nil {
+		t.Fatalf("expected error for a vault credential symlinked into the profile being recreated")
+	} else if !strings.Contains(err.Error(), "inside the profile being recreated") {
+		t.Fatalf("error %q should mention 'inside the profile being recreated'", err)
+	}
+
+	// alice's credential must still be intact.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive the vault-cred-symlink --force: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 1: the IMPLICIT Claude seed (real ~/.claude.json) being a SYMLINK that
+// resolves INTO the profile being recreated must be rejected before the --force
+// RemoveAll, so the old profile survives.
+func TestForceRejectsImplicitSeedSymlinkedIntoProfile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	// Create alice with an explicit seed so the (about-to-be-rigged) implicit real
+	// ~/.claude.json is not consulted on the initial create.
+	goodSeed := credSource(t, `{"v":"explicit-good-seed"}`)
+	goodCred := credSource(t, `{"v":"alice-cred"}`)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		SourceClaudeJSON: goodSeed,
+		CredentialSource: goodCred,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	before, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Replace the real ~/.claude.json with a SYMLINK into alice's profile.
+	realClaudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.Remove(realClaudeJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(aliceHome, ".claude.json"), realClaudeJSON); err != nil {
+		t.Fatalf("symlink real .claude.json into profile: %v", err)
+	}
+
+	// Force-recreate WITHOUT an explicit seed → the implicit seed resolves into the
+	// profile and must be rejected before the RemoveAll.
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		CredentialSource: goodCred,
+	}); err == nil {
+		t.Fatalf("expected error for an implicit seed symlinked into the profile")
+	} else if !strings.Contains(err.Error(), "inside the profile being recreated") {
+		t.Fatalf("error %q should mention 'inside the profile being recreated'", err)
+	}
+
+	// alice must survive intact.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive the implicit-seed-symlink --force: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(aliceHome, ".claude.json"))
+	if err != nil {
+		t.Fatalf("alice .claude.json destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice .claude.json changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 2: a --force create whose computed home EQUALS the real HOME (base =
+// dirname(realHome), name = basename(realHome)) must refuse to RemoveAll, even
+// when a stray .caam-shallow.json sidecar makes it look like a shallow profile.
+func TestForceRefusesToDeleteRealHome(t *testing.T) {
+	realHome := fakeHome(t)
+	// base = dirname(realHome); name = basename(realHome) → home == realHome.
+	base := filepath.Dir(realHome)
+	name := filepath.Base(realHome)
+	mgr, err := NewManager(base, realHome)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	// Remove the implicit Claude seed (real ~/.claude.json, seeded by fakeHome):
+	// since home == realHome, that seed would itself be "inside the profile" and the
+	// FIX 1 preflight would fire first. Removing it lets execution reach the FIX 2
+	// real-HOME RemoveAll guard we are exercising here. (Either guard keeps realHome
+	// intact; this test specifically asserts the real-HOME message.)
+	if err := os.Remove(filepath.Join(realHome, ".claude.json")); err != nil {
+		t.Fatal(err)
+	}
+	// Drop a sidecar so assertIsShallowProfile would otherwise be satisfied, and a
+	// sentinel file we can prove survives.
+	if err := os.WriteFile(filepath.Join(realHome, ProfileMetaFilename), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(realHome, ".bashrc") // seeded by fakeHome
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("sentinel missing before: %v", err)
+	}
+
+	if _, err := mgr.Create(name, CreateOptions{Provider: "claude", Force: true}); err == nil {
+		t.Fatalf("expected --force create to refuse deleting the real HOME")
+	} else if !strings.Contains(err.Error(), "real HOME") {
+		t.Fatalf("error %q should mention 'real HOME'", err)
+	}
+	// The real HOME's contents must survive.
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("real HOME sentinel destroyed: %v", err)
+	}
+}
+
+// FIX 3: the inside-profile rejection must catch a same-file source reached via a
+// symlinked ANCESTOR (a different spelling that os.SameFile-equates to a path
+// inside the profile), which the purely-lexical check would miss.
+func TestInsideProfileCheckUsesSameFile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	cred := credSource(t, `{"v":"original-alice-cred"}`)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		CredentialSource: cred,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+	aliceCred := filepath.Join(aliceHome, ".claude", ".credentials.json")
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink an ancestor: <tmp>/alias -> <aliceHome>/.claude. The source path
+	// <tmp>/alias/.credentials.json is lexically OUTSIDE the profile but, via the
+	// alias, IS the same file as alice's real credential inside the profile.
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Join(aliceHome, ".claude"), alias); err != nil {
+		t.Fatalf("symlink alias: %v", err)
+	}
+	aliasedSource := filepath.Join(alias, ".credentials.json")
+
+	// Also unit-test the SameFile helper directly (portable, no Create needed).
+	if !sameFileOrUnderExisting(aliasedSource, aliceHome) {
+		t.Fatalf("sameFileOrUnderExisting should report the aliased source as inside the profile")
+	}
+	if sameFileOrUnderExisting(cred, aliceHome) {
+		t.Fatalf("sameFileOrUnderExisting should NOT report an unrelated source as inside the profile")
+	}
+
+	// End-to-end: a --force create using the aliased source must be rejected and
+	// must not destroy alice. (resolveExistingSymlinks resolves the alias to the
+	// real .credentials.json inside the profile, so this is caught either by the
+	// resolved lexical check or by the SameFile fallback — both are correct.)
+	if _, err := mgr.Create("alice", CreateOptions{
+		Provider:         "claude",
+		Force:            true,
+		CredentialSource: aliasedSource,
+	}); err == nil {
+		t.Fatalf("expected error for a same-file aliased source inside the profile")
+	} else if !strings.Contains(err.Error(), "inside the profile being recreated") {
+		t.Fatalf("error %q should mention 'inside the profile being recreated'", err)
+	}
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive the aliased-source --force: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
