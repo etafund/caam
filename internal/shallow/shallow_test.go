@@ -2483,3 +2483,149 @@ func TestIsProtectedSourceBidirectionalSameFile(t *testing.T) {
 		t.Fatalf("an unrelated source must not be protected")
 	}
 }
+
+// FIX 1: a --force create whose InnerSymlinkRoot SOURCE in the real HOME is an
+// existing-but-unreadable directory (chmod 000 ~/.claude) must fail BEFORE the
+// RemoveAll, leaving the existing profile + its credential intact.
+//
+// Load-bearing proof: removing the assertInnerRootsReadable preflight call in
+// Create makes this test fail with the post-RemoveAll "populate .claude symlinks:
+// read ..." error and a destroyed profile.
+func TestForcePreflightUnreadableInnerRoot(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	src := credSource(t, `{"v":1}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src}); err != nil {
+		t.Fatalf("initial Create: %v", err)
+	}
+	aliceCred, err := mgr.CredentialPath("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("read alice cred: %v", err)
+	}
+
+	// Make the real ~/.claude (a claude InnerSymlinkRoot source) unreadable.
+	realClaude := filepath.Join(home, ".claude")
+	if err := os.Chmod(realClaude, 0o000); err != nil {
+		t.Fatalf("chmod 000 ~/.claude: %v", err)
+	}
+	// Restore so t.TempDir cleanup (and any later steps) can traverse it.
+	t.Cleanup(func() { _ = os.Chmod(realClaude, 0o700) })
+
+	_, err = mgr.Create("alice", CreateOptions{Provider: "claude", Force: true, CredentialSource: src})
+	if err == nil {
+		t.Fatalf("--force Create should fail when an inner root source is unreadable")
+	}
+	if !strings.Contains(err.Error(), "cannot read provider source") {
+		t.Fatalf("error %q should mention an unreadable provider source", err)
+	}
+	// Must NOT be the post-RemoveAll populate error (that would mean the preflight
+	// is missing and the profile was already destroyed).
+	if strings.Contains(err.Error(), "populate") {
+		t.Fatalf("error %q indicates the failure happened AFTER RemoveAll (preflight missing)", err)
+	}
+
+	// The existing profile + credential must survive (the RemoveAll never happened).
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a refused unreadable-inner-root --force: %v", err)
+	}
+	// Re-enable so we can read the credential back for comparison.
+	if err := os.Chmod(realClaude, 0o700); err != nil {
+		t.Fatalf("restore ~/.claude perms: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 2: ValidateProfileShape must reject a stale/compromised FOREIGN provider
+// auth root. A Claude profile that (legacy/externally) carries `.codex ->
+// ~/.codex` would otherwise run Codex inside it against the REAL Codex auth.
+func TestValidateProfileShapeRejectsStaleForeignRoot(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"c":1}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Positive control: a freshly-created claude profile passes (no foreign roots).
+	if err := mgr.ValidateProfileShape("alice", layout); err != nil {
+		t.Fatalf("fresh claude profile should pass ValidateProfileShape: %v", err)
+	}
+
+	// Plant the foreign root: <home>/.codex -> real ~/.codex.
+	if err := os.Symlink(filepath.Join(home, ".codex"), filepath.Join(got, ".codex")); err != nil {
+		t.Fatal(err)
+	}
+	err = mgr.ValidateProfileShape("alice", layout)
+	if err == nil {
+		t.Fatalf("ValidateProfileShape should reject a stale foreign .codex root")
+	}
+	if !strings.Contains(err.Error(), "foreign provider root") || !strings.Contains(err.Error(), ".codex") {
+		t.Fatalf("error %q should name the foreign .codex root", err)
+	}
+}
+
+// FIX 3: ValidateProfileShape must refuse to treat the user's real HOME as a
+// shallow profile, even when it carries a valid sidecar + claude files. This
+// protects BOTH shallow-spawn and doctor (both route through ValidateProfileShape)
+// from a bad --base/name that would set HOME to the real HOME and run against
+// real auth.
+func TestValidateProfileShapeRefusesRealHome(t *testing.T) {
+	base := t.TempDir()
+	realHome := filepath.Join(base, "realhome")
+	if err := os.MkdirAll(filepath.Join(realHome, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Lay down a valid-looking claude shape + sidecar inside the real HOME.
+	if err := os.WriteFile(filepath.Join(realHome, ".claude", ".credentials.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, ".claude", ".credentials.lock"), []byte(""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, ".claude.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realHome, ProfileMetaFilename), []byte(`{"name":"realhome","provider":"claude","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manager whose base IS `base` and whose realHome IS <base>/realhome, so
+	// HomeFor("realhome") == realHome.
+	mgr, err := NewManager(base, realHome)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	home, err := mgr.HomeFor("realhome")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if home != filepath.Clean(realHome) {
+		t.Fatalf("test setup: HomeFor(realhome)=%q, want realHome=%q", home, realHome)
+	}
+
+	err = mgr.ValidateProfileShape("realhome", layout)
+	if err == nil {
+		t.Fatalf("ValidateProfileShape must refuse the real HOME as a profile")
+	}
+	if !strings.Contains(err.Error(), "real HOME") {
+		t.Fatalf("error %q should mention refusing the real HOME", err)
+	}
+}

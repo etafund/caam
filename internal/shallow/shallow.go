@@ -833,6 +833,15 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		if err := m.assertRealHomeReadable(); err != nil {
 			return "", err
 		}
+		// FIX 1: also preflight each InnerSymlinkRoot SOURCE in the real HOME
+		// (e.g. ~/.claude, ~/.codex). populateInnerSymlinks (run AFTER the RemoveAll)
+		// os.ReadDir's these; an unreadable inner root (e.g. chmod 000 ~/.claude)
+		// would fail AFTER the old profile is gone — old profile lost. Check it here,
+		// with EXACTLY populateInnerSymlinks's missing/ENOTDIR/non-dir tolerance, so
+		// the failure leaves the existing profile intact.
+		if err := m.assertInnerRootsReadable(layout); err != nil {
+			return "", err
+		}
 		if err := os.RemoveAll(home); err != nil {
 			return "", fmt.Errorf("remove existing profile: %w", err)
 		}
@@ -1182,6 +1191,46 @@ func (m *Manager) assertRealHomeReadable() error {
 	// readable, which is fine.
 	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+	}
+	return nil
+}
+
+// assertInnerRootsReadable verifies that each of the layout's InnerSymlinkRoots
+// SOURCE directories in the real HOME (e.g. ~/.claude, ~/.codex) is readable
+// BEFORE the --force RemoveAll. populateInnerSymlinks runs AFTER the RemoveAll
+// and does os.ReadDir on these roots; if a root is an existing-but-unreadable
+// directory (e.g. chmod 000 ~/.claude), that read fails with the old profile
+// already deleted, leaving the user with NOTHING. This preflight reproduces
+// populateInnerSymlinks's EXACT tolerance so it never rejects a create that
+// would have succeeded:
+//   - missing (os.IsNotExist) → OK (no-op there)
+//   - not a directory / ENOTDIR → OK (no-op there)
+//   - existing directory → must be openable + enumerable (Open + Readdirnames(1),
+//     io.EOF = empty-but-readable = OK); any other error → fail BEFORE RemoveAll.
+func (m *Manager) assertInnerRootsReadable(layout Layout) error {
+	for _, root := range layout.InnerSymlinkRoots {
+		srcDir := filepath.Join(m.realHome, filepath.FromSlash(root))
+		st, err := os.Stat(srcDir)
+		if err != nil {
+			// Missing OR an ancestor is a file (ENOTDIR) → populateInnerSymlinks
+			// treats this as a no-op, so it can't fail post-RemoveAll. Tolerate.
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				continue
+			}
+			return fmt.Errorf("cannot read provider source %q: %w", srcDir, err)
+		}
+		if !st.IsDir() {
+			continue // real ~/<root> is a FILE → no-op there too.
+		}
+		f, err := os.Open(srcDir)
+		if err != nil {
+			return fmt.Errorf("cannot read provider source %q: %w", srcDir, err)
+		}
+		_, rderr := f.Readdirnames(1)
+		_ = f.Close()
+		if rderr != nil && !errors.Is(rderr, io.EOF) {
+			return fmt.Errorf("cannot read provider source %q: %w", srcDir, rderr)
+		}
 	}
 	return nil
 }
@@ -1643,6 +1692,14 @@ func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
 	if err != nil {
 		return err
 	}
+	// FIX 3: never treat the user's real HOME (or an ancestor of it) as a shallow
+	// profile. A bad --base/name plus a stray ~/.caam-shallow.json could otherwise
+	// make shallow-spawn/doctor (both route through here) set HOME to the real HOME
+	// and run the harness against REAL auth. wouldRemoveRealHome is the existing
+	// equal-to-or-contains-realHome guard; reuse it.
+	if m.wouldRemoveRealHome(home) {
+		return fmt.Errorf("shallow profile %q: refusing to use your real HOME directory %q as a shallow profile", name, home)
+	}
 	fail := func(component, p string) error {
 		return fmt.Errorf("shallow profile %q: %s %s is missing or compromised (symlinked); recreate it", name, component, p)
 	}
@@ -1705,6 +1762,39 @@ func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
 	}
 	if err := checkRealFile("metadata "+ProfileMetaFilename, filepath.Join(home, ProfileMetaFilename)); err != nil {
 		return err
+	}
+
+	// FIX 2: reject stale/compromised FOREIGN provider auth roots. populateSymlinks
+	// withholds other providers' auth roots only at CREATE time, so a legacy or
+	// externally-created profile (e.g. a Claude profile carrying `.codex ->
+	// ~/.codex`) still passes today and would run the foreign harness against REAL
+	// foreign auth. Compute the foreign reserved tops = every registered provider's
+	// reserved tops MINUS this active layout's own reserved tops; if any foreign top
+	// is PRESENT (symlink or real) under home, fail. A correctly-created profile has
+	// none of these, so this is a no-op for fresh profiles.
+	ownTops := map[string]bool{}
+	for _, d := range layout.RealDirs {
+		ownTops[slashTop(d)] = true
+	}
+	for _, f := range layout.RealFiles {
+		ownTops[slashTop(f)] = true
+	}
+	for _, c := range layout.Credentials {
+		ownTops[slashTop(c.DestRel)] = true
+	}
+	foreignTops := make([]string, 0)
+	for t := range allProviderReservedTops() {
+		if !ownTops[t] {
+			foreignTops = append(foreignTops, t)
+		}
+	}
+	sort.Strings(foreignTops) // deterministic error for tests
+	for _, t := range foreignTops {
+		if _, err := os.Lstat(filepath.Join(home, t)); err == nil {
+			return fmt.Errorf("shallow profile %q: foreign provider root %s is present (stale/compromised); recreate it", name, t)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("shallow profile %q: cannot check foreign provider root %s: %w", name, t, err)
+		}
 	}
 	return nil
 }
