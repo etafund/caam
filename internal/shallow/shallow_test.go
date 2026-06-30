@@ -652,6 +652,22 @@ func newMgr(t *testing.T, home string) *Manager {
 	return mgr
 }
 
+// rewriteRecordedRealHome rewrites the real_home field in an existing profile's
+// metadata sidecar to realHome (preserving the other fields it can read). Used to
+// simulate a profile created under a DIFFERENT HOME, or to keep a profile's
+// recorded HOME aligned with a manager whose realHome a test has mutated.
+func rewriteRecordedRealHome(t *testing.T, home, realHome string) {
+	t.Helper()
+	meta, err := readMeta(home)
+	if err != nil {
+		t.Fatalf("readMeta %s: %v", home, err)
+	}
+	meta.RealHome = realHome
+	if err := writeMeta(home, meta); err != nil {
+		t.Fatalf("writeMeta %s: %v", home, err)
+	}
+}
+
 // assertReal fails unless path is a real (non-symlink) regular file with perm.
 func assertRealFilePerm(t *testing.T, path string, perm os.FileMode) {
 	t.Helper()
@@ -2372,9 +2388,15 @@ func TestForcePreflightUnreadableRealHome(t *testing.T) {
 		t.Fatalf("read alice cred: %v", err)
 	}
 
-	// Now make the real HOME unreadable by pointing the manager at a non-existent
-	// path (NewManager validated a real home; we mutate the field for the test).
-	mgr.realHome = filepath.Join(t.TempDir(), "gone")
+	// Make the real HOME unreadable by pointing the manager at a non-existent path.
+	// To isolate assertRealHomeReadable's failure (and not also trip the FIX 2
+	// HOME-binding guard, which fires when the recorded RealHome differs from the
+	// current one), repoint m.realHome AND rewrite alice's recorded real_home to the
+	// SAME gone path, so the HOME-match guard passes and we reach the real
+	// unreadable-real-HOME preflight.
+	gone := filepath.Join(t.TempDir(), "gone")
+	mgr.realHome = gone
+	rewriteRecordedRealHome(t, filepath.Join(mgr.BaseDir(), "alice"), gone)
 
 	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", Force: true, CredentialSource: src}); err == nil {
 		t.Fatalf("--force Create should fail when the real HOME is unreadable")
@@ -2627,5 +2649,209 @@ func TestValidateProfileShapeRefusesRealHome(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "real HOME") {
 		t.Fatalf("error %q should mention refusing the real HOME", err)
+	}
+}
+
+// FIX 1: a --force create whose InnerSymlinkRoot SOURCE (real ~/.claude) is
+// enumerable (0400: names listable) but NOT searchable (no execute/search bit,
+// so its children can't be Lstat'd) must fail BEFORE the RemoveAll. The old
+// Open+Readdirnames preflight passed a 0400 dir; populateInnerSymlinks then
+// os.Lstat'd each child and EACCES'd AFTER the old profile was already deleted.
+//
+// Load-bearing proof: with the per-child Lstat searchability check removed from
+// assertInnerRootsReadable, this fails with a post-RemoveAll "populate .claude
+// symlinks: ... Lstat ... permission denied" and a lost profile.
+func TestForcePreflightNonSearchableInnerRoot(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	src := credSource(t, `{"v":1}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src}); err != nil {
+		t.Fatalf("initial Create: %v", err)
+	}
+	aliceCred, err := mgr.CredentialPath("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("read alice cred: %v", err)
+	}
+
+	// 0400: ~/.claude is enumerable (it has children like projects/) but NOT
+	// searchable — os.Lstat of any child returns EACCES.
+	realClaude := filepath.Join(home, ".claude")
+	if err := os.Chmod(realClaude, 0o400); err != nil {
+		t.Fatalf("chmod 0400 ~/.claude: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(realClaude, 0o700) })
+
+	_, err = mgr.Create("alice", CreateOptions{Provider: "claude", Force: true, CredentialSource: src})
+	if err == nil {
+		t.Fatalf("--force Create should fail when an inner root source is non-searchable")
+	}
+	if !strings.Contains(err.Error(), "cannot read provider source") {
+		t.Fatalf("error %q should mention an unreadable provider source", err)
+	}
+	// Must NOT be the post-RemoveAll populate error (that would mean the
+	// searchability preflight is missing and the profile was already destroyed).
+	if strings.Contains(err.Error(), "populate") {
+		t.Fatalf("error %q indicates the failure happened AFTER RemoveAll (searchability check missing)", err)
+	}
+
+	// The existing profile + credential must survive byte-identical.
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a refused non-searchable-inner-root --force: %v", err)
+	}
+	if err := os.Chmod(realClaude, 0o700); err != nil {
+		t.Fatalf("restore ~/.claude perms: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 1: same as above but for the real HOME TOP-LEVEL itself (read by
+// populateSymlinks). chmod 0400 the real HOME: its names are listable but its
+// children can't be Lstat'd. assertRealHomeReadable must catch this BEFORE the
+// RemoveAll.
+//
+// Load-bearing proof: removing the per-child Lstat from assertRealHomeReadable
+// makes this fail with a post-RemoveAll "populate symlinks: stat source ...
+// permission denied" and a lost profile.
+func TestForcePreflightNonSearchableRealHome(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+
+	src := credSource(t, `{"v":1}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: src}); err != nil {
+		t.Fatalf("initial Create: %v", err)
+	}
+	aliceCred, err := mgr.CredentialPath("alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("read alice cred: %v", err)
+	}
+
+	// Provide an EXTERNAL .claude.json source so preflightSources' implicit-seed
+	// branch (which Lstats home/.claude.json) is skipped — a 0400 home can't Lstat
+	// its children, so the implicit seed would fail first with a different message.
+	// We want to isolate assertRealHomeReadable's searchability failure here.
+	claudeJSONSrc := credSource(t, `{"seed":true}`)
+
+	// 0400 on the real HOME top-level: enumerable, not searchable (a child like
+	// .bashrc exists but can't be Lstat'd).
+	if err := os.Chmod(home, 0o400); err != nil {
+		t.Fatalf("chmod 0400 real HOME: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(home, 0o700) })
+
+	_, err = mgr.Create("alice", CreateOptions{Provider: "claude", Force: true, CredentialSource: src, SourceClaudeJSON: claudeJSONSrc})
+	if err == nil {
+		t.Fatalf("--force Create should fail when the real HOME top-level is non-searchable")
+	}
+	if !strings.Contains(err.Error(), "cannot read real HOME") {
+		t.Fatalf("error %q should mention an unreadable real HOME", err)
+	}
+	if strings.Contains(err.Error(), "populate") {
+		t.Fatalf("error %q indicates the failure happened AFTER RemoveAll (searchability check missing)", err)
+	}
+
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatalf("restore real HOME perms: %v", err)
+	}
+	if _, err := mgr.Get("alice"); err != nil {
+		t.Fatalf("alice should survive a refused non-searchable-real-HOME --force: %v", err)
+	}
+	after, err := os.ReadFile(aliceCred)
+	if err != nil {
+		t.Fatalf("alice credential destroyed: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("alice credential changed: before=%q after=%q", before, after)
+	}
+}
+
+// FIX 2: Delete must refuse a profile whose recorded real_home differs from the
+// manager's current realHome (a delete run under a DIFFERENT $HOME). The profile
+// dir must survive the refusal.
+func TestDeleteRefusesForeignHomeProfile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"v":1}`)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+
+	// Positive control: a normally-created profile (matching real_home) deletes
+	// fine — assert this on a SEPARATE profile so the foreign one is left intact.
+	if _, err := mgr.Create("bob", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"v":2}`)}); err != nil {
+		t.Fatalf("Create bob: %v", err)
+	}
+	if err := mgr.Delete("bob"); err != nil {
+		t.Fatalf("normally-created profile should delete: %v", err)
+	}
+
+	// Rewrite alice's sidecar to record a DIFFERENT real_home.
+	rewriteRecordedRealHome(t, aliceHome, filepath.Join(t.TempDir(), "other-home"))
+
+	err := mgr.Delete("alice")
+	if err == nil {
+		t.Fatalf("Delete should refuse a profile created for a different HOME")
+	}
+	if !strings.Contains(err.Error(), "different HOME") || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("error %q should mention a different HOME and refusal", err)
+	}
+	// The profile dir must survive.
+	if _, err := os.Stat(aliceHome); err != nil {
+		t.Fatalf("alice profile must survive a refused foreign-HOME delete: %v", err)
+	}
+}
+
+// FIX 2: ValidateProfileShape (spawn AND doctor) must refuse a profile whose
+// recorded real_home differs from the manager's current realHome, and must pass
+// a normally-created profile.
+func TestSpawnShapeRefusesForeignHomeProfile(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude", CredentialSource: credSource(t, `{"v":1}`)}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	aliceHome := filepath.Join(mgr.BaseDir(), "alice")
+
+	// Positive control: a matching-real_home profile passes.
+	if err := mgr.ValidateProfileShape("alice", layout); err != nil {
+		t.Fatalf("normally-created profile should pass ValidateProfileShape: %v", err)
+	}
+
+	// Rewrite the recorded real_home to a different HOME → must be refused.
+	rewriteRecordedRealHome(t, aliceHome, filepath.Join(t.TempDir(), "other-home"))
+	err = mgr.ValidateProfileShape("alice", layout)
+	if err == nil {
+		t.Fatalf("ValidateProfileShape should refuse a profile created for a different HOME")
+	}
+	if !strings.Contains(err.Error(), "different HOME") || !strings.Contains(err.Error(), "refusing") {
+		t.Fatalf("error %q should mention a different HOME and refusal", err)
+	}
+
+	// And an empty recorded real_home is refused too (distinct message).
+	rewriteRecordedRealHome(t, aliceHome, "")
+	err = mgr.ValidateProfileShape("alice", layout)
+	if err == nil {
+		t.Fatalf("ValidateProfileShape should refuse a profile with no recorded HOME")
+	}
+	if !strings.Contains(err.Error(), "no recorded HOME") {
+		t.Fatalf("error %q should mention no recorded HOME", err)
 	}
 }

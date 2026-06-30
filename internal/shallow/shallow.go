@@ -824,7 +824,19 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		if m.wouldRemoveRealHome(home) {
 			return "", fmt.Errorf("refusing to remove %q: it contains your real HOME directory (%q)", home, m.realHome)
 		}
-		// FIX 2: preflight that the real HOME is an existing, readable directory
+		// FIX 2 (HOME binding): don't --force-overwrite a profile that belongs to a
+		// DIFFERENT HOME. The existing profile's meta records the RealHome it was
+		// created under; if that differs from the current m.realHome, the destructive
+		// RemoveAll + rebuild would be operating on another HOME's profile. Load the
+		// meta via the same sidecar assertIsShallowProfile just validated and refuse on
+		// mismatch BEFORE the RemoveAll. (A malformed/unreadable sidecar leaves the old
+		// behavior; assertIsShallowProfile already proved a real sidecar file exists.)
+		if meta, err := readMeta(home); err == nil {
+			if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+				return "", err
+			}
+		}
+		// preflight that the real HOME is an existing, readable directory
 		// BEFORE the RemoveAll. populateSymlinks (run after RemoveAll) reads
 		// m.realHome; if it's missing/unreadable, that read fails AFTER the old
 		// profile is gone and the cleanup defer removes the half-built replacement,
@@ -1189,8 +1201,20 @@ func (m *Manager) assertRealHomeReadable() error {
 	// Readdirnames(1) proves the directory is actually enumerable (Open can
 	// succeed on a dir whose entries can't be listed). io.EOF means empty-but-
 	// readable, which is fine.
-	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+	names, err := f.Readdirnames(1)
+	if err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+	}
+	// FIX 1: enumerability (read bit) is NOT searchability (execute/search bit).
+	// A 0400 dir lists its names but cannot Lstat its children. populateSymlinks
+	// later os.Lstat's each child, which would EACCES post-RemoveAll. Prove
+	// searchability now by Lstat'ing one child (one is enough — a missing search
+	// bit fails for every child). An empty dir has nothing to Lstat, so the
+	// enumerability check above suffices.
+	if len(names) > 0 {
+		if _, err := os.Lstat(filepath.Join(m.realHome, names[0])); err != nil {
+			return fmt.Errorf("cannot read real HOME %q: %w", m.realHome, err)
+		}
 	}
 	return nil
 }
@@ -1226,10 +1250,20 @@ func (m *Manager) assertInnerRootsReadable(layout Layout) error {
 		if err != nil {
 			return fmt.Errorf("cannot read provider source %q: %w", srcDir, err)
 		}
-		_, rderr := f.Readdirnames(1)
+		names, rderr := f.Readdirnames(1)
 		_ = f.Close()
 		if rderr != nil && !errors.Is(rderr, io.EOF) {
 			return fmt.Errorf("cannot read provider source %q: %w", srcDir, rderr)
+		}
+		// FIX 1: prove SEARCHABILITY, not just enumerability. populateInnerSymlinks
+		// os.Lstat's each child of this root; a 0400 dir enumerates names but cannot
+		// Lstat them (no search bit), which would EACCES AFTER the RemoveAll. Lstat
+		// one child here (enough to detect a missing search bit) so the failure
+		// surfaces BEFORE any RemoveAll. An empty dir has no child to stat.
+		if len(names) > 0 {
+			if _, err := os.Lstat(filepath.Join(srcDir, names[0])); err != nil {
+				return fmt.Errorf("cannot read provider source %q: %w", srcDir, err)
+			}
 		}
 	}
 	return nil
@@ -1764,6 +1798,17 @@ func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
 		return err
 	}
 
+	// FIX 2 (HOME binding): refuse a profile whose recorded RealHome differs from
+	// the HOME this manager is running under. spawn AND doctor both route through
+	// here, so this stops a harness being spawned into a profile that was built for
+	// a DIFFERENT $HOME (its symlink farm points back at the OTHER HOME's real
+	// files). A correctly-created profile records the matching RealHome → no-op.
+	if meta, err := readMeta(home); err == nil {
+		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+			return err
+		}
+	}
+
 	// FIX 2: reject stale/compromised FOREIGN provider auth roots. populateSymlinks
 	// withholds other providers' auth roots only at CREATE time, so a legacy or
 	// externally-created profile (e.g. a Claude profile carrying `.codex ->
@@ -1930,6 +1975,51 @@ func (m *Manager) equalsRealHome(home string) bool {
 	return false
 }
 
+// assertProfileRealHomeMatches refuses when a profile's RECORDED RealHome (from
+// its metadata sidecar, written at creation) does not match this manager's
+// current realHome. This binds a profile to the HOME it was created under, so a
+// destructive op or a spawn run with a DIFFERENT $HOME can't operate on it: e.g.
+// `HOME=/tmp/fake caam shallow-profile delete alice --base /home --force` would
+// otherwise compare wouldRemoveRealHome against the wrong (/tmp/fake) realHome
+// and happily delete the real /home/alice.
+//
+// meta == nil is NOT this guard's concern (callers handle nil/malformed metadata
+// separately). For a non-nil meta we REQUIRE a recorded RealHome that equals
+// m.realHome, comparing both the lexical-cleaned forms AND the
+// resolveExistingSymlinks forms (a symlink-equivalent spelling of the same HOME
+// still matches; an empty recorded RealHome is always refused).
+func (m *Manager) assertProfileRealHomeMatches(meta *Meta, home string) error {
+	if meta == nil {
+		return nil
+	}
+	if strings.TrimSpace(meta.RealHome) == "" {
+		return fmt.Errorf("shallow profile %q has no recorded HOME; refusing", home)
+	}
+	recordedClean := filepath.Clean(meta.RealHome)
+	currentClean := filepath.Clean(m.realHome)
+	if recordedClean == currentClean {
+		return nil
+	}
+	recordedResolved, recordedOK := "", false
+	if c, err := resolveExistingSymlinks(meta.RealHome); err == nil {
+		recordedResolved, recordedOK = filepath.Clean(c), true
+	}
+	currentResolved, currentOK := "", false
+	if c, err := resolveExistingSymlinks(m.realHome); err == nil {
+		currentResolved, currentOK = filepath.Clean(c), true
+	}
+	if recordedOK && recordedResolved == currentClean {
+		return nil
+	}
+	if currentOK && currentResolved == recordedClean {
+		return nil
+	}
+	if recordedOK && currentOK && recordedResolved == currentResolved {
+		return nil
+	}
+	return fmt.Errorf("shallow profile %q was created for a different HOME (%q) than the current one (%q); refusing", home, meta.RealHome, m.realHome)
+}
+
 // wouldRemoveRealHome reports whether a RemoveAll(home) would delete the user's
 // real HOME directory — either because home IS the real HOME, OR because home is
 // an ANCESTOR of it (so the real HOME would be removed as a descendant). Unlike
@@ -2011,6 +2101,17 @@ func (m *Manager) Delete(name string) error {
 	// can't make this delete arbitrary real-home data.
 	if err := m.assertIsShallowProfile(home); err != nil {
 		return err
+	}
+	// FIX 2: bind the profile to the HOME it was created under. A delete run with a
+	// DIFFERENT $HOME (so m.realHome differs from the profile's recorded RealHome)
+	// would have compared the real-HOME guards above against the WRONG realHome;
+	// refuse rather than risk deleting real data that belongs to another HOME. A
+	// nil/malformed sidecar leaves meta==nil → this guard is a no-op (the
+	// assertIsShallowProfile sidecar check already gated the destructive path).
+	if meta, err := readMeta(home); err == nil {
+		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+			return err
+		}
 	}
 	return os.RemoveAll(home)
 }
