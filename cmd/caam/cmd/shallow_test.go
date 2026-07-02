@@ -145,6 +145,7 @@ func newShallowTestRoot() *cobra.Command {
 	spawn.Flags().String("base", "", "")
 	spawn.Flags().Bool("print-env", false, "")
 	spawn.Flags().Bool("json", false, "")
+	spawn.Flags().Bool("reload-daemon", false, "")
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
@@ -699,6 +700,96 @@ func TestShallowSpawnCodexStripsLeakyEnv(t *testing.T) {
 		if present {
 			t.Fatalf("env should not contain %s; got %v", k, gotEnv)
 		}
+	}
+}
+
+func TestShallowSpawnCodexReloadDaemon(t *testing.T) {
+	shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-alice", "--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	origCheck := runShallowCodexDaemonCheck
+	origExec := spawnExec
+	var checkProvider string
+	var checkReload bool
+	var gotDaemon bool
+	var gotArgs []string
+	runShallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
+		gotDaemon = true
+		checkProvider = tool
+		checkReload = reload
+		return codexDaemonWarning{
+			Detected: true,
+			PIDs:     []int{777},
+			Reloaded: true,
+			Message:  "reloaded Codex daemon (app-server, pid 777) via SIGTERM so the new account takes effect; it will respawn on next use with the switched auth.",
+		}
+	}
+	spawnExec = func(bin string, args []string, env []string) error {
+		gotArgs = append([]string{}, args...)
+		return nil
+	}
+	t.Cleanup(func() {
+		runShallowCodexDaemonCheck = origCheck
+		spawnExec = origExec
+	})
+
+	if _, stderr, err := runCmdCaptured(t, "shallow-spawn", "codex-alice", "--reload-daemon", "--", "sh", "-c", "echo hi"); err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	} else if !strings.Contains(stderr, "Codex daemon:") {
+		t.Fatalf("expected Codex daemon reload text on stderr, got: %q", stderr)
+	}
+
+	if !gotDaemon {
+		t.Fatal("expected daemon check to run")
+	}
+	if checkProvider != "codex" {
+		t.Fatalf("expected daemon check for codex, got %q", checkProvider)
+	}
+	if !checkReload {
+		t.Fatal("expected daemon check called with --reload-daemon=true")
+	}
+	if len(gotArgs) == 0 || gotArgs[0] != "sh" {
+		t.Fatalf("expected spawned command to be sh, got args: %v", gotArgs)
+	}
+
+}
+
+func TestShallowSpawnCodexDaemonWarningWithoutReload(t *testing.T) {
+	shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob", "--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+
+	origCheck := runShallowCodexDaemonCheck
+	origExec := spawnExec
+	var checkReload bool
+	runShallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
+		checkReload = reload
+		return codexDaemonWarning{
+			Detected: true,
+			PIDs:     []int{888},
+			Message:  "a Codex daemon (app-server, pid 888) is running",
+		}
+	}
+	spawnExec = func(bin string, args []string, env []string) error {
+		return nil
+	}
+	t.Cleanup(func() {
+		runShallowCodexDaemonCheck = origCheck
+		spawnExec = origExec
+	})
+
+	_, stderr, err := runCmdCaptured(t, "shallow-spawn", "codex-bob", "--", "sh", "-c", "echo hi")
+	if err != nil {
+		t.Fatalf("spawn failed: %v", err)
+	}
+	if checkReload {
+		t.Fatal("did not expect daemon check called with --reload-daemon=true")
+	}
+	if !strings.Contains(stderr, "Warning:") {
+		t.Fatalf("expected warning on stderr when daemon detected, got: %q", stderr)
 	}
 }
 

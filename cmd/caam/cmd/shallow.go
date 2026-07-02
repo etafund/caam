@@ -735,6 +735,7 @@ func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print eval-able export/unset statements and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("json", false, "output as JSON (errors and --print-env)")
+	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
 }
 
 // shallowSpawnPrintEnvOutput is the --print-env --json shape: the env transform
@@ -752,6 +753,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	rest := args[1:]
 	printEnv, _ := cmd.Flags().GetBool("print-env")
 	jsonOut, _ := cmd.Flags().GetBool("json")
+	reloadDaemon, _ := cmd.Flags().GetBool("reload-daemon")
 
 	// emit surfaces a pre-exec error as {"success":false,"error":...} on stdout
 	// when --json is set, then silences cobra and still returns the error so the
@@ -869,10 +871,17 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		envSlice = append(envSlice, k+"="+v)
 	}
 
+	daemonWarn := runShallowCodexDaemonCheck(prof.Meta.Provider, reloadDaemon)
+	printShallowCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
+
 	// On Unix, exec the target so signals/exit propagate naturally and we don't
 	// add a stray caam process to the tree.
 	return spawnExec(binPath, rest, envSlice)
 }
+
+var runShallowCodexDaemonCheck = checkCodexDaemon
+
+var printShallowCodexDaemonWarning = printCodexDaemonWarning
 
 // spawnExec replaces the current process image with the target on Unix.
 // Wrapped in a function so tests can inject a fake.
