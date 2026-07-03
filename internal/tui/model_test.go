@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +12,7 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -23,6 +27,128 @@ func TestNew(t *testing.T) {
 	if m.providerPanel == nil {
 		t.Error("expected providerPanel to be initialized")
 	}
+}
+
+func TestRunFallsBackToPlainModeWhenNoTUIEnabled(t *testing.T) {
+	deps, out, _, logs := newRunTestDeps(t)
+	t.Setenv("CAAM_NO_TUI", "1")
+	deps.fileIsTerminal = func(*os.File) bool { return true }
+
+	var programConstructed bool
+	deps.newProgram = func(Model) teaProgramRunner {
+		programConstructed = true
+		return fakeTeaProgram{}
+	}
+
+	if err := runWithDeps(deps); err != nil {
+		t.Fatalf("runWithDeps() fallback error = %v", err)
+	}
+	if programConstructed {
+		t.Fatal("expected NO_TUI fallback to skip Bubble Tea program construction")
+	}
+	if got := out.String(); !strings.Contains(got, "TUI disabled") || !strings.Contains(got, "caam status") {
+		t.Fatalf("plain fallback output missing actionable hint: %q", got)
+	}
+	if got := logs.String(); !strings.Contains(got, "mode=plain") || !strings.Contains(got, "reason=no_tui") {
+		t.Fatalf("structured fallback log missing mode/reason: %q", got)
+	}
+}
+
+func TestRunFallsBackToPlainModeWhenStdoutIsNotTerminal(t *testing.T) {
+	deps, out, errOut, _ := newRunTestDeps(t)
+	deps.fileIsTerminal = func(file *os.File) bool {
+		return file == deps.inputFile
+	}
+
+	var programConstructed bool
+	deps.newProgram = func(Model) teaProgramRunner {
+		programConstructed = true
+		return fakeTeaProgram{}
+	}
+
+	if err := runWithDeps(deps); err != nil {
+		t.Fatalf("runWithDeps() fallback error = %v", err)
+	}
+	if programConstructed {
+		t.Fatal("expected non-terminal stdout fallback to skip Bubble Tea program construction")
+	}
+	if got := out.String(); got != "" {
+		t.Fatalf("non-terminal stdout fallback should not write to stdout, got %q", got)
+	}
+	if got := errOut.String(); !strings.Contains(got, "not an interactive terminal") || strings.Contains(got, "\x1b[") {
+		t.Fatalf("plain fallback should write actionable unstyled stderr, got %q", got)
+	}
+}
+
+func TestShouldUsePlainModeReasons(t *testing.T) {
+	deps, _, _, _ := newRunTestDeps(t)
+
+	tests := []struct {
+		name     string
+		prefs    TUIPreferences
+		inputTTY bool
+		outTTY   bool
+		wantMode bool
+		want     string
+	}{
+		{name: "no tui wins", prefs: TUIPreferences{NoTUI: true}, inputTTY: true, outTTY: true, wantMode: true, want: "no_tui"},
+		{name: "stdin pipe", inputTTY: false, outTTY: true, wantMode: true, want: "stdin_not_terminal"},
+		{name: "stdout pipe", inputTTY: true, outTTY: false, wantMode: true, want: "stdout_not_terminal"},
+		{name: "interactive", inputTTY: true, outTTY: true, wantMode: false, want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deps.fileIsTerminal = func(file *os.File) bool {
+				if file == deps.inputFile {
+					return tt.inputTTY
+				}
+				if file == deps.outputFile {
+					return tt.outTTY
+				}
+				return false
+			}
+
+			gotMode, gotReason := shouldUsePlainMode(tt.prefs, deps)
+			if gotMode != tt.wantMode || gotReason != tt.want {
+				t.Fatalf("shouldUsePlainMode() = (%t, %q), want (%t, %q)", gotMode, gotReason, tt.wantMode, tt.want)
+			}
+		})
+	}
+}
+
+type fakeTeaProgram struct{}
+
+func (fakeTeaProgram) Run() (tea.Model, error) {
+	return New(), nil
+}
+
+func newRunTestDeps(t *testing.T) (tuiRunDeps, *bytes.Buffer, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+
+	t.Setenv("CAAM_HOME", t.TempDir())
+	t.Setenv("TERM", "xterm-256color")
+	unsetEnv(t, "CAAM_NO_TUI")
+	unsetEnv(t, "NO_TUI")
+	unsetEnv(t, "NO_COLOR")
+
+	var out bytes.Buffer
+	var errOut bytes.Buffer
+	var logs bytes.Buffer
+
+	deps := tuiRunDeps{
+		inputFile:      os.Stdin,
+		outputFile:     os.Stdout,
+		outputWriter:   &out,
+		errorWriter:    &errOut,
+		fileIsTerminal: func(*os.File) bool { return true },
+		newProgram: func(Model) teaProgramRunner {
+			return fakeTeaProgram{}
+		},
+		logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+
+	return deps, &out, &errOut, &logs
 }
 
 func TestNewWithProviders(t *testing.T) {
@@ -655,9 +781,119 @@ func TestDialogOverlayView(t *testing.T) {
 	if !strings.Contains(view, dialogContent) {
 		t.Errorf("expected dialog content in view, got %q", view)
 	}
-	if !strings.Contains(view, "caam - Coding Agent Account Manager") {
+	if !strings.Contains(view, "CAAM") {
 		t.Errorf("expected background view to be retained in overlay")
 	}
+}
+
+func TestDialogOverlayViewPlacement(t *testing.T) {
+	tests := []struct {
+		width  int
+		height int
+	}{
+		{80, 24},
+		{120, 40},
+	}
+
+	dialogContent := "OVERLAY-ANCHOR\nsecond line"
+	dialogWidth := lipgloss.Width(dialogContent)
+	dialogHeight := lipgloss.Height(dialogContent)
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			m := New()
+			m.width = tc.width
+			m.height = tc.height
+			m.profiles = map[string][]Profile{
+				"claude": {{Name: "test@example.com"}},
+			}
+			m.syncProfilesPanel()
+
+			view := m.dialogOverlayView(dialogContent)
+			lines := strings.Split(ansi.Strip(view), "\n")
+			expectedY := (tc.height - dialogHeight) / 2
+			expectedX := (tc.width - dialogWidth) / 2
+			if expectedY < 0 {
+				expectedY = 0
+			}
+			if expectedX < 0 {
+				expectedX = 0
+			}
+			if len(lines) <= expectedY {
+				t.Fatalf("overlay output has %d lines, expected at least %d", len(lines), expectedY+1)
+			}
+			gotByteIndex := strings.Index(lines[expectedY], "OVERLAY-ANCHOR")
+			if gotByteIndex < 0 {
+				t.Fatalf("overlay marker missing from expected line: %q", lines[expectedY])
+			}
+			gotX := lipgloss.Width(lines[expectedY][:gotByteIndex])
+			if gotX != expectedX {
+				t.Fatalf("overlay x position = %d, want %d; line=%q", gotX, expectedX, lines[expectedY])
+			}
+			if !strings.Contains(view, "CAAM") {
+				t.Fatalf("overlay should retain background content")
+			}
+			t.Logf("overlay placement terminal=%dx%d dialog=%dx%d x=%d y=%d",
+				tc.width, tc.height, dialogWidth, dialogHeight, gotX, expectedY)
+		})
+	}
+}
+
+func TestDialogOverlayViewClampsOversizeDialog(t *testing.T) {
+	m := New()
+	m.width = 30
+	m.height = 8
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "test@example.com"}},
+	}
+	m.syncProfilesPanel()
+
+	dialogContent := strings.Repeat("W", 80)
+	view := m.dialogOverlayView(dialogContent)
+	lines := strings.Split(ansi.Strip(view), "\n")
+	expectedY := (m.height - 1) / 2
+	if len(lines) <= expectedY {
+		t.Fatalf("overlay output has %d lines, expected at least %d", len(lines), expectedY+1)
+	}
+
+	expected := strings.Repeat("W", m.width)
+	if !strings.HasPrefix(lines[expectedY], expected) {
+		t.Fatalf("oversized dialog should be clamped at viewport width; got line=%q", lines[expectedY])
+	}
+	if got := lipgloss.Width(lines[expectedY]); got > m.width {
+		t.Fatalf("clamped overlay line width = %d, want <= %d", got, m.width)
+	}
+
+	t.Logf("overlay clamp terminal=%dx%d dialog_input_width=%d clamped_width=%d y=%d",
+		m.width, m.height, lipgloss.Width(dialogContent), lipgloss.Width(lines[expectedY]), expectedY)
+}
+
+func TestDialogOverlayStyleAppliesDimLayer(t *testing.T) {
+	m := New()
+	m.styles = NewStyles(NewTheme(ThemeOptions{Mode: ThemeDark}))
+
+	if !m.styles.DialogOverlay.GetFaint() {
+		t.Fatal("dialog overlay style should enable faint/dim styling in color mode")
+	}
+	rendered := m.styles.DialogOverlay.Render("background")
+	t.Logf("overlay dim style faint=%t raw_width=%d rendered_width=%d",
+		m.styles.DialogOverlay.GetFaint(), lipgloss.Width("background"), lipgloss.Width(rendered))
+}
+
+func TestDialogFocusedStyleDiffersFromBlurred(t *testing.T) {
+	d := NewConfirmDialog("Confirm", "Proceed?")
+	d.SetStyles(NewStyles(NewTheme(ThemeOptions{Mode: ThemeDark})))
+	focused := d.View()
+
+	d.Blur()
+	blurred := d.View()
+	if focused == blurred {
+		t.Fatal("focused and blurred dialog views should differ to expose focus ring state")
+	}
+	if !strings.Contains(focused, "Proceed?") || !strings.Contains(blurred, "Proceed?") {
+		t.Fatal("dialog content should remain visible in both focused and blurred states")
+	}
+	t.Logf("dialog focus rendered_width=%d blurred_width=%d", lipgloss.Width(focused), lipgloss.Width(blurred))
 }
 
 // TestDialogOverlayViewSmallScreen tests dialogOverlayView with small dimensions.
@@ -788,6 +1024,93 @@ func TestCompactLayoutSpecTinyDetailHeights(t *testing.T) {
 	spec = m.compactLayoutSpec(layoutTiny, 10, 1)
 	if spec.ShowDetail {
 		t.Error("expected detail to be disabled for short tiny layout")
+	}
+}
+
+func TestLayoutComputationBreakpointsAndOverflow(t *testing.T) {
+	tests := []struct {
+		width    int
+		height   int
+		wantMode layoutMode
+	}{
+		{60, 20, layoutTiny},
+		{70, 20, layoutCompact},
+		{80, 24, layoutCompact},
+		{94, 24, layoutFull},
+		{100, 24, layoutFull},
+		{120, 30, layoutFull},
+		{140, 40, layoutFull},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("%dx%d", tc.width, tc.height), func(t *testing.T) {
+			m := New()
+			m.width = tc.width
+			m.height = tc.height
+
+			if got := m.layoutMode(); got != tc.wantMode {
+				t.Fatalf("layoutMode() = %s, want %s", layoutModeName(got), layoutModeName(tc.wantMode))
+			}
+
+			contentHeight := max(1, tc.height-7)
+			switch tc.wantMode {
+			case layoutFull:
+				spec := m.fullLayoutSpec(contentHeight)
+				available := tc.width - (layoutGap * 2)
+				total := spec.ProviderWidth + spec.ProfilesWidth + spec.DetailWidth
+				if total > available {
+					t.Fatalf("panel widths exceed terminal width: total=%d available=%d spec=%+v", total, available, spec)
+				}
+				if spec.ProviderWidth < minProviderWidth {
+					t.Fatalf("provider width below minimum: %d", spec.ProviderWidth)
+				}
+				if spec.ProfilesWidth < minProfilesWidth {
+					t.Fatalf("profiles width below minimum: %d", spec.ProfilesWidth)
+				}
+				if spec.DetailWidth < minDetailWidth {
+					t.Fatalf("detail width below minimum: %d", spec.DetailWidth)
+				}
+				t.Logf("layout=%s terminal=%dx%d content_height=%d provider=%d profiles=%d detail=%d total=%d available=%d",
+					layoutModeName(spec.Mode), tc.width, tc.height, contentHeight,
+					spec.ProviderWidth, spec.ProfilesWidth, spec.DetailWidth, total, available)
+			case layoutCompact, layoutTiny:
+				const tabsHeight = 1
+				spec := m.compactLayoutSpec(tc.wantMode, contentHeight, tabsHeight)
+				remaining := contentHeight - tabsHeight - 1
+				if remaining < 0 {
+					remaining = 0
+				}
+				used := spec.ProfilesHeight
+				if spec.ShowDetail {
+					used += spec.DetailHeight + 1
+				}
+				if used > remaining {
+					t.Fatalf("panel heights exceed available content height: used=%d remaining=%d spec=%+v", used, remaining, spec)
+				}
+				if spec.ProfilesHeight < 0 || spec.DetailHeight < 0 {
+					t.Fatalf("layout produced negative heights: spec=%+v", spec)
+				}
+				if spec.ContentHeight > tc.height {
+					t.Fatalf("content height exceeds terminal height: %d > %d", spec.ContentHeight, tc.height)
+				}
+				t.Logf("layout=%s terminal=%dx%d content_height=%d profiles_height=%d detail_height=%d show_detail=%t used=%d remaining=%d",
+					layoutModeName(spec.Mode), tc.width, tc.height, contentHeight,
+					spec.ProfilesHeight, spec.DetailHeight, spec.ShowDetail, used, remaining)
+			}
+		})
+	}
+}
+
+func layoutModeName(mode layoutMode) string {
+	switch mode {
+	case layoutFull:
+		return "full"
+	case layoutCompact:
+		return "compact"
+	case layoutTiny:
+		return "tiny"
+	default:
+		return fmt.Sprintf("layoutMode(%d)", mode)
 	}
 }
 
@@ -1230,6 +1553,64 @@ func TestStatusBarSeveritySnapshots(t *testing.T) {
 	}
 }
 
+func TestStatusSeverityClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    StatusSeverity
+	}{
+		{name: "success", message: "Saved profile", want: StatusSuccess},
+		{name: "warning", message: "No profile selected", want: StatusWarning},
+		{name: "error", message: "Export failed", want: StatusError},
+		{name: "info", message: "Ready", want: StatusInfo},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := statusSeverityFromMessage(tt.message)
+			if got != tt.want {
+				t.Fatalf("statusSeverityFromMessage(%q) = %v, want %v", tt.message, got, tt.want)
+			}
+			t.Logf("status severity message=%q severity=%v", tt.message, got)
+		})
+	}
+}
+
+func TestStatusBarHintsAndLongMessageBounds(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	tests := []struct {
+		width     int
+		wantHints []string
+	}{
+		{width: 60, wantHints: []string{"tab", "provider"}},
+		{width: 80, wantHints: []string{"tab", "provider", "/", "search"}},
+		{width: 120, wantHints: []string{"tab", "provider", "enter", "activate", "/", "search"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(fmt.Sprintf("width_%d", tc.width), func(t *testing.T) {
+			m := New()
+			m.width = tc.width
+			m.height = 30
+			m.statusMsg = strings.Repeat("status-", 20) + "done"
+
+			bar := m.renderStatusBar(layoutSpec{Mode: m.layoutMode()})
+			if got := lipgloss.Width(bar); got > tc.width {
+				t.Fatalf("status bar width = %d, want <= %d; bar=%q", got, tc.width, ansi.Strip(bar))
+			}
+
+			plain := ansi.Strip(bar)
+			for _, want := range tc.wantHints {
+				if !strings.Contains(plain, want) {
+					t.Fatalf("status bar at width %d missing hint %q: %q", tc.width, want, plain)
+				}
+			}
+			t.Logf("status bar width=%d rendered_width=%d hints=%q", tc.width, lipgloss.Width(bar), plain)
+		})
+	}
+}
+
 // TestApplySearchFilter tests the applySearchFilter method.
 func TestApplySearchFilter(t *testing.T) {
 	m := New()
@@ -1329,6 +1710,129 @@ func TestRenderSearchBar(t *testing.T) {
 	if !strings.Contains(bar, "work") {
 		t.Errorf("expected search bar to contain query 'work', got %q", bar)
 	}
+}
+
+func TestSearchAcceptAndCancelDoNotMutateProfiles(t *testing.T) {
+	m := New()
+	m.width = 80
+	m.height = 24
+	m.profiles = map[string][]Profile{
+		"claude": {
+			{Name: "work@example.com"},
+			{Name: "personal@example.com"},
+			{Name: "ops@example.com"},
+		},
+	}
+	m.profilesPanel = NewProfilesPanel()
+	m.syncProfilesPanel()
+
+	if got := m.profilesPanel.Count(); got != 3 {
+		t.Fatalf("expected full profile list before search, got %d", got)
+	}
+
+	searchModel, _ := m.handleEnterSearchMode()
+	searching := searchModel.(Model)
+	searching, _ = sendSearchRunes(t, searching, "work")
+	if got := searching.profilesPanel.Count(); got != 1 {
+		t.Fatalf("expected one filtered profile for work query, got %d", got)
+	}
+	if got := len(searching.profiles["claude"]); got != 3 {
+		t.Fatalf("search filtering mutated backing profile data, got %d profiles", got)
+	}
+	bar := ansi.Strip(searching.renderSearchBar())
+	if !strings.Contains(bar, "work") || !strings.Contains(bar, "1 matches") {
+		t.Fatalf("search bar missing live query/match count: %q", bar)
+	}
+
+	acceptedModel, _ := searching.handleSearchKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	accepted := acceptedModel.(Model)
+	if accepted.state != stateList {
+		t.Fatalf("accepted search should return to list state, got %v", accepted.state)
+	}
+	if accepted.statusMsg != "Filtered by: work" {
+		t.Fatalf("accepted search status = %q", accepted.statusMsg)
+	}
+	if got := accepted.profilesPanel.Count(); got != 1 {
+		t.Fatalf("accepted search should keep current filtered panel, got %d profiles", got)
+	}
+
+	cancelModel, _ := m.handleEnterSearchMode()
+	canceling := cancelModel.(Model)
+	canceling, _ = sendSearchRunes(t, canceling, "personal")
+	if got := canceling.profilesPanel.Count(); got != 1 {
+		t.Fatalf("expected one filtered profile before cancel, got %d", got)
+	}
+
+	canceledModel, _ := canceling.handleSearchKeys(tea.KeyMsg{Type: tea.KeyEscape})
+	canceled := canceledModel.(Model)
+	if canceled.state != stateList {
+		t.Fatalf("canceled search should return to list state, got %v", canceled.state)
+	}
+	if canceled.searchQuery != "" || canceled.statusMsg != "" {
+		t.Fatalf("canceled search should clear query/status, got query=%q status=%q", canceled.searchQuery, canceled.statusMsg)
+	}
+	if got := canceled.profilesPanel.Count(); got != 3 {
+		t.Fatalf("canceled search should restore full profile list, got %d profiles", got)
+	}
+	if got := len(canceled.profiles["claude"]); got != 3 {
+		t.Fatalf("canceled search mutated backing profile data, got %d profiles", got)
+	}
+
+	t.Logf("search accept query=%q accepted_count=%d cancel_restored_count=%d backing_count=%d",
+		accepted.searchQuery, accepted.profilesPanel.Count(), canceled.profilesPanel.Count(), len(canceled.profiles["claude"]))
+}
+
+func sendSearchRunes(t *testing.T, m Model, text string) (Model, tea.Cmd) {
+	t.Helper()
+	var cmd tea.Cmd
+	for _, r := range text {
+		next, nextCmd := m.handleSearchKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(Model)
+		cmd = nextCmd
+	}
+	return m, cmd
+}
+
+func TestCommandPaletteModelActionAndCancelPaths(t *testing.T) {
+	m := New()
+	m.width = 100
+	m.height = 30
+
+	openedModel, _ := m.handleOpenCommandPalette()
+	opened := openedModel.(Model)
+	if opened.state != stateCommandPalette {
+		t.Fatalf("expected command palette state, got %v", opened.state)
+	}
+	if opened.commandPalette == nil {
+		t.Fatal("expected command palette dialog to be initialized")
+	}
+
+	helpModel := opened
+	for _, r := range "help" {
+		next, _ := helpModel.handleCommandPaletteKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		helpModel = next.(Model)
+	}
+	submitted, _ := helpModel.handleCommandPaletteKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	afterSubmit := submitted.(Model)
+	if afterSubmit.state != stateHelp {
+		t.Fatalf("help command should switch to help state, got %v", afterSubmit.state)
+	}
+	if afterSubmit.commandPalette != nil {
+		t.Fatal("command palette should close after selected action dispatch")
+	}
+
+	cancelOpenedModel, _ := m.handleOpenCommandPalette()
+	cancelOpened := cancelOpenedModel.(Model)
+	canceledModel, _ := cancelOpened.handleCommandPaletteKeys(tea.KeyMsg{Type: tea.KeyEscape})
+	canceled := canceledModel.(Model)
+	if canceled.state != stateList {
+		t.Fatalf("canceled command palette should return to list state, got %v", canceled.state)
+	}
+	if canceled.commandPalette != nil {
+		t.Fatal("command palette should be nil after cancel")
+	}
+
+	t.Logf("command palette action=%q final_state=%v cancel_state=%v", "help", afterSubmit.state, canceled.state)
 }
 
 // TestHandleEditProfile tests the handleEditProfile method.
@@ -1588,6 +2092,22 @@ func TestStatusCenterMessage(t *testing.T) {
 	if m.statusMessageSeverity() != StatusSuccess {
 		t.Errorf("expected StatusSuccess severity, got %v", m.statusMessageSeverity())
 	}
+}
+
+func TestToastNewestOverridesOlderToastsAndStatus(t *testing.T) {
+	m := New()
+	m.statusMsg = "Background status"
+	m.toasts = append(m.toasts, NewToast("Older toast", StatusInfo))
+	m.toasts = append(m.toasts, NewToast("Newest toast", StatusError))
+
+	if got := m.statusCenterText(); got != "Newest toast" {
+		t.Fatalf("newest toast should override status and older toasts, got %q", got)
+	}
+	if got := m.statusMessageSeverity(); got != StatusError {
+		t.Fatalf("newest toast severity = %v, want %v", got, StatusError)
+	}
+	t.Logf("toast priority status=%q older=%q newest=%q severity=%v",
+		m.statusMsg, m.toasts[0].Message, m.toasts[1].Message, m.statusMessageSeverity())
 }
 
 // TestRenderStatusBarThreeSegments tests the 3-segment status bar layout.

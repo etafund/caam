@@ -5,8 +5,20 @@ package usage
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// ErrRateLimited marks transient provider throttling. Fetchers return errors
+// wrapping this sentinel for HTTP 429 responses.
+var ErrRateLimited = errors.New("rate limited")
+
+var http429TokenRE = regexp.MustCompile(`(^|[^[:alnum:]])429([^[:alnum:]]|$)`)
 
 // UsageWindow represents a rate limit window with utilization data.
 type UsageWindow struct {
@@ -21,6 +33,9 @@ type UsageWindow struct {
 
 	// WindowDuration is the window size (if known).
 	WindowDuration time.Duration `json:"window_duration,omitempty"`
+
+	// Label is a human-readable provider label for this window, when available.
+	Label string `json:"label,omitempty"`
 }
 
 // UsageInfo contains rate limit and usage information for a provider account.
@@ -63,6 +78,17 @@ type UsageInfo struct {
 	// Error contains any error message from fetching.
 	Error string `json:"error,omitempty"`
 
+	// RateLimited indicates the provider returned a transient rate-limit response.
+	RateLimited bool `json:"rate_limited,omitempty"`
+
+	// RetryAfter is the provider-supplied backoff hint for a rate-limit response.
+	RetryAfter time.Duration `json:"retry_after,omitempty"`
+
+	// CachedInactive marks a Claude profile whose cached vault token is stale
+	// because the profile is not currently active. The monitor should present
+	// this as calm stale-cache state, not an auth failure.
+	CachedInactive bool `json:"cached_inactive,omitempty"`
+
 	// BurnRate contains token consumption rate from log/session data.
 	BurnRate *BurnRateInfo `json:"burn_rate,omitempty"`
 
@@ -87,10 +113,64 @@ type Fetcher interface {
 	Fetch(ctx context.Context, accessToken string) (*UsageInfo, error)
 }
 
+// IsRateLimitedError reports whether err represents provider throttling.
+func IsRateLimitedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrRateLimited) || IsRateLimitedMessage(err.Error())
+}
+
+// IsRateLimitedUsage reports whether info represents provider throttling.
+func IsRateLimitedUsage(info *UsageInfo) bool {
+	if info == nil {
+		return false
+	}
+	return info.RateLimited || IsRateLimitedMessage(info.Error)
+}
+
+// IsRateLimitedMessage recognizes common textual forms used before the
+// sentinel existed and by external/test fetchers.
+func IsRateLimitedMessage(message string) bool {
+	e := strings.ToLower(message)
+	return strings.Contains(e, "rate limited") ||
+		strings.Contains(e, "too many requests") ||
+		strings.Contains(e, "status 429") ||
+		strings.Contains(e, "http 429") ||
+		strings.Contains(e, "code 429") ||
+		http429TokenRE.MatchString(e)
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+
+	retryAt, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if !retryAt.After(now) {
+		return 0
+	}
+	return retryAt.Sub(now)
+}
+
 // AvailabilityScore calculates a score for account rotation (0-100).
 // Higher scores indicate more available capacity.
 func (u *UsageInfo) AvailabilityScore() int {
-	if u == nil || u.Error != "" {
+	if u == nil || u.Error != "" || u.CachedInactive {
 		return 0
 	}
 
@@ -283,6 +363,49 @@ func (u *UsageInfo) WindowForModel(model string) *UsageWindow {
 
 	// Fall back to tertiary (premium model) window
 	return u.TertiaryWindow
+}
+
+// FindModelWindow returns the first ModelWindows entry whose key or label
+// contains substr (case-insensitive); optional suffix filter ("5h", "weekly",
+// "seven_day", etc.) may be "". Ties are deterministic by lexicographically
+// smallest key. It is nil-safe.
+func (u *UsageInfo) FindModelWindow(substr, suffix string) *UsageWindow {
+	if u == nil || len(u.ModelWindows) == 0 {
+		return nil
+	}
+
+	substr = strings.ToLower(strings.TrimSpace(substr))
+	suffix = strings.ToLower(strings.TrimSpace(suffix))
+
+	keys := make([]string, 0, len(u.ModelWindows))
+	for key, window := range u.ModelWindows {
+		if window == nil {
+			continue
+		}
+
+		keyLower := strings.ToLower(key)
+		labelLower := strings.ToLower(window.Label)
+		if substr != "" && !strings.Contains(keyLower, substr) && !strings.Contains(labelLower, substr) {
+			continue
+		}
+		if !modelWindowSuffixMatches(keyLower, suffix) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+	return u.ModelWindows[keys[0]]
+}
+
+func modelWindowSuffixMatches(key, suffix string) bool {
+	if suffix == "" {
+		return true
+	}
+	return strings.HasSuffix(key, suffix) || strings.HasPrefix(key, suffix+"_")
 }
 
 // PredictDepletion calculates when the rate limit will be hit based on burn rate.

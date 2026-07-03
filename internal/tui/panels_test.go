@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // =============================================================================
@@ -325,6 +327,88 @@ func TestDetailPanel_View_Locked(t *testing.T) {
 	}
 }
 
+func TestDetailPanel_SectionHierarchySnapshot(t *testing.T) {
+	panel := NewDetailPanelWithTheme(NewTheme(ThemeOptions{NoColor: true}))
+	panel.SetSize(86, 40)
+
+	profile := &DetailInfo{
+		Name:         "long-profile-name@example.com",
+		Provider:     "claude",
+		AuthMode:     "OAuth",
+		LoggedIn:     true,
+		Locked:       true,
+		Path:         "/home/user/.claude/very/deep/path/auth.json",
+		CreatedAt:    time.Now().Add(-72 * time.Hour),
+		LastUsedAt:   time.Now().Add(-3 * time.Hour),
+		Account:      "account@example.com",
+		Description:  "Primary project profile",
+		BrowserCmd:   "chrome",
+		BrowserProf:  "Profile 1",
+		HealthStatus: health.StatusWarning,
+		TokenExpiry:  time.Now().Add(45 * time.Minute),
+		ErrorCount:   2,
+		Penalty:      0.25,
+	}
+	panel.SetProfile(profile)
+
+	snapshot := normalizePanelSnapshot(panel.View())
+	assertInOrder(t, snapshot, "Profile", "Auth", "Usage", "Paths", "Actions")
+	for _, want := range []string{
+		"Profile: long-profile-name@example.com",
+		"Provider",
+		"Claude",
+		"Account",
+		"account@example.com",
+		"Notes",
+		"Primary project profile",
+		"Mode",
+		"OAuth",
+		"warning",
+		"Token",
+		"Expires in",
+		"Lock",
+		"Locked",
+		"Errors",
+		"2 in last hour",
+		"Penalty",
+		"0.25",
+		"Path",
+		"auth.json",
+		"Browser",
+		"chrome (Profile 1)",
+		"Activate profile",
+	} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("detail snapshot missing %q:\n%s", want, snapshot)
+		}
+	}
+	t.Logf("detail snapshot sections=%q width=%d", []string{"Profile", "Auth", "Usage", "Paths", "Actions"}, lipgloss.Width(snapshot))
+}
+
+func TestDetailPanel_MissingFieldsSnapshot(t *testing.T) {
+	panel := NewDetailPanelWithTheme(NewTheme(ThemeOptions{NoColor: true}))
+	panel.SetSize(70, 30)
+	panel.SetProfile(&DetailInfo{
+		Name:         "minimal@example.com",
+		Provider:     "codex",
+		HealthStatus: health.StatusUnknown,
+	})
+
+	snapshot := normalizePanelSnapshot(panel.View())
+	assertInOrder(t, snapshot, "Profile", "Auth", "Usage", "Actions")
+	for _, absent := range []string{"Account", "Notes", "Paths", "Browser"} {
+		if strings.Contains(snapshot, absent) {
+			t.Fatalf("minimal detail snapshot should omit %q:\n%s", absent, snapshot)
+		}
+	}
+	for _, want := range []string{"minimal@example.com", "Codex", "unknown", "Errors", "None", "Last used", "never"} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("minimal detail snapshot missing %q:\n%s", want, snapshot)
+		}
+	}
+	t.Logf("minimal detail snapshot width=%d", lipgloss.Width(snapshot))
+}
+
 func TestFormatDurationFull(t *testing.T) {
 	tests := []struct {
 		duration time.Duration
@@ -606,6 +690,70 @@ func TestProfilesPanel_View_WithProfiles(t *testing.T) {
 	}
 }
 
+func TestProfilesPanel_RowAnatomySnapshots(t *testing.T) {
+	panel := NewProfilesPanelWithTheme(NewTheme(ThemeOptions{NoColor: true}))
+	panel.SetProvider("claude")
+	panel.SetSize(104, 20)
+
+	longName := "very-long-profile-name-for-regression@example.com"
+	longBadge := "NEW"
+	panel.SetProfiles([]ProfileInfo{
+		{
+			Name:           longName,
+			Badge:          longBadge,
+			ProjectDefault: true,
+			AuthMode:       "OAuth",
+			HealthStatus:   health.StatusHealthy,
+			TokenExpiry:    time.Now().Add(2 * time.Hour),
+			LastUsed:       time.Now().Add(-1 * time.Hour),
+			Account:        "account@example.com",
+			IsActive:       true,
+		},
+		{
+			Name:         "locked@example.com",
+			AuthMode:     "API Key",
+			HealthStatus: health.StatusCritical,
+			LastUsed:     time.Time{},
+			Account:      "",
+			Locked:       true,
+		},
+	})
+	panel.SetSelected(1)
+
+	snapshot := normalizePanelSnapshot(panel.View())
+	for _, want := range []string{"Claude Profiles", "Name", "Auth", "Status", "Last Used", "Account"} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("profiles snapshot missing header/title %q:\n%s", want, snapshot)
+		}
+	}
+
+	truncatedName := ansi.Strip(formatNameWithBadge(longName, longBadge, 16))
+	for _, want := range []string{
+		truncatedName,
+		"OAuth",
+		"h left",
+		"1h ago",
+		truncateWithEllipsis("account@example.com", 16),
+		"[PROJECT DEFAULT]",
+		formatNameWithBadge("locked@example.com", "", 16),
+		"API Key",
+		"Critical",
+		"never",
+		"-",
+	} {
+		if !strings.Contains(snapshot, want) {
+			t.Fatalf("profiles snapshot missing row content %q:\n%s", want, snapshot)
+		}
+	}
+
+	selected := panel.GetSelectedProfile()
+	if selected == nil || selected.Name != "locked@example.com" {
+		t.Fatalf("selected row = %#v, want locked@example.com", selected)
+	}
+	t.Logf("profiles row snapshot selected=%q truncated_name=%q width=%d",
+		selected.Name, truncatedName, lipgloss.Width(snapshot))
+}
+
 func TestFormatRelativeTime_ProfilesPanel(t *testing.T) {
 	now := time.Now()
 
@@ -764,5 +912,29 @@ func TestFormatTUIStatus(t *testing.T) {
 				t.Errorf("formatTUIStatus() = %q, want substring %q", got, tt.wantSub)
 			}
 		})
+	}
+}
+
+func normalizePanelSnapshot(s string) string {
+	plain := ansi.Strip(s)
+	lines := strings.Split(plain, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " ")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func assertInOrder(t *testing.T, snapshot string, parts ...string) {
+	t.Helper()
+	last := -1
+	for _, part := range parts {
+		idx := strings.Index(snapshot, part)
+		if idx < 0 {
+			t.Fatalf("snapshot missing %q:\n%s", part, snapshot)
+		}
+		if idx < last {
+			t.Fatalf("snapshot has %q out of order after prior section:\n%s", part, snapshot)
+		}
+		last = idx
 	}
 }

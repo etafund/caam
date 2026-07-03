@@ -373,6 +373,136 @@ func TestSetConfigValue_Project(t *testing.T) {
 	}
 }
 
+func TestSetConfigValue_TUIResolvedToggles(t *testing.T) {
+	cfg := config.DefaultSPMConfig()
+
+	tests := []struct {
+		field string
+		value string
+		want  string
+	}{
+		{field: "theme", value: "LIGHT", want: "light"},
+		{field: "high_contrast", value: "yes", want: "true"},
+		{field: "reduced_motion", value: "on", want: "true"},
+		{field: "toasts", value: "off", want: "false"},
+		{field: "mouse", value: "0", want: "false"},
+		{field: "show_key_hints", value: "no", want: "false"},
+		{field: "density", value: "COMPACT", want: "compact"},
+		{field: "no_tui", value: "1", want: "true"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			key := "tui." + tt.field
+			if err := setConfigValue(cfg, key, tt.value); err != nil {
+				t.Fatalf("setConfigValue(%q, %q) error: %v", key, tt.value, err)
+			}
+
+			got, err := getConfigValue(cfg, key)
+			if err != nil {
+				t.Fatalf("getConfigValue(%q) error: %v", key, err)
+			}
+			if got != tt.want {
+				t.Fatalf("getConfigValue(%q) = %q, want %q", key, got, tt.want)
+			}
+		})
+	}
+
+	logResolvedTUICommandConfig(t, "cli_helper", cfg)
+}
+
+func TestConfigTUICommandSetGetAndSave(t *testing.T) {
+	clearTUIEnvForConfigCommandTest(t)
+	t.Setenv("CAAM_HOME", t.TempDir())
+
+	origSPMConfig := spmConfig
+	t.Cleanup(func() {
+		spmConfig = origSPMConfig
+	})
+	spmConfig = config.DefaultSPMConfig()
+
+	tests := []struct {
+		field string
+		value string
+		want  string
+	}{
+		{field: "theme", value: "light", want: "light"},
+		{field: "high_contrast", value: "true", want: "true"},
+		{field: "reduced_motion", value: "true", want: "true"},
+		{field: "toasts", value: "false", want: "false"},
+		{field: "mouse", value: "false", want: "false"},
+		{field: "show_key_hints", value: "false", want: "false"},
+		{field: "density", value: "compact", want: "compact"},
+		{field: "no_tui", value: "true", want: "true"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			out, err := captureStdout(t, func() error {
+				return configTUICmd.RunE(configTUICmd, []string{tt.field, tt.value})
+			})
+			if err != nil {
+				t.Fatalf("config tui %s %s error: %v", tt.field, tt.value, err)
+			}
+			wantLine := "tui." + tt.field + " = " + tt.want
+			if strings.TrimSpace(out) != wantLine {
+				t.Fatalf("config tui set output = %q, want %q", out, wantLine)
+			}
+
+			out, err = captureStdout(t, func() error {
+				return configTUICmd.RunE(configTUICmd, []string{tt.field})
+			})
+			if err != nil {
+				t.Fatalf("config tui %s error: %v", tt.field, err)
+			}
+			if strings.TrimSpace(out) != tt.want {
+				t.Fatalf("config tui get output = %q, want %q", out, tt.want)
+			}
+		})
+	}
+
+	loaded, err := config.LoadSPMConfig()
+	if err != nil {
+		t.Fatalf("LoadSPMConfig() after config tui updates error: %v", err)
+	}
+	assertResolvedTUICommandConfig(t, loaded, config.TUIConfig{
+		Theme:         "light",
+		HighContrast:  true,
+		ReducedMotion: true,
+		Toasts:        false,
+		Mouse:         false,
+		ShowKeyHints:  false,
+		Density:       "compact",
+		NoTUI:         true,
+	})
+
+	out, err := captureStdout(t, func() error {
+		return configTUICmd.RunE(configTUICmd, nil)
+	})
+	if err != nil {
+		t.Fatalf("config tui show error: %v", err)
+	}
+	for _, snippet := range []string{
+		"TUI Preferences",
+		"theme:",
+		"light",
+		"high_contrast:",
+		"reduced_motion:",
+		"toasts:",
+		"mouse:",
+		"show_key_hints:",
+		"density:",
+		"compact",
+		"no_tui:",
+	} {
+		if !strings.Contains(out, snippet) {
+			t.Fatalf("config tui show output missing %q:\n%s", snippet, out)
+		}
+	}
+
+	logResolvedTUICommandConfig(t, "cli_command", loaded)
+}
+
 func TestSetConfigValue_InvalidKeys(t *testing.T) {
 	cfg := config.DefaultSPMConfig()
 
@@ -393,6 +523,72 @@ func TestSetConfigValue_InvalidKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+func assertResolvedTUICommandConfig(t *testing.T, cfg *config.SPMConfig, want config.TUIConfig) {
+	t.Helper()
+
+	if cfg.TUI.Theme != want.Theme {
+		t.Fatalf("TUI.Theme = %q, want %q", cfg.TUI.Theme, want.Theme)
+	}
+	if cfg.TUI.HighContrast != want.HighContrast {
+		t.Fatalf("TUI.HighContrast = %t, want %t", cfg.TUI.HighContrast, want.HighContrast)
+	}
+	if cfg.TUI.ReducedMotion != want.ReducedMotion {
+		t.Fatalf("TUI.ReducedMotion = %t, want %t", cfg.TUI.ReducedMotion, want.ReducedMotion)
+	}
+	if cfg.TUI.Toasts != want.Toasts {
+		t.Fatalf("TUI.Toasts = %t, want %t", cfg.TUI.Toasts, want.Toasts)
+	}
+	if cfg.TUI.Mouse != want.Mouse {
+		t.Fatalf("TUI.Mouse = %t, want %t", cfg.TUI.Mouse, want.Mouse)
+	}
+	if cfg.TUI.ShowKeyHints != want.ShowKeyHints {
+		t.Fatalf("TUI.ShowKeyHints = %t, want %t", cfg.TUI.ShowKeyHints, want.ShowKeyHints)
+	}
+	if cfg.TUI.Density != want.Density {
+		t.Fatalf("TUI.Density = %q, want %q", cfg.TUI.Density, want.Density)
+	}
+	if cfg.TUI.NoTUI != want.NoTUI {
+		t.Fatalf("TUI.NoTUI = %t, want %t", cfg.TUI.NoTUI, want.NoTUI)
+	}
+}
+
+func clearTUIEnvForConfigCommandTest(t *testing.T) {
+	t.Helper()
+
+	for _, key := range []string{
+		"CAAM_TUI_THEME",
+		"CAAM_TUI_CONTRAST",
+		"CAAM_TUI_REDUCED_MOTION",
+		"CAAM_REDUCED_MOTION",
+		"REDUCED_MOTION",
+		"CAAM_TUI_TOASTS",
+		"CAAM_TUI_MOUSE",
+		"CAAM_TUI_KEY_HINTS",
+		"CAAM_TUI_DENSITY",
+		"CAAM_NO_TUI",
+		"NO_TUI",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func logResolvedTUICommandConfig(t *testing.T, source string, cfg *config.SPMConfig) {
+	t.Helper()
+
+	t.Logf(
+		"resolved_tui_config source=%s theme=%q high_contrast=%t reduced_motion=%t toasts=%t mouse=%t show_key_hints=%t density=%q no_tui=%t",
+		source,
+		cfg.TUI.Theme,
+		cfg.TUI.HighContrast,
+		cfg.TUI.ReducedMotion,
+		cfg.TUI.Toasts,
+		cfg.TUI.Mouse,
+		cfg.TUI.ShowKeyHints,
+		cfg.TUI.Density,
+		cfg.TUI.NoTUI,
+	)
 }
 
 // =============================================================================

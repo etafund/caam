@@ -74,16 +74,26 @@ func usageUnavailable(info *usage.UsageInfo) string {
 	if info == nil {
 		return "no usage data"
 	}
-	// Real data present (a usage window, or a credit balance) -> show the number.
-	if info.MostConstrainedWindow() != nil || info.Credits != nil {
+	if info.CachedInactive {
+		return "cached inactive"
+	}
+	// The main table/brief/alert renderers are intentionally primary-window
+	// based. Secondary/model windows are shown only in detail/JSON paths.
+	if info.PrimaryWindow != nil || info.Credits != nil {
 		return ""
+	}
+	if usage.IsRateLimitedUsage(info) {
+		return "no usage: rate limited (retrying)"
 	}
 	if info.Error != "" {
 		// ASCII only: writeLine pads the table by byte length, so a multi-byte
 		// rune here would shift the right border and break box alignment.
 		return "no usage: " + shortUsageError(info.Error)
 	}
-	return ""
+	if info.SecondaryWindow != nil || info.TertiaryWindow != nil || len(info.ModelWindows) > 0 {
+		return "no usage: no primary usage data"
+	}
+	return "no usage data"
 }
 
 // shortUsageError condenses common usage-fetch errors into a brief hint that
@@ -94,6 +104,8 @@ func shortUsageError(err string) string {
 	case strings.Contains(e, "unauthorized"), strings.Contains(e, "token expired"),
 		strings.Contains(e, "expired or invalid"), strings.Contains(e, "401"):
 		return "auth expired (re-login)"
+	case usage.IsRateLimitedMessage(err):
+		return "rate limited (retrying)"
 	case strings.Contains(e, "missing access token"), strings.Contains(e, "not logged in"),
 		strings.Contains(e, "no access token"):
 		return "not logged in"
@@ -111,7 +123,7 @@ func usagePercent(info *usage.UsageInfo) float64 {
 	if info == nil {
 		return 0
 	}
-	window := info.MostConstrainedWindow()
+	window := info.PrimaryWindow
 	if window == nil {
 		return 0
 	}

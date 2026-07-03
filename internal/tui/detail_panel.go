@@ -31,30 +31,31 @@ type DetailInfo struct {
 
 // DetailPanel renders the right panel showing profile details and available actions.
 type DetailPanel struct {
-	profile *DetailInfo
-	width   int
-	height  int
-	styles  DetailPanelStyles
+	profile      *DetailInfo
+	scrollOffset int
+	width        int
+	height       int
+	styles       DetailPanelStyles
 }
 
 // DetailPanelStyles holds the styles for the detail panel.
 type DetailPanelStyles struct {
-	Border        lipgloss.Style
-	Title         lipgloss.Style
-	Label         lipgloss.Style
-	Value         lipgloss.Style
-	ValueNumeric  lipgloss.Style // Right-aligned numeric values
-	StatusOK      lipgloss.Style
-	StatusWarn    lipgloss.Style
-	StatusBad     lipgloss.Style
-	StatusMuted   lipgloss.Style
-	LockIcon      lipgloss.Style
-	Divider       lipgloss.Style
-	ActionHeader  lipgloss.Style
-	ActionKey     lipgloss.Style
-	ActionDesc    lipgloss.Style
-	Empty         lipgloss.Style
-	SectionHeader lipgloss.Style // Header for grouped sections
+	Border         lipgloss.Style
+	Title          lipgloss.Style
+	Label          lipgloss.Style
+	Value          lipgloss.Style
+	ValueNumeric   lipgloss.Style // Right-aligned numeric values
+	StatusOK       lipgloss.Style
+	StatusWarn     lipgloss.Style
+	StatusBad      lipgloss.Style
+	StatusMuted    lipgloss.Style
+	LockIcon       lipgloss.Style
+	Divider        lipgloss.Style
+	ActionHeader   lipgloss.Style
+	ActionKey      lipgloss.Style
+	ActionDesc     lipgloss.Style
+	Empty          lipgloss.Style
+	SectionHeader  lipgloss.Style // Header for grouped sections
 	SectionDivider lipgloss.Style // Subtle divider between sections
 }
 
@@ -151,25 +152,65 @@ func NewDetailPanelWithTheme(theme Theme) *DetailPanel {
 
 // SetProfile sets the profile to display.
 func (p *DetailPanel) SetProfile(profile *DetailInfo) {
+	if !sameDetailProfile(p.profile, profile) {
+		p.scrollOffset = 0
+	}
 	p.profile = profile
+	p.clampScrollOffset()
 }
 
 // SetSize sets the panel dimensions.
 func (p *DetailPanel) SetSize(width, height int) {
 	p.width = width
 	p.height = height
+	p.clampScrollOffset()
+}
+
+// ScrollUp scrolls long detail content upward.
+func (p *DetailPanel) ScrollUp(lines int) {
+	if p == nil || lines <= 0 {
+		return
+	}
+	p.scrollOffset = max(0, p.scrollOffset-lines)
+}
+
+// ScrollDown scrolls long detail content downward.
+func (p *DetailPanel) ScrollDown(lines int) {
+	if p == nil || lines <= 0 {
+		return
+	}
+	p.scrollOffset = min(p.maxScrollOffset(), p.scrollOffset+lines)
 }
 
 // View renders the detail panel with grouped sections.
 func (p *DetailPanel) View() string {
 	if p.profile == nil {
 		empty := p.styles.Empty.Render("Select a profile to view details")
+		style := p.styles.Border
 		if p.width > 0 {
-			return p.styles.Border.Width(p.width - 2).Render(empty)
+			style = style.Width(p.width - 2)
 		}
-		return p.styles.Border.Render(empty)
+		if p.height > 0 {
+			style = style.Height(max(1, p.height-2))
+		}
+		return style.Render(empty)
 	}
 
+	inner := p.renderContent()
+	inner = p.scrolledContent(inner)
+
+	// Apply border
+	style := p.styles.Border
+	if p.width > 0 {
+		style = style.Width(p.width - 2)
+	}
+	if p.height > 0 {
+		style = style.Height(max(1, p.height-2))
+	}
+	return style.Render(inner)
+}
+
+func (p *DetailPanel) renderContent() string {
 	prof := p.profile
 	dividerWidth := p.width - 6
 	if dividerWidth < 20 {
@@ -345,13 +386,57 @@ func (p *DetailPanel) View() string {
 	allSections = append(allSections, sections...)
 	allSections = append(allSections, "", divider, actionsHeader, actionsContent)
 
-	inner := lipgloss.JoinVertical(lipgloss.Left, allSections...)
+	return lipgloss.JoinVertical(lipgloss.Left, allSections...)
+}
 
-	// Apply border
-	if p.width > 0 {
-		return p.styles.Border.Width(p.width - 2).Render(inner)
+func (p *DetailPanel) visibleContentHeight() int {
+	if p == nil || p.height <= 0 {
+		return 0
 	}
-	return p.styles.Border.Render(inner)
+	return max(1, p.height-2)
+}
+
+func (p *DetailPanel) maxScrollOffset() int {
+	if p == nil || p.profile == nil {
+		return 0
+	}
+	return p.maxScrollOffsetForContent(p.renderContent())
+}
+
+func (p *DetailPanel) maxScrollOffsetForContent(content string) int {
+	height := p.visibleContentHeight()
+	if height <= 0 {
+		return 0
+	}
+	return max(0, len(strings.Split(content, "\n"))-height)
+}
+
+func (p *DetailPanel) clampScrollOffset() {
+	if p == nil {
+		return
+	}
+	p.scrollOffset = max(0, min(p.scrollOffset, p.maxScrollOffset()))
+}
+
+func (p *DetailPanel) scrolledContent(content string) string {
+	height := p.visibleContentHeight()
+	if height <= 0 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	maxOffset := p.maxScrollOffsetForContent(content)
+	p.scrollOffset = max(0, min(p.scrollOffset, maxOffset))
+	start := p.scrollOffset
+	end := min(len(lines), start+height)
+	return strings.Join(lines[start:end], "\n")
+}
+
+func sameDetailProfile(a, b *DetailInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Provider == b.Provider && a.Name == b.Name
 }
 
 // formatDurationFull formats duration for details view.

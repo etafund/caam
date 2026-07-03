@@ -15,6 +15,7 @@ import (
 	"hash"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -570,22 +571,62 @@ func writeHashComponent(hasher hash.Hash, name string, content []byte) {
 }
 
 // Watcher provides real-time monitoring of auth file changes.
-// It wraps fsnotify to watch auth file paths directly.
+// It polls auth file paths so atomic rename patterns and filesystems with
+// incomplete fsnotify support still converge on the current auth state.
 type Watcher struct {
-	tracker  *Tracker
-	onChange func(Change)
-	done     chan struct{}
-	mu       sync.Mutex
-	running  bool
-	stopOnce sync.Once // Ensures done channel is only closed once
+	tracker       *Tracker
+	onChange      func(Change)
+	done          chan struct{}
+	mu            sync.Mutex
+	running       bool
+	stopOnce      sync.Once // Ensures done channel is only closed once
+	pollInterval  time.Duration
+	debounceDelay time.Duration
+}
+
+const (
+	defaultWatcherPollInterval  = 5 * time.Second
+	defaultWatcherDebounceDelay = 250 * time.Millisecond
+)
+
+// WatcherOptions tunes the polling fallback used by Watcher.
+type WatcherOptions struct {
+	// PollInterval controls how often auth files are scanned. Values <= 0 use
+	// the default cross-platform interval.
+	PollInterval time.Duration
+	// DebounceDelay coalesces rapid auth writes and atomic rename sequences.
+	// Negative values disable debouncing; zero uses the default delay.
+	DebounceDelay time.Duration
 }
 
 // NewWatcher creates a new auth file watcher.
 func NewWatcher(vault *authfile.Vault, onChange func(Change)) *Watcher {
+	return NewWatcherWithOptions(vault, onChange, WatcherOptions{})
+}
+
+// NewWatcherWithOptions creates a new auth file watcher with configurable
+// polling and debounce behavior. The watcher intentionally uses polling as the
+// portable baseline because auth files are often replaced via atomic rename and
+// may live on filesystems where fsnotify is incomplete or unavailable.
+func NewWatcherWithOptions(vault *authfile.Vault, onChange func(Change), opts WatcherOptions) *Watcher {
+	pollInterval := opts.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = defaultWatcherPollInterval
+	}
+	debounceDelay := opts.DebounceDelay
+	if debounceDelay == 0 {
+		debounceDelay = defaultWatcherDebounceDelay
+	}
+	if debounceDelay < 0 {
+		debounceDelay = 0
+	}
+
 	return &Watcher{
-		tracker:  NewTracker(vault),
-		onChange: onChange,
-		done:     make(chan struct{}),
+		tracker:       NewTracker(vault),
+		onChange:      onChange,
+		done:          make(chan struct{}),
+		pollInterval:  pollInterval,
+		debounceDelay: debounceDelay,
 	}
 }
 
@@ -612,23 +653,139 @@ func (w *Watcher) Start() error {
 		return err
 	}
 
-	// Poll for changes (simpler than fsnotify for cross-platform auth files)
-	ticker := time.NewTicker(5 * time.Second)
+	// Poll for changes. This is intentionally the primary mechanism: auth files
+	// are frequently updated via write-temp + rename, and polling catches the
+	// final state even when fsnotify misses a rename or a remounted directory.
+	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
+
+	pending := make(map[string]Change)
+	var debounceTimer *time.Timer
+	var debounceC <-chan time.Time
+	defer func() {
+		if debounceTimer != nil {
+			debounceTimer.Stop()
+		}
+	}()
+
+	flushPending := func() {
+		if len(pending) == 0 {
+			return
+		}
+		providers := make([]string, 0, len(pending))
+		for provider := range pending {
+			providers = append(providers, provider)
+		}
+		sort.Strings(providers)
+
+		changes := make([]Change, 0, len(pending))
+		for _, provider := range providers {
+			change := pending[provider]
+			merged := coalescedChange(change.Provider, change.OldState, change.NewState)
+			if merged.Type != ChangeNone {
+				changes = append(changes, merged)
+			}
+		}
+
+		pending = make(map[string]Change)
+		for _, change := range changes {
+			if w.onChange != nil {
+				w.onChange(change)
+			}
+		}
+	}
+
+	scheduleFlush := func() {
+		if w.debounceDelay == 0 {
+			flushPending()
+			return
+		}
+		if debounceTimer == nil {
+			debounceTimer = time.NewTimer(w.debounceDelay)
+			debounceC = debounceTimer.C
+			return
+		}
+		if !debounceTimer.Stop() {
+			select {
+			case <-debounceTimer.C:
+			default:
+			}
+		}
+		debounceTimer.Reset(w.debounceDelay)
+		debounceC = debounceTimer.C
+	}
 
 	for {
 		select {
 		case <-w.done:
 			return nil
 		case <-ticker.C:
-			changes, _ := w.tracker.DetectAllChanges()
-			for _, change := range changes {
-				if w.onChange != nil {
-					w.onChange(change)
-				}
+			select {
+			case <-w.done:
+				return nil
+			default:
 			}
+			changes, _ := w.tracker.DetectAllChanges()
+			if w.debounceDelay == 0 {
+				for _, change := range changes {
+					if w.onChange != nil {
+						w.onChange(change)
+					}
+				}
+				continue
+			}
+			mergePendingChanges(pending, changes)
+			if len(changes) > 0 {
+				scheduleFlush()
+			}
+		case <-debounceC:
+			debounceC = nil
+			select {
+			case <-w.done:
+				return nil
+			default:
+			}
+			changes, _ := w.tracker.DetectAllChanges()
+			mergePendingChanges(pending, changes)
+			flushPending()
 		}
 	}
+}
+
+func mergePendingChanges(pending map[string]Change, changes []Change) {
+	for _, change := range changes {
+		if existing, ok := pending[change.Provider]; ok {
+			change.OldState = existing.OldState
+		}
+		pending[change.Provider] = change
+	}
+}
+
+func coalescedChange(provider string, oldState, newState *AuthState) Change {
+	change := Change{
+		Provider: provider,
+		OldState: oldState,
+		NewState: newState,
+	}
+
+	switch {
+	case oldState == nil && newState != nil && newState.Exists:
+		change.Type = ChangeNew
+		change.Description = "Auth files appeared"
+	case oldState != nil && oldState.Exists && (newState == nil || !newState.Exists):
+		change.Type = ChangeRemoved
+		change.Description = "Auth files were removed"
+	case oldState != nil && !oldState.Exists && newState != nil && newState.Exists:
+		change.Type = ChangeNew
+		change.Description = "Auth files appeared"
+	case oldState != nil && newState != nil && oldState.ContentHash != newState.ContentHash:
+		change.Type = ChangeModified
+		change.Description = "Auth files were modified"
+	default:
+		change.Type = ChangeNone
+	}
+
+	return change
 }
 
 // Stop stops the watcher.

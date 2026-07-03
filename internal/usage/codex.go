@@ -35,9 +35,16 @@ func NewCodexFetcher() *CodexFetcher {
 
 // codexUsageResponse represents the Codex usage API response.
 type codexUsageResponse struct {
-	PlanType  string           `json:"plan_type"`
-	RateLimit *codexRateLimit  `json:"rate_limit"`
-	Credits   *codexCreditInfo `json:"credits"`
+	PlanType             string                 `json:"plan_type"`
+	RateLimit            *codexRateLimit        `json:"rate_limit"`
+	Credits              *codexCreditInfo       `json:"credits"`
+	AdditionalRateLimits []codexAdditionalLimit `json:"additional_rate_limits"`
+}
+
+type codexAdditionalLimit struct {
+	LimitName      string          `json:"limit_name"`
+	MeteredFeature string          `json:"metered_feature"`
+	RateLimit      *codexRateLimit `json:"rate_limit"`
 }
 
 type codexRateLimit struct {
@@ -146,6 +153,11 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// Success - parse response
+	case http.StatusTooManyRequests:
+		info.RateLimited = true
+		info.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), info.FetchedAt)
+		info.Error = ErrRateLimited.Error()
+		return info, fmt.Errorf("%w: status %d", ErrRateLimited, resp.StatusCode)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		info.Error = "unauthorized: token expired or invalid"
 		return info, fmt.Errorf("unauthorized: status %d", resp.StatusCode)
@@ -165,23 +177,31 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 
 	if usage.RateLimit != nil {
 		if usage.RateLimit.PrimaryWindow != nil {
-			w := usage.RateLimit.PrimaryWindow
-			info.PrimaryWindow = &UsageWindow{
-				Utilization:    float64(w.UsedPercent) / 100.0,
-				UsedPercent:    w.UsedPercent,
-				ResetsAt:       time.Unix(int64(w.ResetAt), 0),
-				WindowDuration: time.Duration(w.LimitWindowSeconds) * time.Second,
-			}
+			info.PrimaryWindow = codexUsageWindow(usage.RateLimit.PrimaryWindow, "")
 		}
 
 		if usage.RateLimit.SecondaryWindow != nil {
-			w := usage.RateLimit.SecondaryWindow
-			info.SecondaryWindow = &UsageWindow{
-				Utilization:    float64(w.UsedPercent) / 100.0,
-				UsedPercent:    w.UsedPercent,
-				ResetsAt:       time.Unix(int64(w.ResetAt), 0),
-				WindowDuration: time.Duration(w.LimitWindowSeconds) * time.Second,
+			info.SecondaryWindow = codexUsageWindow(usage.RateLimit.SecondaryWindow, "")
+		}
+	}
+
+	for _, limit := range usage.AdditionalRateLimits {
+		key := codexAdditionalLimitKey(limit)
+		if key == "" || limit.RateLimit == nil {
+			continue
+		}
+
+		if limit.RateLimit.PrimaryWindow != nil {
+			if info.ModelWindows == nil {
+				info.ModelWindows = make(map[string]*UsageWindow)
 			}
+			info.ModelWindows[key+"/5h"] = codexUsageWindow(limit.RateLimit.PrimaryWindow, limit.LimitName)
+		}
+		if limit.RateLimit.SecondaryWindow != nil {
+			if info.ModelWindows == nil {
+				info.ModelWindows = make(map[string]*UsageWindow)
+			}
+			info.ModelWindows[key+"/weekly"] = codexUsageWindow(limit.RateLimit.SecondaryWindow, limit.LimitName)
 		}
 	}
 
@@ -196,6 +216,31 @@ func (f *CodexFetcher) FetchWithOptions(ctx context.Context, accessToken string,
 	}
 
 	return info, nil
+}
+
+func codexUsageWindow(w *codexWindow, label string) *UsageWindow {
+	if w == nil {
+		return nil
+	}
+	return &UsageWindow{
+		Utilization:    float64(w.UsedPercent) / 100.0,
+		UsedPercent:    w.UsedPercent,
+		ResetsAt:       time.Unix(int64(w.ResetAt), 0),
+		WindowDuration: time.Duration(w.LimitWindowSeconds) * time.Second,
+		Label:          strings.TrimSpace(label),
+	}
+}
+
+func codexAdditionalLimitKey(limit codexAdditionalLimit) string {
+	if key := strings.TrimSpace(limit.MeteredFeature); key != "" {
+		return strings.ToLower(key)
+	}
+
+	name := strings.ToLower(strings.TrimSpace(limit.LimitName))
+	if name == "" {
+		return ""
+	}
+	return strings.Join(strings.Fields(name), "-")
 }
 
 // resolveUsageURL determines the correct usage API URL.

@@ -848,3 +848,21 @@ func TestUsageInfo_DepletionWarningLevel(t *testing.T) {
 		})
 	}
 }
+
+func TestRateLimitedSentinelAndHelpers(t *testing.T) {
+	if !IsRateLimitedError(ErrRateLimited) {
+		t.Fatal("IsRateLimitedError did not recognize ErrRateLimited")
+	}
+	if !IsRateLimitedMessage("API error: status 429") {
+		t.Fatal("IsRateLimitedMessage did not recognize status 429")
+	}
+	if !IsRateLimitedUsage(&UsageInfo{RateLimited: true}) {
+		t.Fatal("IsRateLimitedUsage did not recognize RateLimited flag")
+	}
+	if !IsRateLimitedUsage(&UsageInfo{Error: "too many requests"}) {
+		t.Fatal("IsRateLimitedUsage did not recognize too many requests")
+	}
+	if IsRateLimitedMessage("401 Unauthorized; request id abc429def") {
+		t.Fatal("IsRateLimitedMessage misclassified incidental 429 substring")
+	}
+}

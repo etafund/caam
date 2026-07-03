@@ -1,6 +1,9 @@
 package authwatch
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -89,9 +92,7 @@ func TestCaptureWithAuth(t *testing.T) {
 	}
 
 	// Set environment
-	oldCodexHome := os.Getenv("CODEX_HOME")
-	os.Setenv("CODEX_HOME", codexDir)
-	defer os.Setenv("CODEX_HOME", oldCodexHome)
+	t.Setenv("CODEX_HOME", codexDir)
 
 	tracker := NewTracker(vault)
 
@@ -1065,6 +1066,239 @@ func TestWatcherDetectsChanges(t *testing.T) {
 
 	// Note: In a real test we'd wait for the change, but the 5-second poll
 	// makes this test slow. The test mainly verifies the watcher starts/stops correctly.
+}
+
+func TestWatcherDetectsAtomicRenameWithPollingFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	codexDir := filepath.Join(tmpDir, "codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(codexDir, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"value":"initial"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldCodexHome := os.Getenv("CODEX_HOME")
+	os.Setenv("CODEX_HOME", codexDir)
+	defer os.Setenv("CODEX_HOME", oldCodexHome)
+
+	changes := make(chan Change, 10)
+	w := NewWatcherWithOptions(vault, func(c Change) {
+		changes <- c
+	}, WatcherOptions{
+		PollInterval:  10 * time.Millisecond,
+		DebounceDelay: 20 * time.Millisecond,
+	})
+	stopWatcher := startAuthWatcherForTest(t, w)
+	waitForCapturedState(t, w, "codex")
+
+	renamedBody := []byte(`{"value":"renamed"}`)
+	tmpAuth := filepath.Join(codexDir, "auth.json.tmp")
+	if err := os.WriteFile(tmpAuth, renamedBody, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmpAuth, authPath); err != nil {
+		t.Fatal(err)
+	}
+
+	change := waitForAuthChange(t, changes)
+	if change.Provider != "codex" {
+		t.Fatalf("provider = %q, want codex", change.Provider)
+	}
+	if change.Type != ChangeModified {
+		t.Fatalf("change type = %v, want %v", change.Type, ChangeModified)
+	}
+	if change.NewState == nil || change.NewState.ContentHash == "" {
+		t.Fatalf("missing new state in change: %+v", change)
+	}
+	if got, want := change.NewState.ContentHash, expectedAuthContentHash("auth.json", renamedBody); got != want {
+		t.Fatalf("new content hash = %q, want renamed hash %q", got, want)
+	}
+
+	stopWatcher()
+}
+
+func TestWatcherDebouncesHighFrequencyAuthChurn(t *testing.T) {
+	tmpDir := t.TempDir()
+	vault := authfile.NewVault(tmpDir)
+
+	codexDir := filepath.Join(tmpDir, "codex")
+	if err := os.MkdirAll(codexDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(codexDir, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"value":"initial"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("CODEX_HOME", codexDir)
+
+	changes := make(chan Change, 10)
+	w := NewWatcherWithOptions(vault, func(c Change) {
+		changes <- c
+	}, WatcherOptions{
+		PollInterval:  5 * time.Millisecond,
+		DebounceDelay: 60 * time.Millisecond,
+	})
+	stopWatcher := startAuthWatcherForTest(t, w)
+	waitForCapturedState(t, w, "codex")
+
+	finalChurnBody := []byte(`{"value":"churn-final"}`)
+	for i := 0; i < 10; i++ {
+		body := []byte(fmt.Sprintf(`{"value":"churn-%02d"}`, i))
+		if i == 9 {
+			body = finalChurnBody
+		}
+		if err := os.WriteFile(authPath, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(8 * time.Millisecond)
+	}
+
+	first := waitForAuthChange(t, changes)
+	if first.Provider != "codex" || first.Type != ChangeModified {
+		t.Fatalf("unexpected first change: %+v", first)
+	}
+	if first.NewState == nil || first.NewState.ContentHash != expectedAuthContentHash("auth.json", finalChurnBody) {
+		t.Fatalf("first change did not report final churn state: %+v", first.NewState)
+	}
+
+	select {
+	case extra := <-changes:
+		t.Fatalf("expected churn to coalesce into one callback, got extra %+v", extra)
+	case <-time.After(90 * time.Millisecond):
+	}
+
+	settledBody := []byte(`{"value":"settled"}`)
+	if err := os.WriteFile(authPath, settledBody, 0600); err != nil {
+		t.Fatal(err)
+	}
+	second := waitForAuthChange(t, changes)
+	if second.Provider != "codex" || second.Type != ChangeModified {
+		t.Fatalf("unexpected second change after debounce window: %+v", second)
+	}
+	if second.NewState == nil || second.NewState.ContentHash != expectedAuthContentHash("auth.json", settledBody) {
+		t.Fatalf("second change did not report settled state: %+v", second.NewState)
+	}
+
+	stopWatcher()
+}
+
+func expectedAuthContentHash(baseName string, body []byte) string {
+	hasher := sha256.New()
+	writeHashComponent(hasher, baseName, body)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func TestMergePendingChangesPreservesOriginalOldStateAndFinalNewState(t *testing.T) {
+	stateA := &AuthState{Provider: "codex", Exists: true, ContentHash: "a"}
+	stateB := &AuthState{Provider: "codex", Exists: true, ContentHash: "b"}
+	stateC := &AuthState{Provider: "codex", Exists: true, ContentHash: "c"}
+
+	pending := make(map[string]Change)
+	mergePendingChanges(pending, []Change{{Provider: "codex", Type: ChangeModified, OldState: stateA, NewState: stateB}})
+	mergePendingChanges(pending, []Change{{Provider: "codex", Type: ChangeModified, OldState: stateB, NewState: stateC}})
+
+	got := pending["codex"]
+	if got.OldState != stateA {
+		t.Fatalf("old state was not preserved: got %p want %p", got.OldState, stateA)
+	}
+	if got.NewState != stateC {
+		t.Fatalf("new state was not updated to final state: got %p want %p", got.NewState, stateC)
+	}
+
+	coalesced := coalescedChange(got.Provider, got.OldState, got.NewState)
+	if coalesced.Type != ChangeModified {
+		t.Fatalf("coalesced type = %v, want %v", coalesced.Type, ChangeModified)
+	}
+}
+
+func TestCoalescedChangeDropsNetNoOpAndRecomputesType(t *testing.T) {
+	absent := &AuthState{Provider: "codex", Exists: false}
+	stateA := &AuthState{Provider: "codex", Exists: true, ContentHash: "a"}
+	stateB := &AuthState{Provider: "codex", Exists: true, ContentHash: "b"}
+
+	if got := coalescedChange("codex", stateA, stateA); got.Type != ChangeNone {
+		t.Fatalf("A -> A type = %v, want none", got.Type)
+	}
+	if got := coalescedChange("codex", absent, stateB); got.Type != ChangeNew {
+		t.Fatalf("absent -> present type = %v, want new", got.Type)
+	}
+	if got := coalescedChange("codex", stateA, absent); got.Type != ChangeRemoved {
+		t.Fatalf("present -> absent type = %v, want removed", got.Type)
+	}
+	if got := coalescedChange("codex", stateA, stateB); got.Type != ChangeModified {
+		t.Fatalf("A -> B type = %v, want modified", got.Type)
+	}
+}
+
+func startAuthWatcherForTest(t *testing.T, w *Watcher) func() {
+	t.Helper()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Start()
+	}()
+
+	stopped := false
+	stop := func() {
+		t.Helper()
+		if stopped {
+			return
+		}
+		stopped = true
+		w.Stop()
+		expectWatcherStopped(t, errCh)
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
+func waitForCapturedState(t *testing.T, w *Watcher, provider string) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for initial %s capture", provider)
+		case <-ticker.C:
+			if w.tracker.GetState(provider) != nil {
+				return
+			}
+		}
+	}
+}
+
+func waitForAuthChange(t *testing.T, changes <-chan Change) Change {
+	t.Helper()
+
+	select {
+	case change := <-changes:
+		return change
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for auth change")
+		return Change{}
+	}
+}
+
+func expectWatcherStopped(t *testing.T, errCh <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("watcher stopped with error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not stop")
+	}
 }
 
 func TestCaptureUnknownProvider(t *testing.T) {

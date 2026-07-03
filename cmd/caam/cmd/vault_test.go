@@ -641,10 +641,25 @@ func TestStatus_LoggedInUnprofiled_CrossReferencesSavedProfiles(t *testing.T) {
 		t.Fatalf("read status output: %v", err)
 	}
 
-	var out statusOutput
-	if err := json.Unmarshal(rawOut, &out); err != nil {
+	var envelope struct {
+		GeneratedAt  string       `json:"generated_at"`
+		Version      string       `json:"version"`
+		OutputFormat string       `json:"output_format"`
+		Data         statusOutput `json:"data"`
+	}
+	if err := json.Unmarshal(rawOut, &envelope); err != nil {
 		t.Fatalf("unmarshal status json %q: %v", string(rawOut), err)
 	}
+	if envelope.GeneratedAt == "" {
+		t.Fatalf("expected generated_at in status envelope")
+	}
+	if envelope.Version == "" {
+		t.Fatalf("expected version in status envelope")
+	}
+	if envelope.OutputFormat != jsonOutputFormatStatus {
+		t.Fatalf("output_format = %q, want %q", envelope.OutputFormat, jsonOutputFormatStatus)
+	}
+	out := envelope.Data
 	if len(out.Tools) != 1 {
 		t.Fatalf("expected 1 tool in status output, got %d (%s)", len(out.Tools), string(rawOut))
 	}

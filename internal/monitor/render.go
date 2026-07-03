@@ -205,12 +205,20 @@ func formatDuration(d time.Duration) string {
 	if d < time.Hour {
 		return fmt.Sprintf("%dm", int(d.Minutes()))
 	}
+	if d >= 24*time.Hour {
+		days := int(d.Hours()) / 24
+		hours := int(d.Hours()) % 24
+		if hours == 0 {
+			return fmt.Sprintf("%dd", days)
+		}
+		return fmt.Sprintf("%dd%dh", days, hours)
+	}
 	hours := int(d.Hours())
 	mins := int(d.Minutes()) % 60
 	if mins == 0 {
 		return fmt.Sprintf("%dh", hours)
 	}
-	return fmt.Sprintf("%dh %dm", hours, mins)
+	return fmt.Sprintf("%dh%dm", hours, mins)
 }
 
 // formatCooldown formats the cooldown remaining time.

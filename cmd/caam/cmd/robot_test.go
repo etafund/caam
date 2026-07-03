@@ -125,6 +125,7 @@ func TestSchema_AllOutputs(t *testing.T) {
 		}
 		if item.Command == "status" {
 			hasStatus = true
+			assertEnvelopeSchema(t, item.Schema, jsonOutputFormatStatus)
 		}
 	}
 	if !hasStatus {
@@ -157,6 +158,43 @@ func TestSchema_SingleCommandAlias(t *testing.T) {
 	}
 	if envelope.Schema[0].Command != "ls" {
 		t.Fatalf("expected list alias to map to ls, got %q", envelope.Schema[0].Command)
+	}
+	assertEnvelopeSchema(t, envelope.Schema[0].Schema, jsonOutputFormatLS)
+}
+
+func assertEnvelopeSchema(t *testing.T, schema map[string]interface{}, outputFormat string) {
+	t.Helper()
+
+	required, ok := schema["required"].([]interface{})
+	if !ok {
+		t.Fatalf("schema required field has unexpected type: %T", schema["required"])
+	}
+	for _, field := range []string{"generated_at", "version", "output_format", "data"} {
+		found := false
+		for _, value := range required {
+			if value == field {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("schema required fields %v missing %q", required, field)
+		}
+	}
+
+	properties, ok := schema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("schema properties field has unexpected type: %T", schema["properties"])
+	}
+	outputFormatSchema, ok := properties["output_format"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("output_format schema has unexpected type: %T", properties["output_format"])
+	}
+	if outputFormatSchema["const"] != outputFormat {
+		t.Fatalf("output_format const = %v, want %q", outputFormatSchema["const"], outputFormat)
+	}
+	if _, ok := properties["data"].(map[string]interface{}); !ok {
+		t.Fatalf("data schema has unexpected type: %T", properties["data"])
 	}
 }
 

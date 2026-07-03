@@ -9,7 +9,14 @@ import {
   AlertCircle,
   CheckCircle2,
 } from "lucide-react";
-import { DashboardLayout } from "@/components";
+import {
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  DashboardLayout,
+} from "@/components";
 
 interface StatCardProps {
   title: string;
@@ -24,28 +31,29 @@ function StatCard({ title, value, change, trend, icon }: StatCardProps) {
     <motion.div
       initial={{ opacity: 0, y: 20 }}
       animate={{ opacity: 1, y: 0 }}
-      className="rounded-xl border border-border bg-surface p-6"
     >
-      <div className="flex items-start justify-between">
-        <div>
-          <p className="text-sm text-muted">{title}</p>
-          <p className="mt-2 text-3xl font-semibold">{value}</p>
-          {change && (
-            <p
-              className={`mt-1 text-sm ${
-                trend === "up"
-                  ? "text-success"
-                  : trend === "down"
-                    ? "text-danger"
-                    : "text-muted"
-              }`}
-            >
-              {change}
-            </p>
-          )}
+      <Card className="p-6">
+        <div className="flex items-start justify-between">
+          <div>
+            <p className="text-sm text-muted">{title}</p>
+            <p className="mt-2 text-3xl font-semibold">{value}</p>
+            {change && (
+              <p
+                className={`mt-1 text-sm ${
+                  trend === "up"
+                    ? "text-success"
+                    : trend === "down"
+                      ? "text-danger"
+                      : "text-muted"
+                }`}
+              >
+                {change}
+              </p>
+            )}
+          </div>
+          <div className="rounded-lg bg-accent/10 p-3 text-accent">{icon}</div>
         </div>
-        <div className="rounded-lg bg-accent/10 p-3 text-accent">{icon}</div>
-      </div>
+      </Card>
     </motion.div>
   );
 }
@@ -135,31 +143,32 @@ export default function DashboardPage() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.1 }}
-            className="rounded-xl border border-border bg-surface"
           >
-            <div className="border-b border-border px-6 py-4">
-              <h2 className="font-semibold">Recent Activity</h2>
-            </div>
-            <div className="divide-y divide-border">
-              {recentActivity.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex items-start gap-3 px-6 py-4"
-                >
-                  {item.type === "success" ? (
-                    <CheckCircle2 className="mt-0.5 h-5 w-5 text-success" />
-                  ) : item.type === "warning" ? (
-                    <AlertCircle className="mt-0.5 h-5 w-5 text-warning" />
-                  ) : (
-                    <AlertCircle className="mt-0.5 h-5 w-5 text-danger" />
-                  )}
-                  <div className="flex-1">
-                    <p className="text-sm">{item.message}</p>
-                    <p className="mt-1 text-xs text-muted">{item.time}</p>
+            <Card>
+              <CardHeader>
+                <CardTitle>Recent Activity</CardTitle>
+              </CardHeader>
+              <div className="divide-y divide-border">
+                {recentActivity.map((item) => (
+                  <div
+                    key={item.id}
+                    className="flex items-start gap-3 px-6 py-4"
+                  >
+                    {item.type === "success" ? (
+                      <CheckCircle2 className="mt-0.5 h-5 w-5 text-success" />
+                    ) : item.type === "warning" ? (
+                      <AlertCircle className="mt-0.5 h-5 w-5 text-warning" />
+                    ) : (
+                      <AlertCircle className="mt-0.5 h-5 w-5 text-danger" />
+                    )}
+                    <div className="flex-1">
+                      <p className="text-sm">{item.message}</p>
+                      <p className="mt-1 text-xs text-muted">{item.time}</p>
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </Card>
           </motion.div>
 
           {/* Quick Actions */}
@@ -167,29 +176,30 @@ export default function DashboardPage() {
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: 0.2 }}
-            className="rounded-xl border border-border bg-surface"
           >
-            <div className="border-b border-border px-6 py-4">
-              <h2 className="font-semibold">Quick Actions</h2>
-            </div>
-            <div className="grid grid-cols-2 gap-4 p-6">
-              <button className="flex flex-col items-center gap-2 rounded-lg border border-border bg-background p-4 text-sm transition-colors hover:border-accent hover:bg-accent/5">
-                <Users className="h-6 w-6 text-accent" />
-                <span>Switch Profile</span>
-              </button>
-              <button className="flex flex-col items-center gap-2 rounded-lg border border-border bg-background p-4 text-sm transition-colors hover:border-accent hover:bg-accent/5">
-                <Key className="h-6 w-6 text-accent" />
-                <span>Refresh Token</span>
-              </button>
-              <button className="flex flex-col items-center gap-2 rounded-lg border border-border bg-background p-4 text-sm transition-colors hover:border-accent hover:bg-accent/5">
-                <ArrowUpRight className="h-6 w-6 text-accent" />
-                <span>Sync Now</span>
-              </button>
-              <button className="flex flex-col items-center gap-2 rounded-lg border border-border bg-background p-4 text-sm transition-colors hover:border-accent hover:bg-accent/5">
-                <Activity className="h-6 w-6 text-accent" />
-                <span>View Logs</span>
-              </button>
-            </div>
+            <Card>
+              <CardHeader>
+                <CardTitle>Quick Actions</CardTitle>
+              </CardHeader>
+              <CardContent className="grid grid-cols-2 gap-4">
+                <Button className="h-auto flex-col p-4" variant="secondary">
+                  <Users className="h-6 w-6 text-accent" />
+                  <span>Switch Profile</span>
+                </Button>
+                <Button className="h-auto flex-col p-4" variant="secondary">
+                  <Key className="h-6 w-6 text-accent" />
+                  <span>Refresh Token</span>
+                </Button>
+                <Button className="h-auto flex-col p-4" variant="secondary">
+                  <ArrowUpRight className="h-6 w-6 text-accent" />
+                  <span>Sync Now</span>
+                </Button>
+                <Button className="h-auto flex-col p-4" variant="secondary">
+                  <Activity className="h-6 w-6 text-accent" />
+                  <span>View Logs</span>
+                </Button>
+              </CardContent>
+            </Card>
           </motion.div>
         </div>
       </div>

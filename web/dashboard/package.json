@@ -9,7 +9,11 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "deps:audit": "pnpm audit --audit-level critical",
+    "deps:health": "node scripts/dependency-health.mjs",
+    "deps:health:check": "node scripts/dependency-health.mjs --check",
+    "security:check": "pnpm run deps:audit && pnpm run deps:health:check"
   },
   "dependencies": {
     "next": "16.1.4",
@@ -28,7 +32,7 @@
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
     "@playwright/test": "^1.52.1",
-    "vitest": "^3.2.3",
+    "vitest": "^3.2.6",
     "@testing-library/react": "^16.3.0",
     "@vitejs/plugin-react": "^4.5.4",
     "jsdom": "^26.1.0",

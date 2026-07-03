@@ -54,6 +54,56 @@ func TestHelpRenderer_Caching(t *testing.T) {
 	}
 }
 
+func TestHelpRenderer_CacheSizeAndInvalidation(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	theme := NewTheme(ThemeOptionsFromEnv())
+	hr := NewHelpRenderer(theme)
+	hr.SetWidth(80)
+
+	markdown := "# Cache Test\n\nRepeated content."
+	result1 := hr.Render(markdown)
+	if result1 == "" {
+		t.Fatal("initial render returned empty output")
+	}
+	if got := len(hr.cache); got != 1 {
+		t.Fatalf("expected 1 cache entry after first render, got %d", got)
+	}
+
+	result2 := hr.Render(markdown)
+	if result2 != result1 {
+		t.Fatal("identical content should reuse cached rendered output")
+	}
+	if got := len(hr.cache); got != 1 {
+		t.Fatalf("identical content should not grow cache, got %d entries", got)
+	}
+
+	other := "## Different\n\nNew content."
+	_ = hr.Render(other)
+	if got := len(hr.cache); got != 2 {
+		t.Fatalf("different content should add one cache entry, got %d", got)
+	}
+
+	hr.SetWidth(80)
+	if got := len(hr.cache); got != 2 {
+		t.Fatalf("setting same width should keep cache, got %d entries", got)
+	}
+
+	hr.SetWidth(100)
+	if got := len(hr.cache); got != 0 {
+		t.Fatalf("changing width should clear cache, got %d entries", got)
+	}
+
+	result3 := hr.Render(markdown)
+	if result3 == "" {
+		t.Fatal("render after width change returned empty output")
+	}
+	if got := len(hr.cache); got != 1 {
+		t.Fatalf("NO_COLOR fallback should cache rendered content, got %d entries", got)
+	}
+
+	t.Logf("help render cache sizes: repeated=1 different=2 same_width=2 changed_width=0 fallback=1")
+}
+
 func TestHelpRenderer_WidthChange(t *testing.T) {
 	theme := DefaultTheme()
 	hr := NewHelpRenderer(theme)

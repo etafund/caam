@@ -1052,6 +1052,170 @@ func TestTUIConfigEnvOverrides(t *testing.T) {
 	})
 }
 
+func TestTUIConfigPrecedenceAndMissingFieldFixtures(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		env     map[string]string
+		want    TUIConfig
+		sources tuiConfigSources
+	}{
+		{
+			name: "defaults when config file is missing",
+			want: TUIConfig{
+				Theme:         "auto",
+				HighContrast:  false,
+				ReducedMotion: false,
+				Toasts:        true,
+				Mouse:         true,
+				ShowKeyHints:  true,
+				Density:       "cozy",
+				NoTUI:         false,
+			},
+			sources: allTUIConfigSources("default"),
+		},
+		{
+			name: "config file overrides defaults",
+			yaml: `
+version: 1
+tui:
+  theme: dark
+  high_contrast: true
+  reduced_motion: true
+  toasts: false
+  mouse: false
+  show_key_hints: false
+  density: compact
+  no_tui: true
+`,
+			want: TUIConfig{
+				Theme:         "dark",
+				HighContrast:  true,
+				ReducedMotion: true,
+				Toasts:        false,
+				Mouse:         false,
+				ShowKeyHints:  false,
+				Density:       "compact",
+				NoTUI:         true,
+			},
+			sources: allTUIConfigSources("config_file"),
+		},
+		{
+			name: "missing config fields keep defaults",
+			yaml: `
+version: 1
+tui:
+  theme: light
+  toasts: false
+`,
+			want: TUIConfig{
+				Theme:         "light",
+				HighContrast:  false,
+				ReducedMotion: false,
+				Toasts:        false,
+				Mouse:         true,
+				ShowKeyHints:  true,
+				Density:       "cozy",
+				NoTUI:         false,
+			},
+			sources: tuiConfigSources{
+				Theme:         "config_file",
+				HighContrast:  "default",
+				ReducedMotion: "default",
+				Toasts:        "config_file",
+				Mouse:         "default",
+				ShowKeyHints:  "default",
+				Density:       "default",
+				NoTUI:         "default",
+			},
+		},
+		{
+			name: "env overrides config file",
+			yaml: `
+version: 1
+tui:
+  theme: dark
+  high_contrast: true
+  reduced_motion: false
+  toasts: true
+  mouse: true
+  show_key_hints: true
+  density: cozy
+  no_tui: false
+`,
+			env: map[string]string{
+				"CAAM_TUI_THEME":          "light",
+				"CAAM_TUI_CONTRAST":       "normal",
+				"CAAM_TUI_REDUCED_MOTION": "true",
+				"CAAM_TUI_TOASTS":         "false",
+				"CAAM_TUI_MOUSE":          "false",
+				"CAAM_TUI_KEY_HINTS":      "false",
+				"CAAM_TUI_DENSITY":        "compact",
+				"CAAM_NO_TUI":             "true",
+			},
+			want: TUIConfig{
+				Theme:         "light",
+				HighContrast:  false,
+				ReducedMotion: true,
+				Toasts:        false,
+				Mouse:         false,
+				ShowKeyHints:  false,
+				Density:       "compact",
+				NoTUI:         true,
+			},
+			sources: allTUIConfigSources("env"),
+		},
+		{
+			name: "env overrides defaults when config file is missing",
+			env: map[string]string{
+				"CAAM_TUI_THEME":          "dark",
+				"CAAM_TUI_CONTRAST":       "high",
+				"CAAM_TUI_REDUCED_MOTION": "true",
+				"CAAM_TUI_TOASTS":         "false",
+				"CAAM_TUI_MOUSE":          "false",
+				"CAAM_TUI_KEY_HINTS":      "false",
+				"CAAM_TUI_DENSITY":        "compact",
+				"CAAM_NO_TUI":             "true",
+			},
+			want: TUIConfig{
+				Theme:         "dark",
+				HighContrast:  true,
+				ReducedMotion: true,
+				Toasts:        false,
+				Mouse:         false,
+				ShowKeyHints:  false,
+				Density:       "compact",
+				NoTUI:         true,
+			},
+			sources: allTUIConfigSources("env"),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTUIEnvForSPMConfigTest(t)
+			t.Setenv("CAAM_HOME", t.TempDir())
+
+			if tc.yaml != "" {
+				configPath := filepath.Join(os.Getenv("CAAM_HOME"), "config.yaml")
+				if err := os.WriteFile(configPath, []byte(tc.yaml), 0600); err != nil {
+					t.Fatalf("WriteFile config fixture error = %v", err)
+				}
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			cfg, err := LoadSPMConfig()
+			if err != nil {
+				t.Fatalf("LoadSPMConfig() error = %v", err)
+			}
+			assertResolvedTUIConfig(t, cfg.TUI, tc.want)
+			logResolvedTUIConfig(t, cfg.TUI, tc.sources)
+		})
+	}
+}
+
 func TestTUIConfigValidation(t *testing.T) {
 	// Save original env
 	origCaamHome := os.Getenv("CAAM_HOME")
@@ -1166,6 +1330,103 @@ func TestTUIConfigSaveAndLoad(t *testing.T) {
 	if !loaded.TUI.NoTUI {
 		t.Error("Loaded TUI.NoTUI should be true")
 	}
+}
+
+type tuiConfigSources struct {
+	Theme         string
+	HighContrast  string
+	ReducedMotion string
+	Toasts        string
+	Mouse         string
+	ShowKeyHints  string
+	Density       string
+	NoTUI         string
+}
+
+func allTUIConfigSources(source string) tuiConfigSources {
+	return tuiConfigSources{
+		Theme:         source,
+		HighContrast:  source,
+		ReducedMotion: source,
+		Toasts:        source,
+		Mouse:         source,
+		ShowKeyHints:  source,
+		Density:       source,
+		NoTUI:         source,
+	}
+}
+
+func assertResolvedTUIConfig(t *testing.T, got, want TUIConfig) {
+	t.Helper()
+
+	if got.Theme != want.Theme {
+		t.Fatalf("TUI.Theme = %q, want %q", got.Theme, want.Theme)
+	}
+	if got.HighContrast != want.HighContrast {
+		t.Fatalf("TUI.HighContrast = %t, want %t", got.HighContrast, want.HighContrast)
+	}
+	if got.ReducedMotion != want.ReducedMotion {
+		t.Fatalf("TUI.ReducedMotion = %t, want %t", got.ReducedMotion, want.ReducedMotion)
+	}
+	if got.Toasts != want.Toasts {
+		t.Fatalf("TUI.Toasts = %t, want %t", got.Toasts, want.Toasts)
+	}
+	if got.Mouse != want.Mouse {
+		t.Fatalf("TUI.Mouse = %t, want %t", got.Mouse, want.Mouse)
+	}
+	if got.ShowKeyHints != want.ShowKeyHints {
+		t.Fatalf("TUI.ShowKeyHints = %t, want %t", got.ShowKeyHints, want.ShowKeyHints)
+	}
+	if got.Density != want.Density {
+		t.Fatalf("TUI.Density = %q, want %q", got.Density, want.Density)
+	}
+	if got.NoTUI != want.NoTUI {
+		t.Fatalf("TUI.NoTUI = %t, want %t", got.NoTUI, want.NoTUI)
+	}
+}
+
+func clearTUIEnvForSPMConfigTest(t *testing.T) {
+	t.Helper()
+
+	for _, key := range []string{
+		"CAAM_TUI_THEME",
+		"CAAM_TUI_CONTRAST",
+		"CAAM_TUI_REDUCED_MOTION",
+		"CAAM_REDUCED_MOTION",
+		"REDUCED_MOTION",
+		"CAAM_TUI_TOASTS",
+		"CAAM_TUI_MOUSE",
+		"CAAM_TUI_KEY_HINTS",
+		"CAAM_TUI_DENSITY",
+		"CAAM_NO_TUI",
+		"NO_TUI",
+	} {
+		t.Setenv(key, "")
+	}
+}
+
+func logResolvedTUIConfig(t *testing.T, cfg TUIConfig, sources tuiConfigSources) {
+	t.Helper()
+
+	t.Logf(
+		"resolved_tui_config theme=%q theme_source=%s high_contrast=%t high_contrast_source=%s reduced_motion=%t reduced_motion_source=%s toasts=%t toasts_source=%s mouse=%t mouse_source=%s show_key_hints=%t show_key_hints_source=%s density=%q density_source=%s no_tui=%t no_tui_source=%s",
+		cfg.Theme,
+		sources.Theme,
+		cfg.HighContrast,
+		sources.HighContrast,
+		cfg.ReducedMotion,
+		sources.ReducedMotion,
+		cfg.Toasts,
+		sources.Toasts,
+		cfg.Mouse,
+		sources.Mouse,
+		cfg.ShowKeyHints,
+		sources.ShowKeyHints,
+		cfg.Density,
+		sources.Density,
+		cfg.NoTUI,
+		sources.NoTUI,
+	)
 }
 
 func TestNewConfigSectionDefaults(t *testing.T) {

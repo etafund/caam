@@ -36,6 +36,7 @@ func init() {
 	renameCmd.Flags().Bool("migrate-aliases", true, "migrate aliases from old to new profile")
 	renameCmd.Flags().Bool("json", false, "output in JSON format")
 	renameCmd.Flags().BoolP("yes", "y", false, "skip confirmation for --delete-old")
+	addPromptModeFlags(renameCmd)
 }
 
 func runRename(cmd *cobra.Command, args []string) error {
@@ -97,7 +98,7 @@ func runRename(cmd *cobra.Command, args []string) error {
 	if migrateAliases {
 		cfg, err := config.Load()
 		if err == nil {
-			aliases := cfg.GetAliases(tool, oldName)
+			aliases := append([]string(nil), cfg.GetAliases(tool, oldName)...)
 			if len(aliases) > 0 {
 				// Remove aliases from old profile and add to new
 				for _, alias := range aliases {
@@ -122,10 +123,11 @@ func runRename(cmd *cobra.Command, args []string) error {
 	// Delete old profile if requested (with confirmation)
 	if deleteOld {
 		if !skipConfirm {
-			fmt.Printf("Delete old profile %s/%s? This cannot be undone. [y/N]: ", tool, oldName)
-			var response string
-			fmt.Scanln(&response)
-			if response != "y" && response != "Y" {
+			confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Delete old profile %s/%s? This cannot be undone.", tool, oldName), false)
+			if err != nil {
+				return fmt.Errorf("confirm delete old profile: %w", err)
+			}
+			if !confirmed {
 				if jsonOutput {
 					result["deleted"] = false
 					result["delete_skipped"] = "user declined"

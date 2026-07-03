@@ -51,3 +51,6 @@ tmp/
 
 # Scratch / working files
 scratch/
+
+# beads task DB (local-only, not tracked in git)
+.beads/

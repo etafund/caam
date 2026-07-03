@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { Badge } from "./ui";
 
 interface NavItem {
   label: string;
@@ -78,15 +79,9 @@ export function Sidebar() {
         <div className="rounded-lg bg-surface-muted p-3">
           <p className="text-xs text-muted">Connected Providers</p>
           <div className="mt-2 flex gap-2">
-            <span className="inline-flex h-6 items-center rounded bg-accent/10 px-2 text-xs font-medium text-accent">
-              Claude
-            </span>
-            <span className="inline-flex h-6 items-center rounded bg-success/10 px-2 text-xs font-medium text-success">
-              Codex
-            </span>
-            <span className="inline-flex h-6 items-center rounded bg-warning/10 px-2 text-xs font-medium text-warning">
-              Gemini
-            </span>
+            <Badge tone="accent">Claude</Badge>
+            <Badge tone="success">Codex</Badge>
+            <Badge tone="warning">Gemini</Badge>
           </div>
         </div>
       </div>

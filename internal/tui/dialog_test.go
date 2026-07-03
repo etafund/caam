@@ -146,6 +146,28 @@ func TestConfirmDialog_Creation(t *testing.T) {
 	}
 }
 
+func TestConfirmDialog_DefaultsToNo(t *testing.T) {
+	d := NewConfirmDialog("Confirm Delete", "Delete this profile?")
+
+	if d.selected != 0 {
+		t.Fatalf("expected default selected button to be No (0), got %d", d.selected)
+	}
+	view := d.View()
+	if !strings.Contains(view, "No") || !strings.Contains(view, "Yes") {
+		t.Fatalf("confirmation view missing expected buttons: %q", view)
+	}
+
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.Result() != DialogResultSubmit {
+		t.Fatalf("expected enter to submit selected default, got %v", d.Result())
+	}
+	if d.Confirmed() {
+		t.Fatal("default confirmation selection should not confirm destructive action")
+	}
+
+	t.Logf("confirm defaults title=%q selected=%d confirmed=%t result=%v", d.title, d.selected, d.Confirmed(), d.Result())
+}
+
 func TestConfirmDialog_ConfirmWithY(t *testing.T) {
 	d := NewConfirmDialog("Confirm", "Delete this?")
 
@@ -714,6 +736,33 @@ func TestTextInputDialog_ValidationErrorCleared(t *testing.T) {
 	}
 }
 
+func TestTextInputDialog_InlineValidationView(t *testing.T) {
+	d := NewTextInputDialog("Profile", "Email:")
+	d.SetHint("Use the account email")
+	d.SetValidation(func(value string) string {
+		if !strings.Contains(value, "@") {
+			return "Must be a valid email address"
+		}
+		return ""
+	})
+
+	d.SetValue("invalid")
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if d.Result() != DialogResultNone {
+		t.Fatalf("invalid input should keep dialog open, got result %v", d.Result())
+	}
+
+	view := d.View()
+	if !strings.Contains(view, "Must be a valid email address") {
+		t.Fatalf("inline validation error missing from view: %q", view)
+	}
+	if strings.Contains(view, "Use the account email") {
+		t.Fatalf("hint should be hidden while validation error is shown: %q", view)
+	}
+
+	t.Logf("text input validation field=%q error=%q focused=%t", d.prompt, d.GetError(), d.focused)
+}
+
 // Test inline validation for MultiFieldDialog
 func TestMultiFieldDialog_InlineValidation(t *testing.T) {
 	fields := []FieldDefinition{
@@ -754,6 +803,52 @@ func TestMultiFieldDialog_InlineValidation(t *testing.T) {
 	if d.GetError(0) != "Invalid email format" {
 		t.Errorf("expected 'Invalid email format', got %q", d.GetError(0))
 	}
+}
+
+func TestMultiFieldDialog_InlineErrorRenderingDetails(t *testing.T) {
+	fields := []FieldDefinition{
+		{
+			Label:    "Email",
+			Required: true,
+			Hint:     "Use account email",
+			Validate: func(value string) string {
+				if !strings.Contains(value, "@") {
+					return "Invalid email format"
+				}
+				return ""
+			},
+		},
+		{Label: "Display name", Required: true},
+	}
+	d := NewMultiFieldDialog("Profile", fields)
+
+	if d.Validate() {
+		t.Fatal("empty required fields should fail validation")
+	}
+	view := d.View()
+	if !strings.Contains(view, "*") {
+		t.Fatalf("required indicator missing from validation view: %q", view)
+	}
+	if !strings.Contains(view, "This field is required") {
+		t.Fatalf("required error missing from validation view: %q", view)
+	}
+	if strings.Contains(view, "Use account email") {
+		t.Fatalf("field hint should be hidden while inline error is shown: %q", view)
+	}
+
+	d.ClearErrors()
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if d.Validate() {
+		t.Fatal("invalid email should fail custom validation")
+	}
+	view = d.View()
+	if !strings.Contains(view, "Invalid email format") {
+		t.Fatalf("custom validation error missing from view: %q", view)
+	}
+
+	t.Logf("multifield validation field=%q error=%q focus_index=%d", fields[0].Label, d.GetError(0), d.focused)
 }
 
 func TestMultiFieldDialog_ValidateField(t *testing.T) {

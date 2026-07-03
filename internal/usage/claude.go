@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
 // Claude API constants.
 const (
-	ClaudeUsageURL   = "https://api.anthropic.com/api/oauth/usage"
-	ClaudeAPIBeta    = "oauth-2025-04-20"
-	ClaudeUserAgent  = "caam/1.0"
-	claudeTimeout    = 30 * time.Second
+	ClaudeUsageURL  = "https://api.anthropic.com/api/oauth/usage"
+	ClaudeAPIBeta   = "oauth-2025-04-20"
+	ClaudeUserAgent = "caam/1.0"
+	claudeTimeout   = 30 * time.Second
 )
 
 // ClaudeFetcher fetches usage data from Claude's OAuth API.
@@ -27,13 +28,6 @@ func NewClaudeFetcher() *ClaudeFetcher {
 	return &ClaudeFetcher{
 		client: &http.Client{Timeout: claudeTimeout},
 	}
-}
-
-// claudeUsageResponse represents the Claude usage API response.
-type claudeUsageResponse struct {
-	FiveHour *claudeWindow `json:"five_hour"`
-	SevenDay *claudeWindow `json:"seven_day"`
-	Opus     *claudeWindow `json:"opus"`
 }
 
 type claudeWindow struct {
@@ -80,6 +74,11 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 	switch resp.StatusCode {
 	case http.StatusOK:
 		// Success - parse response
+	case http.StatusTooManyRequests:
+		info.RateLimited = true
+		info.RetryAfter = parseRetryAfter(resp.Header.Get("Retry-After"), info.FetchedAt)
+		info.Error = ErrRateLimited.Error()
+		return info, fmt.Errorf("%w: status %d", ErrRateLimited, resp.StatusCode)
 	case http.StatusUnauthorized, http.StatusForbidden:
 		info.Error = "unauthorized: token expired or invalid"
 		return info, fmt.Errorf("unauthorized: status %d", resp.StatusCode)
@@ -88,56 +87,79 @@ func (f *ClaudeFetcher) Fetch(ctx context.Context, accessToken string) (*UsageIn
 		return info, fmt.Errorf("API error: status %d", resp.StatusCode)
 	}
 
-	var usage claudeUsageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&usage); err != nil {
+	var raw map[string]json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		info.Error = fmt.Sprintf("decode error: %v", err)
 		return info, fmt.Errorf("decode response: %w", err)
 	}
 
 	// Convert to UsageInfo
 	// Note: Claude API returns utilization as 0-100 percentage, not 0-1 fraction
-	if usage.FiveHour != nil {
-		util := usage.FiveHour.Utilization
-		// Normalize: if > 1, it's a percentage; convert to 0-1 fraction
-		if util > 1 {
-			util = util / 100.0
-		}
-		info.PrimaryWindow = &UsageWindow{
-			Utilization:    util,
-			UsedPercent:    int(util * 100),
-			ResetsAt:       parseISO8601(usage.FiveHour.ResetsAt),
-			WindowDuration: 5 * time.Hour,
-		}
+	if window, ok := claudeUsageWindow(raw["five_hour"], 5*time.Hour); ok {
+		info.PrimaryWindow = window
 	}
 
-	if usage.SevenDay != nil {
-		util := usage.SevenDay.Utilization
-		// Normalize: if > 1, it's a percentage; convert to 0-1 fraction
-		if util > 1 {
-			util = util / 100.0
-		}
-		info.SecondaryWindow = &UsageWindow{
-			Utilization:    util,
-			UsedPercent:    int(util * 100),
-			ResetsAt:       parseISO8601(usage.SevenDay.ResetsAt),
-			WindowDuration: 7 * 24 * time.Hour,
-		}
+	if window, ok := claudeUsageWindow(raw["seven_day"], 7*24*time.Hour); ok {
+		info.SecondaryWindow = window
 	}
 
-	if usage.Opus != nil {
-		util := usage.Opus.Utilization
-		if util > 1 {
-			util = util / 100.0
+	for key, value := range raw {
+		if key == "five_hour" || key == "seven_day" {
+			continue
 		}
-		info.TertiaryWindow = &UsageWindow{
-			Utilization: util,
-			UsedPercent: int(util * 100),
-			ResetsAt:    parseISO8601(usage.Opus.ResetsAt),
-			// Opus limits are typically daily/weekly but window duration is variable
+
+		window, ok := claudeUsageWindow(value, claudeModelWindowDuration(key))
+		if !ok {
+			continue
+		}
+		if info.ModelWindows == nil {
+			info.ModelWindows = make(map[string]*UsageWindow)
+		}
+		info.ModelWindows[key] = window
+		if key == "seven_day_opus" {
+			info.TertiaryWindow = window
 		}
 	}
 
 	return info, nil
+}
+
+func claudeUsageWindow(raw json.RawMessage, duration time.Duration) (*UsageWindow, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+
+	var parsed struct {
+		Utilization *float64 `json:"utilization"`
+		ResetsAt    string   `json:"resets_at"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil || parsed.Utilization == nil {
+		return nil, false
+	}
+
+	util := *parsed.Utilization
+	if util > 1 {
+		util = util / 100.0
+	}
+
+	return &UsageWindow{
+		Utilization:    util,
+		UsedPercent:    int(util * 100),
+		ResetsAt:       parseISO8601(parsed.ResetsAt),
+		WindowDuration: duration,
+	}, true
+}
+
+func claudeModelWindowDuration(key string) time.Duration {
+	key = strings.ToLower(key)
+	switch {
+	case strings.HasPrefix(key, "seven_day_"):
+		return 7 * 24 * time.Hour
+	case strings.HasPrefix(key, "five_hour_"):
+		return 5 * time.Hour
+	default:
+		return 0
+	}
 }
 
 // parseISO8601 parses an ISO8601 timestamp string.

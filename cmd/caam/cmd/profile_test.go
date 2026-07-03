@@ -2,12 +2,16 @@
 package cmd
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/provider/codex"
+	"github.com/spf13/cobra"
 )
 
 // TestProfileCommandStructure tests the profile parent command.
@@ -35,6 +39,7 @@ func TestProfileSubcommands(t *testing.T) {
 		"delete": false,
 		"status": false,
 		"unlock": false,
+		"shell":  false,
 	}
 
 	for _, cmd := range subcommands {
@@ -559,6 +564,144 @@ func TestProfileEnvironmentSetup(t *testing.T) {
 			store.Delete(prov, "envtest")
 		})
 	}
+}
+
+func TestEnvCommandJSONForProfileDoesNotMutateActiveAuth(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := setupProfileEnvCommandTest(t, tmpDir)
+	defer restore()
+
+	activeCodexHome := filepath.Join(tmpDir, "active-codex")
+	if err := os.MkdirAll(activeCodexHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+	activeAuthPath := filepath.Join(activeCodexHome, "auth.json")
+	activeAuth := []byte(`{"active":"unchanged"}`)
+	if err := os.WriteFile(activeAuthPath, activeAuth, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", activeCodexHome)
+
+	prof, err := profileStore.Create("codex", "work", "oauth")
+	if err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+
+	cmd := &cobra.Command{}
+	addEnvFlags(cmd)
+	if err := cmd.Flags().Set("json", "true"); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := captureOutput(t, commandForRunE(cmd, runEnv), []string{"codex", "work"})
+	if err != nil {
+		t.Fatalf("run env --json: %v stderr=%q", err, stderr)
+	}
+
+	var got struct {
+		Provider string            `json:"provider"`
+		Profile  string            `json:"profile"`
+		Env      map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("env --json output is not JSON: %v; output=%q", err, stdout)
+	}
+	if got.Provider != "codex" || got.Profile != "work" {
+		t.Fatalf("unexpected identity in JSON: %+v", got)
+	}
+	if got.Env["CODEX_HOME"] != prof.CodexHomePath() {
+		t.Fatalf("CODEX_HOME = %q, want %q", got.Env["CODEX_HOME"], prof.CodexHomePath())
+	}
+	if got.Env["HOME"] != prof.HomePath() {
+		t.Fatalf("HOME = %q, want %q", got.Env["HOME"], prof.HomePath())
+	}
+
+	after, err := os.ReadFile(activeAuthPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(activeAuth) {
+		t.Fatalf("active auth mutated: got %q want %q", after, activeAuth)
+	}
+}
+
+func TestProfileShellPrintNoRC(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := setupProfileEnvCommandTest(t, tmpDir)
+	defer restore()
+
+	prof, err := profileStore.Create("codex", "work", "oauth")
+	if err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+
+	cmd := &cobra.Command{}
+	addProfileShellFlags(cmd)
+	if err := cmd.Flags().Set("print", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("no-rc", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("shell", "bash"); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := captureOutput(t, commandForRunE(cmd, runProfileShell), []string{"codex", "work"})
+	if err != nil {
+		t.Fatalf("profile shell --print --no-rc: %v stderr=%q", err, stderr)
+	}
+	if !strings.Contains(stdout, "export CODEX_HOME="+shellQuote(prof.CodexHomePath())) {
+		t.Fatalf("missing CODEX_HOME export in:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "export HOME="+shellQuote(prof.HomePath())) {
+		t.Fatalf("missing HOME export in:\n%s", stdout)
+	}
+	if !strings.Contains(stdout, "exec bash --noprofile --norc") {
+		t.Fatalf("missing no-rc bash exec in:\n%s", stdout)
+	}
+}
+
+func TestProfileShellNonInteractiveRequiresPrintOrJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	restore := setupProfileEnvCommandTest(t, tmpDir)
+	defer restore()
+
+	if _, err := profileStore.Create("codex", "work", "oauth"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+
+	cmd := &cobra.Command{}
+	addProfileShellFlags(cmd)
+	err := runProfileShell(cmd, []string{"codex", "work"})
+	if err == nil {
+		t.Fatal("expected profile shell without --print/--json to fail in noninteractive test")
+	}
+	if !strings.Contains(err.Error(), "non-interactive") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func setupProfileEnvCommandTest(t *testing.T, tmpDir string) func() {
+	t.Helper()
+
+	oldStore := profileStore
+	oldRegistry := registry
+	profileStore = profile.NewStore(filepath.Join(tmpDir, "profiles"))
+	registry = provider.NewRegistry()
+	registry.Register(codex.New())
+
+	return func() {
+		profileStore = oldStore
+		registry = oldRegistry
+	}
+}
+
+func commandForRunE(cmd *cobra.Command, runE func(*cobra.Command, []string) error) *cobra.Command {
+	cmd.Use = "test"
+	cmd.Args = cobra.ArbitraryArgs
+	cmd.RunE = runE
+	return cmd
 }
 
 // TestProfileStoreNonExistent tests loading non-existent profile.

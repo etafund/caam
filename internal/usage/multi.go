@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/logs"
@@ -26,6 +26,9 @@ type MultiProfileFetcher struct {
 	claudeFetcher *ClaudeFetcher
 	codexFetcher  *CodexFetcher
 	logScanner    logs.Scanner // Optional scanner for burn rate calculation
+
+	sameProviderSpacing time.Duration
+	sameProviderJitter  time.Duration
 }
 
 // FetcherOption configures the MultiProfileFetcher.
@@ -38,11 +41,22 @@ func WithLogScanner(scanner logs.Scanner) FetcherOption {
 	}
 }
 
+// WithSameProviderPacing configures the delay between same-provider requests.
+// Tests can set jitter to zero for deterministic timing.
+func WithSameProviderPacing(spacing, jitter time.Duration) FetcherOption {
+	return func(m *MultiProfileFetcher) {
+		m.sameProviderSpacing = spacing
+		m.sameProviderJitter = jitter
+	}
+}
+
 // NewMultiProfileFetcher creates a new multi-profile fetcher.
 func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 	m := &MultiProfileFetcher{
-		claudeFetcher: NewClaudeFetcher(),
-		codexFetcher:  NewCodexFetcher(),
+		claudeFetcher:       NewClaudeFetcher(),
+		codexFetcher:        NewCodexFetcher(),
+		sameProviderSpacing: 750 * time.Millisecond,
+		sameProviderJitter:  250 * time.Millisecond,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -54,132 +68,32 @@ func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 // profiles is a map of profile name to access token.
 func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider string, profiles map[string]string) []ProfileUsage {
 	if m == nil {
-		m = &MultiProfileFetcher{}
+		m = NewMultiProfileFetcher()
 	}
 
-	var wg sync.WaitGroup
 	results := make([]ProfileUsage, 0, len(profiles))
-	var mu sync.Mutex
 
-	for name, token := range profiles {
-		wg.Add(1)
-		go func(name, token string) {
-			defer wg.Done()
-
-			var info *UsageInfo
-			var err error
-
-			switch provider {
-			case "claude":
-				if m.claudeFetcher == nil {
-					info = &UsageInfo{
-						Provider:  provider,
-						FetchedAt: time.Now(),
-						Error:     "claude fetcher unavailable",
-					}
-				} else {
-					info, err = m.claudeFetcher.Fetch(ctx, token)
-				}
-			case "codex":
-				if m.codexFetcher == nil {
-					info = &UsageInfo{
-						Provider:  provider,
-						FetchedAt: time.Now(),
-						Error:     "codex fetcher unavailable",
-					}
-				} else {
-					info, err = m.codexFetcher.Fetch(ctx, token)
-				}
-			default:
-				info = &UsageInfo{
-					Provider:  provider,
-					FetchedAt: time.Now(),
-					Error:     fmt.Sprintf("unsupported provider: %s", provider),
-				}
-			}
-
-			if info == nil {
-				errMsg := "usage fetcher returned no data"
-				if err != nil {
-					errMsg = err.Error()
-				}
-				info = &UsageInfo{
-					Provider:  provider,
-					FetchedAt: time.Now(),
-					Error:     errMsg,
-				}
-			} else if err != nil && info.Error == "" {
-				info.Error = err.Error()
-			}
-
-			if info != nil {
-				info.ProfileName = name
-
-				// Calculate burn rate if scanner is available
-				if m.logScanner != nil {
-					// Scan logs for this provider.
-					// Note: Currently logs.Scanner interface takes logDir.
-					// We might need to know the specific log directory for the profile if isolated,
-					// or use the provider's default log dir and filter by user?
-					// For now, we'll scan the provider's default logs and we might need to filter by profile?
-					//
-					// CAAM usually runs one profile at a time in Vault mode, so the logs in ~/.local/share/claude/logs
-					// belong to the *active* profile at that time. But historical logs might be mixed.
-					//
-					// However, typical CLI usage is sequential.
-					// We'll scan the last 24 hours of logs.
-
-					// Use a 24-hour window for burn rate calculation
-					window := 24 * time.Hour
-					since := time.Now().Add(-window)
-
-					// We need to find the correct log directory.
-					// For Vault mode, it's the standard provider log dir.
-					// But MultiProfileFetcher doesn't know about file system paths easily.
-					// We'll rely on the scanner's default behavior if logDir is empty.
-					//
-					// If using MultiScanner, we need to cast or select the right scanner.
-					var scanner logs.Scanner
-					if ms, ok := m.logScanner.(*logs.MultiScanner); ok {
-						scanner = ms.Scanner(provider)
-					} else {
-						scanner = m.logScanner
-					}
-
-					if scanner != nil {
-						scanRes, err := scanner.Scan(ctx, "", since)
-						if err == nil && scanRes != nil {
-							// Filter logs?
-							// If we have profile-specific logs, great.
-							// For now, assume all logs for the provider are relevant usage
-							// (as we are usually checking *our* usage).
-							//
-							// TODO: If we want to be precise per-profile, we'd need logs to contain
-							// some identity info, which they often don't.
-							// But for "burn rate", recent usage is what matters.
-
-							burnRate := CalculateBurnRate(scanRes.Entries, window, DefaultBurnRateOptions())
-							if burnRate != nil {
-								info.BurnRate = burnRate
-								info.UpdateDepletion()
-							}
-						}
-					}
-				}
-			}
-
-			mu.Lock()
-			results = append(results, ProfileUsage{
-				Provider:    provider,
-				ProfileName: name,
-				Usage:       info,
-				AccessToken: token,
-			})
-			mu.Unlock()
-		}(name, token)
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
 	}
+	sort.Strings(names)
 
-	wg.Wait()
+	for i, name := range names {
+		if i > 0 {
+			if err := m.waitForSameProviderSpacing(ctx); err != nil {
+				break
+			}
+		}
+		token := profiles[name]
+		info := m.fetchProfile(ctx, provider, name, token)
+		results = append(results, ProfileUsage{
+			Provider:    provider,
+			ProfileName: name,
+			Usage:       info,
+			AccessToken: token,
+		})
+	}
 
 	// Sort by availability score (highest first)
 	sort.Slice(results, func(i, j int) bool {
@@ -198,6 +112,122 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 	})
 
 	return results
+}
+
+func (m *MultiProfileFetcher) waitForSameProviderSpacing(ctx context.Context) error {
+	delay := m.sameProviderDelay()
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *MultiProfileFetcher) sameProviderDelay() time.Duration {
+	spacing := m.sameProviderSpacing
+	if spacing <= 0 {
+		return 0
+	}
+	jitter := m.sameProviderJitter
+	if jitter <= 0 {
+		return spacing
+	}
+	maxOffset := int64(jitter)*2 + 1
+	offset := time.Duration(rand.Int63n(maxOffset) - int64(jitter))
+	delay := spacing + offset
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func (m *MultiProfileFetcher) fetchProfile(ctx context.Context, provider, name, token string) *UsageInfo {
+	var info *UsageInfo
+	var err error
+
+	switch provider {
+	case "claude":
+		if m.claudeFetcher == nil {
+			info = &UsageInfo{
+				Provider:  provider,
+				FetchedAt: time.Now(),
+				Error:     "claude fetcher unavailable",
+			}
+		} else {
+			info, err = m.claudeFetcher.Fetch(ctx, token)
+		}
+	case "codex":
+		if m.codexFetcher == nil {
+			info = &UsageInfo{
+				Provider:  provider,
+				FetchedAt: time.Now(),
+				Error:     "codex fetcher unavailable",
+			}
+		} else {
+			info, err = m.codexFetcher.Fetch(ctx, token)
+		}
+	default:
+		info = &UsageInfo{
+			Provider:  provider,
+			FetchedAt: time.Now(),
+			Error:     fmt.Sprintf("unsupported provider: %s", provider),
+		}
+	}
+
+	if info == nil {
+		errMsg := "usage fetcher returned no data"
+		if err != nil {
+			errMsg = err.Error()
+		}
+		info = &UsageInfo{
+			Provider:  provider,
+			FetchedAt: time.Now(),
+			Error:     errMsg,
+		}
+	} else if err != nil && info.Error == "" {
+		info.Error = err.Error()
+	}
+
+	info.ProfileName = name
+	m.attachBurnRate(ctx, provider, info)
+	return info
+}
+
+func (m *MultiProfileFetcher) attachBurnRate(ctx context.Context, provider string, info *UsageInfo) {
+	if info == nil || m.logScanner == nil {
+		return
+	}
+
+	window := 24 * time.Hour
+	since := time.Now().Add(-window)
+
+	var scanner logs.Scanner
+	if ms, ok := m.logScanner.(*logs.MultiScanner); ok {
+		scanner = ms.Scanner(provider)
+	} else {
+		scanner = m.logScanner
+	}
+
+	if scanner == nil {
+		return
+	}
+	scanRes, err := scanner.Scan(ctx, "", since)
+	if err != nil || scanRes == nil {
+		return
+	}
+
+	burnRate := CalculateBurnRate(scanRes.Entries, window, DefaultBurnRateOptions())
+	if burnRate == nil {
+		return
+	}
+	info.BurnRate = burnRate
+	info.UpdateDepletion()
 }
 
 // GetBestProfile returns the profile with the highest availability score.

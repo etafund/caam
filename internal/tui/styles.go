@@ -441,7 +441,11 @@ func spinnerMessageStyle(theme Theme) lipgloss.Style {
 // Styles holds all the lipgloss styles for the TUI.
 type Styles struct {
 	// Header styles
-	Header lipgloss.Style
+	Header        lipgloss.Style
+	HeaderBrand   lipgloss.Style
+	HeaderCrumb   lipgloss.Style
+	HeaderContext lipgloss.Style
+	HeaderSubtle  lipgloss.Style
 
 	// Tab styles
 	Tab       lipgloss.Style
@@ -522,11 +526,23 @@ func NewStyles(theme Theme) Styles {
 
 	return Styles{
 		Header: lipgloss.NewStyle().
-			Bold(true).
-			Foreground(p.Accent).
 			Background(p.Surface).
 			Padding(0, 1).
 			MarginBottom(1),
+
+		HeaderBrand: lipgloss.NewStyle().
+			Bold(true).
+			Foreground(p.Accent),
+
+		HeaderCrumb: lipgloss.NewStyle().
+			Foreground(p.Text).
+			Bold(true),
+
+		HeaderContext: lipgloss.NewStyle().
+			Foreground(p.Text),
+
+		HeaderSubtle: lipgloss.NewStyle().
+			Foreground(p.Muted),
 
 		Tab: lipgloss.NewStyle().
 			Padding(0, 1).

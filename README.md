@@ -44,6 +44,19 @@ caam robot docs
 caam schema
 ```
 
+`status --json` and `list --json` use a stable envelope:
+
+```json
+{
+  "generated_at": "2026-07-03T20:00:00Z",
+  "version": "caam dev (unknown) built on unknown with go1.24.4",
+  "output_format": "caam.status.v1",
+  "data": {
+    "tools": []
+  }
+}
+```
+
 ---
 
 ## The Problem
@@ -841,7 +854,7 @@ Switching profiles while a CLI is running may cause auth errors in the running s
 
 **Q: How do I know which account I'm currently using?**
 
-Run `caam status`. It shows the active profile (email) for each tool based on content hash matching.
+Run `caam status`. It shows the active profile name for each tool based on content hash matching; for Claude this may be an auto-generated name unless you named the profile yourself.
 
 ---
 
@@ -932,7 +945,7 @@ go install github.com/Dicklesworthstone/coding_agent_account_manager/cmd/caam@la
 
 ## Tips
 
-1. **Use the actual email address as the profile name** — it's self-documenting and you'll never forget which account is which
+1. **Use the actual email address as the profile name when the provider exposes it or you know it** — Claude Code may require explicit names or auto-generated names because current Claude auth files do not expose email/account ID
 2. **Backup before clearing:** `caam backup claude current@email.com && caam clear claude`
 3. **Check status often:** `caam status` shows what's active across all tools
 4. **Use --backup-current flag:** `caam activate claude new@email.com --backup-current` auto-saves current state before switching
@@ -955,6 +968,14 @@ While codex-pool answers "which account should handle THIS request?" (real-time 
 - **Project-Profile Associations** — Remember which profile to use for each project directory
 
 See [`docs/SMART_PROFILE_MANAGEMENT.md`](docs/SMART_PROFILE_MANAGEMENT.md) for the full design document.
+
+---
+
+## Developer Docs
+
+- [`docs/UI_TOOLKIT_GUIDANCE.md`](docs/UI_TOOLKIT_GUIDANCE.md) - UI toolkit baselines and migration policy for shell prompts, Go TUI, future Rust TUI helpers, and the web dashboard.
+- [`docs/DISTRIBUTED_AUTH_RECOVERY.md`](docs/DISTRIBUTED_AUTH_RECOVERY.md) - WezTerm and distributed auth recovery design.
+- [`docs/OPENCODE_AUTH_RESEARCH.md`](docs/OPENCODE_AUTH_RESEARCH.md) - OpenCode auth research and Claude Code recovery implications.
 
 ---
 

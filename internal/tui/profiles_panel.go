@@ -32,12 +32,14 @@ type ProfileInfo struct {
 
 // ProfilesPanel renders the center panel showing profiles for the selected provider.
 type ProfilesPanel struct {
-	provider string
-	profiles []ProfileInfo
-	selected int
-	width    int
-	height   int
-	styles   ProfilesPanelStyles
+	provider     string
+	profiles     []ProfileInfo
+	selected     int
+	scrollOffset int
+	hoverIndex   int
+	width        int
+	height       int
+	styles       ProfilesPanelStyles
 }
 
 // ProfilesPanelStyles holds the styles for the profiles panel.
@@ -48,6 +50,7 @@ type ProfilesPanelStyles struct {
 	Row             lipgloss.Style
 	RowAlt          lipgloss.Style // Zebra stripe - alternate row background
 	SelectedRow     lipgloss.Style
+	HoveredRow      lipgloss.Style
 	ActiveIndicator lipgloss.Style
 	StatusOK        lipgloss.Style
 	StatusWarn      lipgloss.Style
@@ -106,6 +109,11 @@ func NewProfilesPanelStyles(theme Theme) ProfilesPanelStyles {
 			Foreground(p.Text).
 			Bold(true).
 			Background(p.Selection),
+
+		HoveredRow: lipgloss.NewStyle().
+			Foreground(p.Text).
+			Bold(true).
+			Background(p.SurfaceMuted),
 
 		ActiveIndicator: lipgloss.NewStyle().
 			Foreground(p.Success).
@@ -266,8 +274,9 @@ func NewProfilesPanel() *ProfilesPanel {
 // NewProfilesPanelWithTheme creates a new profiles panel using a theme.
 func NewProfilesPanelWithTheme(theme Theme) *ProfilesPanel {
 	return &ProfilesPanel{
-		profiles: []ProfileInfo{},
-		styles:   NewProfilesPanelStyles(theme),
+		profiles:   []ProfileInfo{},
+		hoverIndex: -1,
+		styles:     NewProfilesPanelStyles(theme),
 	}
 }
 
@@ -293,12 +302,17 @@ func (p *ProfilesPanel) SetProfiles(profiles []ProfileInfo) {
 	if p.selected >= len(p.profiles) {
 		p.selected = max(0, len(p.profiles)-1)
 	}
+	if p.hoverIndex >= len(p.profiles) {
+		p.hoverIndex = -1
+	}
+	p.ensureSelectedVisible()
 }
 
 // SetSelected sets the currently selected profile index.
 func (p *ProfilesPanel) SetSelected(index int) {
 	if index >= 0 && index < len(p.profiles) {
 		p.selected = index
+		p.ensureSelectedVisible()
 	}
 }
 
@@ -308,6 +322,7 @@ func (p *ProfilesPanel) SetSelectedByName(name string) bool {
 	for i := range p.profiles {
 		if p.profiles[i].Name == name {
 			p.selected = i
+			p.ensureSelectedVisible()
 			return true
 		}
 	}
@@ -332,11 +347,33 @@ func (p *ProfilesPanel) GetSelectedProfile() *ProfileInfo {
 	return nil
 }
 
+// SetHoveredIndex sets the row currently under the mouse without changing selection.
+func (p *ProfilesPanel) SetHoveredIndex(index int) {
+	if p == nil {
+		return
+	}
+	if index < 0 || index >= len(p.profiles) {
+		p.hoverIndex = -1
+		return
+	}
+	p.hoverIndex = index
+}
+
+// SetHoveredVisibleRow sets the hovered row from a visible row offset.
+func (p *ProfilesPanel) SetHoveredVisibleRow(row int) {
+	if p == nil || row < 0 || row >= p.visibleRowCapacity() {
+		p.SetHoveredIndex(-1)
+		return
+	}
+	p.SetHoveredIndex(p.scrollOffset + row)
+}
+
 // MoveUp moves selection up.
 func (p *ProfilesPanel) MoveUp() {
 	if p.selected > 0 {
 		p.selected--
 	}
+	p.ensureSelectedVisible()
 }
 
 // MoveDown moves selection down.
@@ -344,12 +381,69 @@ func (p *ProfilesPanel) MoveDown() {
 	if p.selected < len(p.profiles)-1 {
 		p.selected++
 	}
+	p.ensureSelectedVisible()
+}
+
+// ScrollUp moves selection upward by the requested number of rows.
+func (p *ProfilesPanel) ScrollUp(rows int) {
+	if p == nil || rows <= 0 {
+		return
+	}
+	p.selected = max(0, p.selected-rows)
+	p.ensureSelectedVisible()
+}
+
+// ScrollDown moves selection downward by the requested number of rows.
+func (p *ProfilesPanel) ScrollDown(rows int) {
+	if p == nil || rows <= 0 {
+		return
+	}
+	p.selected = min(len(p.profiles)-1, p.selected+rows)
+	p.ensureSelectedVisible()
 }
 
 // SetSize sets the panel dimensions.
 func (p *ProfilesPanel) SetSize(width, height int) {
 	p.width = width
 	p.height = height
+	p.ensureSelectedVisible()
+}
+
+func (p *ProfilesPanel) visibleRowCapacity() int {
+	if p == nil {
+		return 0
+	}
+	if p.height <= 0 {
+		return len(p.profiles)
+	}
+
+	// Border top/bottom, title margin, and header border consume fixed space.
+	return max(1, p.height-6)
+}
+
+func (p *ProfilesPanel) maxScrollOffset() int {
+	return max(0, len(p.profiles)-p.visibleRowCapacity())
+}
+
+func (p *ProfilesPanel) ensureSelectedVisible() {
+	if p == nil {
+		return
+	}
+	if len(p.profiles) == 0 {
+		p.selected = 0
+		p.scrollOffset = 0
+		return
+	}
+
+	p.selected = max(0, min(p.selected, len(p.profiles)-1))
+	capacity := p.visibleRowCapacity()
+	if p.selected < p.scrollOffset {
+		p.scrollOffset = p.selected
+	}
+	if p.selected >= p.scrollOffset+capacity {
+		p.scrollOffset = p.selected - capacity + 1
+	}
+	p.scrollOffset = max(0, min(p.scrollOffset, p.maxScrollOffset()))
 }
 
 // View renders the profiles panel.
@@ -453,7 +547,11 @@ func (p *ProfilesPanel) View() string {
 
 	// Profile rows with zebra striping
 	var rows []string
-	for i, prof := range p.profiles {
+	p.ensureSelectedVisible()
+	start := p.scrollOffset
+	end := min(len(p.profiles), start+p.visibleRowCapacity())
+	for i := start; i < end; i++ {
+		prof := p.profiles[i]
 		// Left icon indicator for active profile
 		indicator := "  "
 		if prof.IsActive {
@@ -506,6 +604,8 @@ func (p *ProfilesPanel) View() string {
 		var style lipgloss.Style
 		if i == p.selected {
 			style = p.styles.SelectedRow
+		} else if i == p.hoverIndex {
+			style = p.styles.HoveredRow
 		} else if i%2 == 1 {
 			// Alternate rows get subtle background
 			style = p.styles.RowAlt

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/term"
 )
 
 // providerAccountURLs maps provider names to their account management URLs.
@@ -36,6 +38,75 @@ var providerAccountURLs = map[string]string{
 	"claude": "https://console.anthropic.com/",
 	"codex":  "https://platform.openai.com/",
 	"gemini": "https://aistudio.google.com/",
+}
+
+type teaProgramRunner interface {
+	Run() (tea.Model, error)
+}
+
+type tuiRunDeps struct {
+	inputFile      *os.File
+	outputFile     *os.File
+	outputWriter   io.Writer
+	errorWriter    io.Writer
+	fileIsTerminal func(*os.File) bool
+	newProgram     func(Model) teaProgramRunner
+	logger         *slog.Logger
+}
+
+func defaultTUIRunDeps() tuiRunDeps {
+	return tuiRunDeps{
+		inputFile:    os.Stdin,
+		outputFile:   os.Stdout,
+		outputWriter: os.Stdout,
+		errorWriter:  os.Stderr,
+		fileIsTerminal: func(file *os.File) bool {
+			if file == nil {
+				return false
+			}
+			return term.IsTerminal(int(file.Fd()))
+		},
+		newProgram: newTeaProgram,
+		logger:     slog.Default(),
+	}
+}
+
+func newTeaProgram(m Model) teaProgramRunner {
+	return tea.NewProgram(m, tuiProgramOptions(m)...)
+}
+
+func tuiProgramOptions(m Model) []tea.ProgramOption {
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if m.mouseEnabled {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
+	return opts
+}
+
+func (d tuiRunDeps) withDefaults() tuiRunDeps {
+	defaults := defaultTUIRunDeps()
+	if d.inputFile == nil {
+		d.inputFile = defaults.inputFile
+	}
+	if d.outputFile == nil {
+		d.outputFile = defaults.outputFile
+	}
+	if d.outputWriter == nil {
+		d.outputWriter = defaults.outputWriter
+	}
+	if d.errorWriter == nil {
+		d.errorWriter = defaults.errorWriter
+	}
+	if d.fileIsTerminal == nil {
+		d.fileIsTerminal = defaults.fileIsTerminal
+	}
+	if d.newProgram == nil {
+		d.newProgram = defaults.newProgram
+	}
+	if d.logger == nil {
+		d.logger = defaults.logger
+	}
+	return d
 }
 
 // viewState represents the current view/mode of the TUI.
@@ -132,10 +203,11 @@ type Model struct {
 	vaultMeta           map[string]map[string]vaultProfileMeta
 
 	// View state
-	width  int
-	height int
-	state  viewState
-	err    error
+	width        int
+	height       int
+	state        viewState
+	mouseEnabled bool
+	err          error
 
 	// UI components
 	keys          keyMap
@@ -189,8 +261,9 @@ type Model struct {
 	commandPalette *CommandPaletteDialog
 
 	// Help renderer with Glamour markdown support and caching
-	helpRenderer *HelpRenderer
-	theme        Theme
+	helpRenderer     *HelpRenderer
+	helpScrollOffset int
+	theme            Theme
 
 	// Toast notifications
 	toasts []Toast
@@ -257,6 +330,7 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 		profiles:        make(map[string][]Profile),
 		selected:        0,
 		state:           stateList,
+		mouseEnabled:    prefs.Mouse,
 		keys:            defaultKeyMap(),
 		styles:          NewStyles(theme),
 		providerPanel:   NewProviderPanelWithTheme(providers, theme),
@@ -554,6 +628,8 @@ func (m *Model) expireToasts() bool {
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	m.logDebugDiagnostics("update", msg)
+
 	switch msg := msg.(type) {
 	case signalsReadyMsg:
 		if msg.err != nil {
@@ -789,9 +865,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKeyPress(msg)
 
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampHelpScrollOffset()
 		m.clampDialogWidths()
 		return m, nil
 
@@ -898,6 +978,161 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+const mouseWheelRows = 3
+
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.mouseEnabled {
+		return m, nil
+	}
+	if m.usagePanel != nil && m.usagePanel.Visible() {
+		return m, nil
+	}
+	if m.syncPanel != nil && m.syncPanel.Visible() {
+		return m, nil
+	}
+	if m.state == stateHelp {
+		return m.handleHelpMouse(msg)
+	}
+	if msg.Action == tea.MouseActionMotion {
+		return m.handleMouseMotion(msg), nil
+	}
+
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		return m.scrollMouseTarget(msg, -mouseWheelRows), nil
+	case tea.MouseButtonWheelDown:
+		return m.scrollMouseTarget(msg, mouseWheelRows), nil
+	default:
+		return m, nil
+	}
+}
+
+func (m Model) handleHelpMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		return m.scrollHelp(-mouseWheelRows), nil
+	case tea.MouseButtonWheelDown:
+		return m.scrollHelp(mouseWheelRows), nil
+	default:
+		return m, nil
+	}
+}
+
+func (m Model) handleMouseMotion(msg tea.MouseMsg) Model {
+	if m.profilesPanel == nil {
+		return m
+	}
+	if row, ok := m.profileVisibleRowForMouse(msg); ok {
+		m.profilesPanel.SetHoveredVisibleRow(row)
+	} else {
+		m.profilesPanel.SetHoveredIndex(-1)
+	}
+	return m
+}
+
+func (m Model) scrollMouseTarget(msg tea.MouseMsg, rows int) Model {
+	if rows == 0 {
+		return m
+	}
+	if m.mouseOverDetail(msg) {
+		m.syncDetailPanel()
+		if rows < 0 {
+			m.detailPanel.ScrollUp(-rows)
+		} else {
+			m.detailPanel.ScrollDown(rows)
+		}
+		return m
+	}
+
+	if m.profilesPanel != nil {
+		if rows < 0 {
+			m.profilesPanel.ScrollUp(-rows)
+		} else {
+			m.profilesPanel.ScrollDown(rows)
+		}
+		m.selected = m.profilesPanel.GetSelected()
+		if info := m.profilesPanel.GetSelectedProfile(); info != nil {
+			m.selectedProfileName = info.Name
+		}
+		m.syncDetailPanel()
+		return m
+	}
+
+	profiles := m.currentProfiles()
+	if len(profiles) == 0 {
+		m.selected = 0
+		m.selectedProfileName = ""
+		return m
+	}
+	m.selected = max(0, min(m.selected+rows, len(profiles)-1))
+	if name := m.selectedProfileNameValue(); name != "" {
+		m.selectedProfileName = name
+	}
+	return m
+}
+
+func (m Model) profileVisibleRowForMouse(msg tea.MouseMsg) (int, bool) {
+	if m.profilesPanel == nil {
+		return 0, false
+	}
+	mode := m.layoutMode()
+	panelsTop := m.panelsTopY()
+	if mode == layoutFull {
+		layout := m.fullLayoutSpec(max(0, m.height-panelsTop-1))
+		profilesStart := layout.ProviderWidth + layout.Gap
+		profilesEnd := profilesStart + layout.ProfilesWidth
+		if msg.X < profilesStart || msg.X >= profilesEnd {
+			return 0, false
+		}
+		row := msg.Y - panelsTop - profilesPanelRowsStartY
+		if row < 0 || row >= m.profilesPanel.visibleRowCapacity() {
+			return 0, false
+		}
+		return row, true
+	}
+
+	const compactTabsHeight = 1
+	layout := m.compactLayoutSpec(mode, max(0, m.height-panelsTop-1), compactTabsHeight)
+	row := msg.Y - panelsTop - compactTabsHeight - profilesPanelRowsStartY
+	if row < 0 || row >= layout.ProfilesHeight || row >= m.profilesPanel.visibleRowCapacity() {
+		return 0, false
+	}
+	return row, true
+}
+
+const profilesPanelRowsStartY = 4
+
+func (m Model) panelsTopY() int {
+	headerHeight := 1
+	if m.projectContextLine() != "" {
+		headerHeight++
+	}
+	if m.renderSearchBar() != "" {
+		headerHeight++
+	}
+	return headerHeight + 1
+}
+
+func (m Model) mouseOverDetail(msg tea.MouseMsg) bool {
+	if m.detailPanel == nil {
+		return false
+	}
+	mode := m.layoutMode()
+	if mode == layoutFull {
+		layout := m.fullLayoutSpec(max(0, m.height-4))
+		detailStart := layout.ProviderWidth + layout.Gap + layout.ProfilesWidth + layout.Gap
+		return msg.X >= detailStart
+	}
+
+	const compactTabsHeight = 1
+	layout := m.compactLayoutSpec(mode, max(0, m.height-4), compactTabsHeight)
+	if !layout.ShowDetail {
+		return false
+	}
+	detailStartY := 2 + compactTabsHeight + layout.ProfilesHeight + 1
+	return msg.Y >= detailStartY
+}
+
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Usage panel overlay gets first crack at keys.
@@ -941,9 +1176,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case stateSearch:
 		return m.handleSearchKeys(msg)
 	case stateHelp:
-		// Any key returns to list
-		m.state = stateList
-		return m, nil
+		return m.handleHelpKeys(msg)
 	case stateBackupDialog:
 		return m.handleBackupDialogKeys(msg)
 	case stateConfirmOverwrite:
@@ -975,6 +1208,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Help):
 		m.state = stateHelp
+		m.helpScrollOffset = 0
 		return m, nil
 
 	case key.Matches(msg, m.keys.Up):
@@ -1831,6 +2065,7 @@ func (m Model) handleCommandPaletteAction(action string) (tea.Model, tea.Cmd) {
 		return m.handleImportBundle()
 	case "help":
 		m.state = stateHelp
+		m.helpScrollOffset = 0
 	}
 
 	return m, nil
@@ -2490,11 +2725,7 @@ func trimLeftANSI(s string, left int) string {
 // mainView renders the main list view.
 func (m Model) mainView() string {
 	// Header
-	headerLines := []string{m.styles.Header.Render("caam - Coding Agent Account Manager")}
-	if projectLine := m.projectContextLine(); projectLine != "" {
-		headerLines = append(headerLines, m.styles.StatusText.Render(projectLine))
-	}
-	header := lipgloss.JoinVertical(lipgloss.Left, headerLines...)
+	header := m.renderHeader()
 
 	// Search bar (rendered when in search mode)
 	searchBar := m.renderSearchBar()
@@ -2750,7 +2981,7 @@ func (m Model) layoutDebugString(spec layoutSpec) string {
 }
 
 func (m Model) debugEnabled() bool {
-	return os.Getenv("CAAM_DEBUG") != ""
+	return tuiDebugEnabled()
 }
 
 func (m Model) dialogWidth(preferred int) int {
@@ -3154,9 +3385,15 @@ func statusSeverityFromMessage(msg string) StatusSeverity {
 
 // helpView renders the help screen with Glamour markdown rendering.
 func (m Model) helpView() string {
+	rendered := m.renderHelpContent()
+	rendered = m.helpViewportContent(rendered)
+	return m.styles.Help.Render(rendered)
+}
+
+func (m Model) renderHelpContent() string {
 	if m.helpRenderer == nil {
 		// Fallback to plain text if renderer not initialized
-		return m.styles.Help.Render(MainHelpMarkdown())
+		return MainHelpMarkdown()
 	}
 
 	// Update renderer width for proper word wrap
@@ -3166,8 +3403,83 @@ func (m Model) helpView() string {
 	}
 	m.helpRenderer.SetWidth(contentWidth)
 
-	rendered := m.helpRenderer.Render(MainHelpMarkdown())
-	return m.styles.Help.Render(rendered)
+	return m.helpRenderer.Render(MainHelpMarkdown())
+}
+
+func (m Model) helpViewportContent(content string) string {
+	height := m.helpViewportHeight()
+	if height <= 0 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	maxOffset := maxHelpScrollOffsetForLines(lines, height)
+	offset := max(0, min(m.helpScrollOffset, maxOffset))
+	end := min(len(lines), offset+height)
+	return strings.Join(lines[offset:end], "\n")
+}
+
+func (m Model) helpViewportHeight() int {
+	if m.height <= 0 {
+		return 0
+	}
+	return max(1, m.height-4)
+}
+
+func (m Model) maxHelpScrollOffset() int {
+	height := m.helpViewportHeight()
+	if height <= 0 {
+		return 0
+	}
+	return maxHelpScrollOffsetForLines(strings.Split(m.renderHelpContent(), "\n"), height)
+}
+
+func maxHelpScrollOffsetForLines(lines []string, height int) int {
+	if height <= 0 {
+		return 0
+	}
+	return max(0, len(lines)-height)
+}
+
+func (m *Model) clampHelpScrollOffset() {
+	if m == nil {
+		return
+	}
+	m.helpScrollOffset = max(0, min(m.helpScrollOffset, m.maxHelpScrollOffset()))
+}
+
+func (m Model) scrollHelp(lines int) Model {
+	m.helpScrollOffset = max(0, min(m.helpScrollOffset+lines, m.maxHelpScrollOffset()))
+	return m
+}
+
+func (m Model) handleHelpKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyUp:
+		return m.scrollHelp(-1), nil
+	case tea.KeyDown:
+		return m.scrollHelp(1), nil
+	case tea.KeyPgUp:
+		return m.scrollHelp(-m.helpViewportHeight()), nil
+	case tea.KeyPgDown:
+		return m.scrollHelp(m.helpViewportHeight()), nil
+	case tea.KeyHome:
+		m.helpScrollOffset = 0
+		return m, nil
+	case tea.KeyEnd:
+		m.helpScrollOffset = m.maxHelpScrollOffset()
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "k":
+		return m.scrollHelp(-1), nil
+	case "j":
+		return m.scrollHelp(1), nil
+	default:
+		m.state = stateList
+		return m, nil
+	}
 }
 
 func (m Model) dumpStatsLine() string {
@@ -3201,6 +3513,12 @@ func (m Model) dumpStatsLine() string {
 
 // Run starts the TUI application.
 func Run() error {
+	return runWithDeps(defaultTUIRunDeps())
+}
+
+func runWithDeps(deps tuiRunDeps) error {
+	deps = deps.withDefaults()
+
 	spmCfg, err := config.LoadSPMConfig()
 	if err != nil {
 		// Keep the TUI usable even with a broken config file.
@@ -3214,7 +3532,7 @@ func Run() error {
 
 	// Log resolved TUI config for debugging (no sensitive data to redact)
 	prefs := TUIPreferencesFromConfig(spmCfg)
-	slog.Debug("resolved TUI config",
+	deps.logger.Debug("resolved TUI config",
 		slog.String("theme", string(prefs.Mode)),
 		slog.String("contrast", string(prefs.Contrast)),
 		slog.Bool("no_color", prefs.NoColor),
@@ -3224,6 +3542,21 @@ func Run() error {
 		slog.Bool("show_key_hints", prefs.ShowKeyHints),
 		slog.String("density", prefs.Density),
 		slog.Bool("no_tui", prefs.NoTUI),
+	)
+
+	if plainMode, reason := shouldUsePlainMode(prefs, deps); plainMode {
+		deps.logger.Info("tui startup mode",
+			slog.String("mode", "plain"),
+			slog.String("reason", reason),
+			slog.Bool("no_color", prefs.NoColor),
+		)
+		return renderPlainMode(reason, plainModeWriter(reason, deps))
+	}
+
+	deps.logger.Info("tui startup mode",
+		slog.String("mode", "interactive"),
+		slog.String("reason", "terminal"),
+		slog.Bool("no_color", prefs.NoColor),
 	)
 
 	m := NewWithConfig(spmCfg)
@@ -3241,7 +3574,7 @@ func Run() error {
 		pidWritten = true
 	}
 
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := deps.newProgram(m)
 	finalModel, err := p.Run()
 
 	if fm, ok := finalModel.(Model); ok {
@@ -3255,6 +3588,50 @@ func Run() error {
 	if pidWritten {
 		_ = signals.RemovePIDFile(pidPath)
 	}
+	return err
+}
+
+func shouldUsePlainMode(prefs TUIPreferences, deps tuiRunDeps) (bool, string) {
+	deps = deps.withDefaults()
+	switch {
+	case prefs.NoTUI:
+		return true, "no_tui"
+	case !deps.fileIsTerminal(deps.inputFile):
+		return true, "stdin_not_terminal"
+	case !deps.fileIsTerminal(deps.outputFile):
+		return true, "stdout_not_terminal"
+	default:
+		return false, ""
+	}
+}
+
+func plainModeWriter(reason string, deps tuiRunDeps) io.Writer {
+	deps = deps.withDefaults()
+	if reason == "no_tui" {
+		return deps.outputWriter
+	}
+	return deps.errorWriter
+}
+
+func renderPlainMode(reason string, w io.Writer) error {
+	if w == nil {
+		w = io.Discard
+	}
+
+	switch reason {
+	case "no_tui":
+		_, err := fmt.Fprintln(w, "CAAM TUI disabled by NO_TUI/CAAM_NO_TUI.")
+		if err != nil {
+			return err
+		}
+	default:
+		_, err := fmt.Fprintln(w, "CAAM TUI unavailable because stdin/stdout is not an interactive terminal.")
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err := fmt.Fprintln(w, "Use `caam status`, `caam ls`, or JSON flags for scripts; run `caam` in an interactive terminal to open the TUI.")
 	return err
 }
 

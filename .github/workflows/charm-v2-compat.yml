@@ -1,0 +1,62 @@
+name: Charm v2 Compatibility
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "go.mod"
+      - "go.sum"
+      - "internal/tui/**"
+      - ".github/workflows/charm-v2-compat.yml"
+
+jobs:
+  tui-compile:
+    name: TUI compile spike
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      TUI_CHARM_V2: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.24.4"
+
+      - name: Compile TUI against Charm v2 in a temporary copy
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          spike_dir="${RUNNER_TEMP}/caam-charm-v2-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${spike_dir}"
+          tar --exclude=.git -cf - . | tar -xf - -C "${spike_dir}"
+          cd "${spike_dir}"
+
+          find internal/tui -name '*.go' -print0 | xargs -0 perl -0pi -e '
+            s#github\.com/charmbracelet/bubbletea#charm.land/bubbletea/v2#g;
+            s#github\.com/charmbracelet/bubbles#charm.land/bubbles/v2#g;
+            s#github\.com/charmbracelet/lipgloss#charm.land/lipgloss/v2#g;
+          '
+
+          go mod edit \
+            -droprequire=github.com/charmbracelet/bubbletea \
+            -droprequire=github.com/charmbracelet/bubbles \
+            -droprequire=github.com/charmbracelet/lipgloss
+          go get charm.land/bubbletea/v2@latest charm.land/bubbles/v2@latest charm.land/lipgloss/v2@latest
+          go mod tidy
+          go test ./internal/tui -run '^$' -count=1
+
+      - name: Report non-blocking result
+        if: always()
+        run: |
+          {
+            echo "## Charm v2 compatibility"
+            echo
+            echo "This workflow is intentionally non-blocking. Failures are expected until the v2 migration branch adapts TUI APIs."
+            echo
+            echo "- TUI_CHARM_V2=${TUI_CHARM_V2}"
+            echo "- Main branch remains pinned to the committed Charm v1 module paths."
+          } >> "${GITHUB_STEP_SUMMARY}"

@@ -13,7 +13,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	osexec "os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -906,9 +908,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	if jsonOutput {
 		output.Warnings = warnings
 		output.Recommendations = recommendations
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeJSONEnvelope(cmd.OutOrStdout(), jsonOutputFormatStatus, output)
 	}
 
 	// Show warnings
@@ -1184,9 +1184,7 @@ func runLs(cmd *cobra.Command, args []string) error {
 }
 
 func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
-	enc := json.NewEncoder(cmd.OutOrStdout())
-	enc.SetIndent("", "  ")
-	return enc.Encode(output)
+	return encodeJSONEnvelope(cmd.OutOrStdout(), jsonOutputFormatLS, output)
 }
 
 // deleteCmd removes a profile from the vault.
@@ -1212,11 +1210,12 @@ Examples:
 			return fmt.Errorf("refusing to delete system profile %s/%s without --force", tool, profileName)
 		}
 		if !force {
-			fmt.Printf("Delete profile %s/%s? [y/N]: ", tool, profileName)
-			var confirm string
-			fmt.Scanln(&confirm)
-			if strings.ToLower(confirm) != "y" {
-				fmt.Println("Cancelled")
+			confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Delete profile %s/%s?", tool, profileName), false)
+			if err != nil {
+				return fmt.Errorf("confirm delete profile: %w", err)
+			}
+			if !confirmed {
+				fmt.Fprintln(cmd.OutOrStdout(), "Cancelled")
 				return nil
 			}
 		}
@@ -1238,6 +1237,7 @@ Examples:
 
 func init() {
 	deleteCmd.Flags().Bool("force", false, "skip confirmation (required to delete system profiles starting with '_')")
+	addPromptModeFlags(deleteCmd)
 }
 
 // PathsFileRecord is a single auth-file path record for `paths --json`.
@@ -1351,11 +1351,12 @@ Examples:
 
 		force, _ := cmd.Flags().GetBool("force")
 		if !force {
-			fmt.Printf("Clear auth for %s? This will log you out. [y/N]: ", tool)
-			var confirm string
-			fmt.Scanln(&confirm)
-			if strings.ToLower(confirm) != "y" {
-				fmt.Println("Cancelled")
+			confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Clear auth for %s? This will log you out.", tool), false)
+			if err != nil {
+				return fmt.Errorf("confirm clear auth: %w", err)
+			}
+			if !confirmed {
+				fmt.Fprintln(cmd.OutOrStdout(), "Cancelled")
 				return nil
 			}
 		}
@@ -1371,6 +1372,7 @@ Examples:
 
 func init() {
 	clearCmd.Flags().Bool("force", false, "skip confirmation")
+	addPromptModeFlags(clearCmd)
 }
 
 // =============================================================================
@@ -1398,6 +1400,7 @@ func init() {
 	profileCmd.AddCommand(profileDeleteCmd)
 	profileCmd.AddCommand(profileStatusCmd)
 	profileCmd.AddCommand(profileUnlockCmd)
+	profileCmd.AddCommand(profileShellCmd)
 }
 
 var profileAddCmd = &cobra.Command{
@@ -1570,11 +1573,12 @@ var profileDeleteCmd = &cobra.Command{
 
 		force, _ := cmd.Flags().GetBool("force")
 		if !force {
-			fmt.Printf("Delete isolated profile %s/%s? [y/N]: ", tool, name)
-			var confirm string
-			fmt.Scanln(&confirm)
-			if strings.ToLower(confirm) != "y" {
-				fmt.Println("Cancelled")
+			confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Delete isolated profile %s/%s?", tool, name), false)
+			if err != nil {
+				return fmt.Errorf("confirm delete isolated profile: %w", err)
+			}
+			if !confirmed {
+				fmt.Fprintln(cmd.OutOrStdout(), "Cancelled")
 				return nil
 			}
 		}
@@ -1590,6 +1594,7 @@ var profileDeleteCmd = &cobra.Command{
 
 func init() {
 	profileDeleteCmd.Flags().Bool("force", false, "skip confirmation")
+	addPromptModeFlags(profileDeleteCmd)
 }
 
 var profileStatusCmd = &cobra.Command{
@@ -1703,11 +1708,12 @@ Examples:
 
 		// Force unlock - user accepted the risk
 		fmt.Printf("WARNING: Force-unlocking profile locked by running process (PID %d)\n", lockInfo.PID)
-		fmt.Printf("Force unlock %s/%s? This may cause data corruption! [y/N]: ", tool, name)
-		var confirm string
-		fmt.Scanln(&confirm)
-		if strings.ToLower(confirm) != "y" {
-			fmt.Println("Cancelled")
+		confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Force unlock %s/%s? This may cause data corruption!", tool, name), false)
+		if err != nil {
+			return fmt.Errorf("confirm force unlock: %w", err)
+		}
+		if !confirmed {
+			fmt.Fprintln(cmd.OutOrStdout(), "Cancelled")
 			return nil
 		}
 
@@ -1721,6 +1727,185 @@ Examples:
 
 func init() {
 	profileUnlockCmd.Flags().BoolP("force", "f", false, "force unlock even if process is running (dangerous)")
+	addPromptModeFlags(profileUnlockCmd)
+}
+
+var profileShellCmd = &cobra.Command{
+	Use:   "shell <tool> <profile> [-- shell-args...]",
+	Short: "Open a shell with an isolated profile environment",
+	Long: `Open a shell with the selected profile's isolated environment.
+
+This command does not activate or mutate the current auth files. It only passes
+the profile-scoped environment to the spawned shell, or prints the commands/data
+needed to do that yourself.
+
+Examples:
+  caam profile shell codex work
+  caam profile shell codex work --print
+  caam profile shell codex work --json
+  caam profile shell codex work --no-rc --shell bash`,
+	Args: cobra.MinimumNArgs(2),
+	RunE: runProfileShell,
+}
+
+func init() {
+	addProfileShellFlags(profileShellCmd)
+}
+
+func addProfileShellFlags(cmd *cobra.Command) {
+	cmd.Flags().Bool("print", false, "print shell commands instead of executing")
+	cmd.Flags().Bool("json", false, "print shell plan as JSON instead of executing")
+	cmd.Flags().Bool("no-rc", false, "ask supported shells to skip user rc/profile files")
+	cmd.Flags().String("shell", "", "shell executable to run (default: $SHELL, then detected shell)")
+}
+
+type profileShellPlan struct {
+	Provider string            `json:"provider"`
+	Profile  string            `json:"profile"`
+	Env      map[string]string `json:"env"`
+	Shell    string            `json:"shell"`
+	Args     []string          `json:"args"`
+	NoRC     bool              `json:"no_rc"`
+	Command  []string          `json:"command"`
+}
+
+func runProfileShell(cmd *cobra.Command, args []string) error {
+	tool := strings.ToLower(args[0])
+	name := args[1]
+	shellArgs := []string{}
+	if len(args) > 2 {
+		shellArgs = args[2:]
+	}
+
+	envVars, err := profileEnvFor(tool, name)
+	if err != nil {
+		return err
+	}
+
+	printOut, _ := cmd.Flags().GetBool("print")
+	jsonOut, _ := cmd.Flags().GetBool("json")
+	noRC, _ := cmd.Flags().GetBool("no-rc")
+	shellFlag, _ := cmd.Flags().GetString("shell")
+	if printOut && jsonOut {
+		return fmt.Errorf("--json and --print are mutually exclusive")
+	}
+
+	shellPath := profileShellExecutable(shellFlag)
+	execArgs, err := profileShellArgs(shellPath, noRC, shellArgs)
+	if err != nil {
+		return err
+	}
+	plan := profileShellPlan{
+		Provider: tool,
+		Profile:  name,
+		Env:      envVars,
+		Shell:    shellPath,
+		Args:     execArgs,
+		NoRC:     noRC,
+		Command:  append([]string{shellPath}, execArgs...),
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(plan)
+	}
+	if printOut {
+		return writeProfileShellPrint(cmd.OutOrStdout(), tool, name, envVars, shellPath, execArgs)
+	}
+
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return fmt.Errorf("profile shell requires an interactive terminal; use --print or --json for non-interactive output")
+	}
+
+	shellCmd := osexec.CommandContext(cmd.Context(), shellPath, execArgs...)
+	shellCmd.Env = environmentWithOverrides(os.Environ(), envVars)
+	shellCmd.Stdin = os.Stdin
+	shellCmd.Stdout = os.Stdout
+	shellCmd.Stderr = os.Stderr
+	return shellCmd.Run()
+}
+
+func profileShellExecutable(shellFlag string) string {
+	if strings.TrimSpace(shellFlag) != "" {
+		return shellFlag
+	}
+	if shellPath := os.Getenv("SHELL"); shellPath != "" {
+		return shellPath
+	}
+	if shellPath := os.Getenv("COMSPEC"); shellPath != "" {
+		return shellPath
+	}
+	return detectShell()
+}
+
+func profileShellArgs(shellPath string, noRC bool, userArgs []string) ([]string, error) {
+	args := []string{}
+	if noRC {
+		noRCArgs, err := noRCArgsForShell(shellPath)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, noRCArgs...)
+	}
+	args = append(args, userArgs...)
+	return args, nil
+}
+
+func noRCArgsForShell(shellPath string) ([]string, error) {
+	base := strings.ToLower(filepath.Base(shellPath))
+	switch base {
+	case "bash":
+		return []string{"--noprofile", "--norc"}, nil
+	case "zsh":
+		return []string{"-f"}, nil
+	case "fish":
+		return []string{"--no-config"}, nil
+	case "powershell", "powershell.exe", "pwsh", "pwsh.exe":
+		return []string{"-NoProfile"}, nil
+	case "cmd", "cmd.exe":
+		return []string{"/d"}, nil
+	default:
+		return nil, fmt.Errorf("--no-rc is not supported for shell %q; pass --shell bash, zsh, fish, pwsh, or cmd", shellPath)
+	}
+}
+
+func writeProfileShellPrint(w io.Writer, tool, name string, envVars map[string]string, shellPath string, args []string) error {
+	if err := writeEnvOutput(w, tool, name, envVars, envOutputOptions{ExportPrefix: "export"}); err != nil {
+		return err
+	}
+	fmt.Fprint(w, "exec")
+	for _, part := range append([]string{shellPath}, args...) {
+		fmt.Fprintf(w, " %s", shellQuote(part))
+	}
+	fmt.Fprintln(w)
+	return nil
+}
+
+func environmentWithOverrides(base []string, overrides map[string]string) []string {
+	env := make(map[string]string, len(base)+len(overrides))
+	for _, entry := range base {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			continue
+		}
+		env[key] = value
+	}
+	for key, value := range overrides {
+		env[key] = value
+	}
+
+	keys := make([]string, 0, len(env))
+	for key := range env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, key+"="+env[key])
+	}
+	return out
 }
 
 var profileDescribeCmd = &cobra.Command{

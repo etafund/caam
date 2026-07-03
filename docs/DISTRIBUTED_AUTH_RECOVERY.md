@@ -7,6 +7,10 @@ This document describes two related features for caam:
 1. **Auto-Discovery Watcher**: Automatically detect and save auth profiles when users log in naturally
 2. **Distributed Auth Recovery**: Automatically handle Claude Code rate limit recovery across multiple remote terminal sessions
 
+Related research:
+
+- [OpenCode Auth Research for Claude Code Recovery](OPENCODE_AUTH_RESEARCH.md): reviewed OpenCode sources show useful cache-invalidation and operator UX lessons, but did not show a documented reusable Claude Code `/login` automation flow for CAAM.
+
 ## Problem Statement
 
 ### Current Pain Points
@@ -136,13 +140,13 @@ Uses fsnotify to watch auth file changes:
 
 On file change:
 1. Debounce (wait 500ms for writes to settle)
-2. Parse file to extract account identity:
-   - Claude: JWT decode → extract email claim
+2. Parse file to extract account identity when the provider exposes it:
+   - Claude: current Claude Code OAuth tokens are opaque and usually do not expose email/account ID; create an auto-named profile unless the user provided a name
    - Codex: JSON parse → extract user info
    - Gemini: JSON parse → extract account email
 3. Check if profile already exists in vault
-4. If new, create profile with email as name
-5. Log action: "Auto-discovered profile: claude/alice@gmail.com"
+4. If new, create profile with extracted identity when available; for Claude, use an auto-name unless the user provided a name.
+5. Log action, for example: "Auto-discovered profile: codex/alice@example.com" or "Auto-discovered profile: claude/auto-20260703-120000 (identity unavailable)"
 
 ### Code Location
 

@@ -114,9 +114,9 @@ func commandAliases(command string) []string {
 }
 
 func statusOutputSchema() map[string]interface{} {
-	return map[string]interface{}{
+	return jsonEnvelopeSchema("caam status output", jsonOutputFormatStatus, map[string]interface{}{
 		"$schema": "https://json-schema.org/draft/2020-12/schema",
-		"title":   "caam status output",
+		"title":   "caam status data",
 		"type":    "object",
 		"required": []string{
 			"tools",
@@ -216,13 +216,13 @@ func statusOutputSchema() map[string]interface{} {
 				"items": map[string]interface{}{"type": "string"},
 			},
 		},
-	}
+	})
 }
 
 func lsOutputSchema() map[string]interface{} {
-	return map[string]interface{}{
+	return jsonEnvelopeSchema("caam ls output", jsonOutputFormatLS, map[string]interface{}{
 		"$schema": "https://json-schema.org/draft/2020-12/schema",
-		"title":   "caam ls output",
+		"title":   "caam ls data",
 		"type":    "object",
 		"required": []string{
 			"profiles",
@@ -311,6 +311,56 @@ func lsOutputSchema() map[string]interface{} {
 				"type":        "integer",
 				"minimum":     0,
 				"description": "Number of profile entries",
+			},
+		},
+	})
+}
+
+func jsonEnvelopeSchema(title, outputFormat string, dataSchema map[string]interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"$schema": "https://json-schema.org/draft/2020-12/schema",
+		"title":   title,
+		"type":    "object",
+		"required": []string{
+			"generated_at",
+			"version",
+			"output_format",
+			"data",
+		},
+		"additionalProperties": false,
+		"properties": map[string]interface{}{
+			"generated_at": map[string]interface{}{
+				"type":        "string",
+				"format":      "date-time",
+				"description": "RFC3339 timestamp when caam generated the response",
+			},
+			"version": map[string]interface{}{
+				"type":        "string",
+				"description": "caam build version string",
+			},
+			"output_format": map[string]interface{}{
+				"type":  "string",
+				"const": outputFormat,
+			},
+			"data": dataSchema,
+			"error": map[string]interface{}{
+				"type": "object",
+				"required": []string{
+					"message",
+				},
+				"additionalProperties": false,
+				"properties": map[string]interface{}{
+					"code": map[string]interface{}{
+						"type": "string",
+					},
+					"message": map[string]interface{}{
+						"type": "string",
+					},
+				},
+			},
+			"_meta": map[string]interface{}{
+				"type":                 "object",
+				"additionalProperties": true,
 			},
 		},
 	}
