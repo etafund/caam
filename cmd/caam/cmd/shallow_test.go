@@ -704,7 +704,7 @@ func TestShallowSpawnCodexStripsLeakyEnv(t *testing.T) {
 }
 
 func TestShallowSpawnCodexReloadDaemon(t *testing.T) {
-	shallowEnv(t)
+	base, _ := shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-alice", "--tool", "codex", "--json"); err != nil {
 		t.Fatal(err)
 	}
@@ -713,12 +713,14 @@ func TestShallowSpawnCodexReloadDaemon(t *testing.T) {
 	origExec := spawnExec
 	var checkProvider string
 	var checkReload bool
+	var checkCodexHome string
 	var gotDaemon bool
 	var gotArgs []string
-	runShallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
+	runShallowCodexDaemonCheck = func(tool string, reload bool, codexHome string) codexDaemonWarning {
 		gotDaemon = true
 		checkProvider = tool
 		checkReload = reload
+		checkCodexHome = codexHome
 		return codexDaemonWarning{
 			Detected: true,
 			PIDs:     []int{777},
@@ -750,6 +752,9 @@ func TestShallowSpawnCodexReloadDaemon(t *testing.T) {
 	if !checkReload {
 		t.Fatal("expected daemon check called with --reload-daemon=true")
 	}
+	if want := filepath.Join(base, "codex-alice", ".codex"); checkCodexHome != want {
+		t.Fatalf("expected daemon check scoped to CODEX_HOME %q, got %q", want, checkCodexHome)
+	}
 	if len(gotArgs) == 0 || gotArgs[0] != "sh" {
 		t.Fatalf("expected spawned command to be sh, got args: %v", gotArgs)
 	}
@@ -757,7 +762,7 @@ func TestShallowSpawnCodexReloadDaemon(t *testing.T) {
 }
 
 func TestShallowSpawnCodexDaemonWarningWithoutReload(t *testing.T) {
-	shallowEnv(t)
+	base, _ := shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob", "--tool", "codex", "--json"); err != nil {
 		t.Fatal(err)
 	}
@@ -765,8 +770,10 @@ func TestShallowSpawnCodexDaemonWarningWithoutReload(t *testing.T) {
 	origCheck := runShallowCodexDaemonCheck
 	origExec := spawnExec
 	var checkReload bool
-	runShallowCodexDaemonCheck = func(tool string, reload bool) codexDaemonWarning {
+	var checkCodexHome string
+	runShallowCodexDaemonCheck = func(tool string, reload bool, codexHome string) codexDaemonWarning {
 		checkReload = reload
+		checkCodexHome = codexHome
 		return codexDaemonWarning{
 			Detected: true,
 			PIDs:     []int{888},
@@ -787,6 +794,9 @@ func TestShallowSpawnCodexDaemonWarningWithoutReload(t *testing.T) {
 	}
 	if checkReload {
 		t.Fatal("did not expect daemon check called with --reload-daemon=true")
+	}
+	if want := filepath.Join(base, "codex-bob", ".codex"); checkCodexHome != want {
+		t.Fatalf("expected daemon check scoped to CODEX_HOME %q, got %q", want, checkCodexHome)
 	}
 	if !strings.Contains(stderr, "Warning:") {
 		t.Fatalf("expected warning on stderr when daemon detected, got: %q", stderr)
@@ -947,7 +957,7 @@ func TestShallowCreateManagedFilesJSON(t *testing.T) {
 // metadata records no provider or an unsupported provider, never silently
 // falling back to a Claude env.
 func TestShallowSpawnRejectsMalformedMeta(t *testing.T) {
-	base, _ := shallowEnv(t)
+	base, realHome := shallowEnv(t)
 	metaPath := func(name string) string {
 		return filepath.Join(base, name, ".caam-shallow.json")
 	}
@@ -975,6 +985,22 @@ func TestShallowSpawnRejectsMalformedMeta(t *testing.T) {
 	_, _, err = runCmdCaptured(t, "shallow-spawn", "emptyprov", "--print-env")
 	if err == nil || !strings.Contains(err.Error(), "has no recorded provider") {
 		t.Fatalf("empty-provider: expected 'has no recorded provider', got %v", err)
+	}
+
+	// (b2) blank provider with legacy credential_from should be inferred and allowed.
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacyprov", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(metaPath("legacyprov"),
+		[]byte(`{"name":"legacyprov","credential_from":"vault:claude/legacyprov","real_home":"`+realHome+`","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := runCmdCaptured(t, "shallow-spawn", "legacyprov", "--print-env")
+	if err != nil {
+		t.Fatalf("legacy-provider inference should allow spawn, got %v", err)
+	}
+	if !strings.Contains(out, "export SHALLOW_PROFILE='legacyprov'") {
+		t.Fatalf("expected print-env for legacy inferred provider, got %q", out)
 	}
 
 	// (c) provider set to an unsupported value.
@@ -1328,7 +1354,7 @@ func TestShallowDoctorUnhealthy(t *testing.T) {
 // TestShallowDoctorMalformedMeta deletes a profile's metadata sidecar and
 // asserts doctor flags it as malformed / no recorded provider.
 func TestShallowDoctorMalformedMeta(t *testing.T) {
-	base, _ := shallowEnv(t)
+	base, realHome := shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "nometa", "--json"); err != nil {
 		t.Fatal(err)
 	}
@@ -1341,6 +1367,23 @@ func TestShallowDoctorMalformedMeta(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "malformed") || !strings.Contains(stdout, "no recorded provider") {
 		t.Fatalf("expected malformed/no-recorded-provider message, got %q", stdout)
+	}
+
+	// Legacy metadata with no explicit provider but a valid legacy credential label
+	// should be inferred as Claude and pass doctor.
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacydoc", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "legacydoc", ".caam-shallow.json"),
+		[]byte(`{"name":"legacydoc","credential_from":"vault:claude/legacydoc","real_home":"`+realHome+`","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err = runCmdCaptured(t, "shallow-profile", "doctor", "legacydoc")
+	if err != nil {
+		t.Fatalf("expected legacy-provider metadata to be healthy, got %v (stdout=%q)", err, stdout)
+	}
+	if !strings.Contains(stdout, "legacydoc") || !strings.Contains(stdout, "healthy") {
+		t.Fatalf("expected healthy output for legacydoc, got %q", stdout)
 	}
 }
 

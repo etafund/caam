@@ -10,6 +10,7 @@ import (
 
 func init() {
 	scanProcesses = scanProcLinux
+	readProcessEnviron = readProcLinuxEnviron
 }
 
 // scanProcLinux enumerates processes by reading /proc/<pid>/cmdline. This is
@@ -40,4 +41,12 @@ func scanProcLinux() ([]rawProc, bool) {
 		procs = append(procs, rawProc{pid: pid, cmdline: string(data)})
 	}
 	return procs, true
+}
+
+func readProcLinuxEnviron(pid int) ([]byte, bool) {
+	data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "environ"))
+	if err != nil || len(data) == 0 {
+		return nil, false
+	}
+	return data, true
 }

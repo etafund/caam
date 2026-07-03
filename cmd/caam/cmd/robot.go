@@ -138,6 +138,45 @@ type RobotCoordinator struct {
 	Pending int    `json:"pending_auth_requests"`
 }
 
+const robotDocsSchemaVersion = 1
+
+type RobotDocEntry struct {
+	Command     string   `json:"command"`
+	Description string   `json:"description"`
+	Flags       []string `json:"flags,omitempty"`
+	Notes       string   `json:"notes,omitempty"`
+}
+
+type RobotDocExample struct {
+	Name  string `json:"name"`
+	Use   string `json:"command"`
+	Notes string `json:"notes,omitempty"`
+}
+
+type RobotDocExitCode struct {
+	Code       int    `json:"code"`
+	Scenario   string `json:"scenario"`
+	Meaning    string `json:"meaning"`
+	Severity   string `json:"severity"`
+	NextAction string `json:"next_action"`
+}
+
+type RobotDocTopic struct {
+	Topic       string             `json:"topic"`
+	Description string             `json:"description"`
+	Steps       []string           `json:"steps,omitempty"`
+	Commands    []RobotDocEntry    `json:"commands,omitempty"`
+	Examples    []RobotDocExample  `json:"examples,omitempty"`
+	ExitCodes   []RobotDocExitCode `json:"exit_codes,omitempty"`
+	Notes       []string           `json:"notes,omitempty"`
+}
+
+type RobotDocsData struct {
+	Version       string          `json:"version"`
+	SchemaVersion int             `json:"schema_version"`
+	Topics        []RobotDocTopic `json:"topics"`
+}
+
 // RobotNextData contains recommended next action.
 type RobotNextData struct {
 	Provider        string            `json:"provider"`
@@ -1224,6 +1263,211 @@ All commands return:
 	return nil
 }
 
+func runRobotDocs(cmd *cobra.Command, args []string) error {
+	start := time.Now()
+	ndjson, _ := cmd.Flags().GetBool("ndjson")
+	var topic string
+	if len(args) == 1 {
+		topic = strings.ToLower(args[0])
+	}
+
+	data, err := getRobotDocs(topic)
+	if err != nil {
+		return robotError(cmd, "docs", "INVALID_TOPIC", err.Error(),
+			"topics: quickstart, commands, flags, examples, exit-codes, schemas, all",
+			[]string{
+				"caam robot docs quickstart",
+				"caam robot docs commands",
+				"caam robot docs exit-codes",
+				"caam robot docs schemas",
+			})
+	}
+
+	output := RobotOutput{
+		Success: true,
+		Command: "docs",
+		Data:    data,
+		Timing: &RobotTiming{
+			StartedAt:  start.UTC().Format(time.RFC3339),
+			DurationMs: time.Since(start).Milliseconds(),
+		},
+	}
+
+	if ndjson {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		for _, topicData := range data.Topics {
+			fragment := RobotOutput{
+				Success:   true,
+				Command:   "docs",
+				Timestamp: output.Timestamp,
+				Data: RobotDocsData{
+					Version:       data.Version,
+					SchemaVersion: data.SchemaVersion,
+					Topics:        []RobotDocTopic{topicData},
+				},
+				Timing: output.Timing,
+			}
+			if err := enc.Encode(fragment); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return robotOutput(cmd, output)
+}
+
+func getRobotDocs(topic string) (RobotDocsData, error) {
+	topics := []RobotDocTopic{
+		{
+			Topic:       "quickstart",
+			Description: "Minimal agent-first command flow for switching accounts.",
+			Steps: []string{
+				"Inspect saved profiles with list for the target tool.",
+				"Activate a profile explicitly or use auto selection.",
+				"Run the tool command through caam exec for isolated execution.",
+			},
+			Commands: []RobotDocEntry{
+				{
+					Command:     "caam ls",
+					Description: "alias: list. Shows all saved profiles.",
+				},
+				{
+					Command:     "caam status",
+					Description: "Shows active profile and health summary.",
+				},
+				{
+					Command:     "caam activate <tool> <profile>",
+					Description: "Activate a saved profile.",
+				},
+				{
+					Command:     "caam exec <tool> <profile> -- <command>",
+					Description: "Run a command in an isolated profile context.",
+				},
+			},
+			Examples: []RobotDocExample{
+				{Name: "list-and-activate", Use: "caam ls codex --json"},
+				{Name: "activate", Use: "caam activate codex work --json"},
+			},
+		},
+		{
+			Topic:       "commands",
+			Description: "Core CAAM commands used by agents.",
+			Commands: []RobotDocEntry{
+				{
+					Command:     "caam backup <tool> <profile>",
+					Description: "Store current auth files in the vault.",
+					Flags:       []string{"--json"},
+				},
+				{
+					Command:     "caam activate <tool> [profile]",
+					Description: "Restore a profile or auto-select one (via rotation).",
+					Flags:       []string{"--json", "--auto", "--force", "--backup-current", "--reload-daemon"},
+				},
+				{
+					Command:     "caam status [tool]",
+					Description: "Show active profile and health summary.",
+					Flags:       []string{"--json"},
+				},
+				{
+					Command:     "caam ls [tool]",
+					Description: "List saved profiles.",
+					Flags:       []string{"--json", "--tag", "--no-color"},
+				},
+				{
+					Command:     "caam profile",
+					Description: "Alias and profile-level management.",
+				},
+				{
+					Command:     "caam exec <tool> <profile> -- <command>",
+					Description: "Run command with CAAM-specific profile auth context.",
+					Flags:       []string{"--json", "--print-env", "--dry-run"},
+				},
+				{
+					Command:     "caam robot",
+					Description: "Machine-optimized command surface (always JSON).",
+				},
+			},
+		},
+		{
+			Topic:       "flags",
+			Description: "Important non-command-specific flags used by automation.",
+			Commands: []RobotDocEntry{
+				{
+					Command:     "--json",
+					Description: "Emit machine-readable output where supported.",
+				},
+				{
+					Command:     "caam --version",
+					Description: "Print concise version string.",
+				},
+				{
+					Command:     "caam robot status --include-coordinators",
+					Description: "Include coordinator status in robot status output.",
+				},
+			},
+			Notes: []string{
+				"JSON/structured output should be consumed from stdout only.",
+				"Human diagnostics are emitted to stderr.",
+			},
+		},
+		{
+			Topic:       "examples",
+			Description: "Canonical command examples for agent scripts.",
+			Examples: []RobotDocExample{
+				{Name: "backup", Use: "caam backup codex work --json"},
+				{Name: "activate", Use: "caam activate codex work --json"},
+				{Name: "status", Use: "caam status codex --json"},
+				{Name: "ls", Use: "caam ls codex --json"},
+				{Name: "profile-show", Use: "caam profile show codex work"},
+				{Name: "exec", Use: "caam exec codex work -- run-test"},
+			},
+			Notes: []string{
+				"Use robot status when coordinating multi-agent decisioning.",
+				"Use robot next for a scored profile recommendation.",
+				"Use robot docs when command surface changes.",
+			},
+		},
+		{
+			Topic:       "exit-codes",
+			Description: "Common exit patterns exposed by command execution paths.",
+			ExitCodes: []RobotDocExitCode{
+				{Code: 0, Scenario: "success", Meaning: "command completed successfully", Severity: "low", NextAction: "continue"},
+				{Code: 1, Scenario: "runtime-error", Meaning: "command failed for user/runtime reason", Severity: "high", NextAction: "inspect Error field"},
+				{Code: 2, Scenario: "partial-success", Meaning: "non-blocking warning path", Severity: "medium", NextAction: "act on suggested commands"},
+				{Code: 130, Scenario: "interrupted", Meaning: "SIGINT received", Severity: "medium", NextAction: "retry if operation incomplete"},
+			},
+		},
+		{
+			Topic:       "schemas",
+			Description: "Machine-readable shape references for robot docs metadata.",
+			Notes: []string{
+				"Canonical JSON Schema definitions are available via `caam schema`.",
+			},
+		},
+	}
+
+	if topic == "" || topic == "all" {
+		return RobotDocsData{
+			Version:       version.Info(),
+			SchemaVersion: robotDocsSchemaVersion,
+			Topics:        topics,
+		}, nil
+	}
+
+	for _, candidate := range topics {
+		if candidate.Topic == topic {
+			return RobotDocsData{
+				Version:       version.Info(),
+				SchemaVersion: robotDocsSchemaVersion,
+				Topics:        []RobotDocTopic{candidate},
+			}, nil
+		}
+	}
+
+	return RobotDocsData{}, fmt.Errorf("unknown docs topic %q", topic)
+}
+
 // ============================================================================
 // New Robot Subcommands
 // ============================================================================
@@ -1300,11 +1544,31 @@ var robotConfigCmd = &cobra.Command{
 	Long: `View or modify caam configuration.
 
 Without arguments, returns full config as JSON.
-With 'set <key> <value>', updates a config value.`,
+	With 'set <key> <value>', updates a config value.`,
 	RunE: runRobotConfig,
 }
 
+var robotDocsCmd = &cobra.Command{
+	Use:   "docs [topic]",
+	Short: "Machine-readable command documentation",
+	Long: `Emit machine-readable docs for automation and agents.
+
+Topics:
+  quickstart       Minimal startup workflow
+  commands         Core CAAM command map
+  flags            Command-level flag references
+  examples         Canonical command examples
+  exit-codes       Common success/error exit patterns
+  schemas          JSON schema metadata and references
+
+Without a topic, returns all topics.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: runRobotDocs,
+}
+
 func init() {
+	robotCmd.SilenceUsage = true
+	robotCmd.SilenceErrors = true
 	rootCmd.AddCommand(robotCmd)
 	robotCmd.AddCommand(robotStatusCmd)
 	robotCmd.AddCommand(robotNextCmd)
@@ -1318,6 +1582,7 @@ func init() {
 	robotCmd.AddCommand(robotPathsCmd)
 	robotCmd.AddCommand(robotHistoryCmd)
 	robotCmd.AddCommand(robotConfigCmd)
+	robotCmd.AddCommand(robotDocsCmd)
 
 	// Status flags
 	robotStatusCmd.Flags().String("provider", "", "filter to specific provider")
@@ -1350,6 +1615,7 @@ func init() {
 	robotHistoryCmd.Flags().Int("days", 7, "number of days of history")
 	robotHistoryCmd.Flags().Int("limit", 50, "max events to return")
 	robotHistoryCmd.Flags().String("provider", "", "filter to specific provider")
+	robotDocsCmd.Flags().Bool("ndjson", false, "emit newline-delimited JSON")
 }
 
 // RobotLimitsData contains rate limit information.

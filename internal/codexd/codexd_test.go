@@ -103,6 +103,61 @@ func TestDetect_DeduplicatesAndClassifies(t *testing.T) {
 	}
 }
 
+func TestDetectForCodexHomeFiltersByEnvironment(t *testing.T) {
+	origScan := scanProcesses
+	origEnv := readProcessEnviron
+	t.Cleanup(func() {
+		scanProcesses = origScan
+		readProcessEnviron = origEnv
+	})
+
+	scanProcesses = func() ([]rawProc, bool) {
+		return []rawProc{
+			{pid: 100, cmdline: "codex app-server"},
+			{pid: 200, cmdline: "codex mcp serve"},
+			{pid: 300, cmdline: "codex proto"},
+			{pid: 400, cmdline: "codex app-server"},
+			{pid: 500, cmdline: "codex"}, // interactive -> ignored
+		}, true
+	}
+	readProcessEnviron = func(pid int) ([]byte, bool) {
+		switch pid {
+		case 100:
+			return []byte("CODEX_HOME=/tmp/cod-a/.codex\x00HOME=/tmp/cod-a\x00SHALLOW_PROFILE=cod-a\x00"), true
+		case 200:
+			return []byte("CODEX_HOME=/tmp/cod-b/.codex\x00HOME=/tmp/cod-b\x00SHALLOW_PROFILE=cod-b\x00"), true
+		case 300:
+			return []byte("HOME=/tmp/cod-a\x00SHALLOW_PROFILE=cod-a\x00"), true
+		default:
+			return nil, false
+		}
+	}
+
+	procs, supported := DetectForCodexHome("/tmp/cod-a/.codex/")
+	if !supported {
+		t.Fatal("expected supported=true with injected scanner")
+	}
+	gotPIDs := []int{}
+	for _, p := range procs {
+		gotPIDs = append(gotPIDs, p.PID)
+	}
+	if !reflect.DeepEqual(gotPIDs, []int{100, 300}) {
+		t.Fatalf("pids for cod-a = %v, want [100 300]", gotPIDs)
+	}
+
+	procs, supported = DetectForCodexHome("/tmp/cod-b/.codex")
+	if !supported {
+		t.Fatal("expected supported=true with injected scanner")
+	}
+	gotPIDs = gotPIDs[:0]
+	for _, p := range procs {
+		gotPIDs = append(gotPIDs, p.PID)
+	}
+	if !reflect.DeepEqual(gotPIDs, []int{200}) {
+		t.Fatalf("pids for cod-b = %v, want [200]", gotPIDs)
+	}
+}
+
 func TestDetect_Unsupported(t *testing.T) {
 	orig := scanProcesses
 	t.Cleanup(func() { scanProcesses = orig })

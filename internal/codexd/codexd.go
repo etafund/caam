@@ -21,6 +21,7 @@
 package codexd
 
 import (
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -35,6 +36,14 @@ type Process struct {
 	// "mcp-server". May be empty if we matched a generic persistent codex
 	// process we could not classify precisely.
 	Subcommand string
+	// CodexHome is the process's CODEX_HOME, when the platform lets us inspect
+	// it. It is used to avoid reloading another shallow profile's daemon.
+	CodexHome string
+	// Home is the process's HOME, used as a fallback because Codex defaults to
+	// HOME/.codex when CODEX_HOME is unset.
+	Home string
+	// ShallowProfile is the process's SHALLOW_PROFILE marker, when present.
+	ShallowProfile string
 }
 
 // rawProc is the platform-agnostic representation a scanner yields.
@@ -47,6 +56,11 @@ type rawProc struct {
 // process_darwin.go / process_other.go). It returns the candidate processes to
 // inspect, or (nil, false) if process scanning is unavailable on this platform.
 var scanProcesses func() ([]rawProc, bool)
+
+// readProcessEnviron is set by platforms that can cheaply read another
+// process's environment. It is only called after a process has already been
+// classified as a Codex daemon.
+var readProcessEnviron func(pid int) ([]byte, bool)
 
 // Detect scans running processes and returns any that look like a persistent
 // Codex daemon (app-server / mcp-server). The second return value is false when
@@ -71,16 +85,88 @@ func Detect() (procs []Process, supported bool) {
 		if !match {
 			continue
 		}
+		codexHome, home, shallowProfile := processEnvMetadata(p.pid)
 		seen[p.pid] = struct{}{}
 		procs = append(procs, Process{
-			PID:        p.pid,
-			Cmdline:    strings.TrimSpace(p.cmdline),
-			Subcommand: sub,
+			PID:            p.pid,
+			Cmdline:        strings.TrimSpace(p.cmdline),
+			Subcommand:     sub,
+			CodexHome:      codexHome,
+			Home:           home,
+			ShallowProfile: shallowProfile,
 		})
 	}
 
 	sort.Slice(procs, func(i, j int) bool { return procs[i].PID < procs[j].PID })
 	return procs, true
+}
+
+// DetectForCodexHome scans running Codex daemons, then returns only daemons
+// whose environment points at codexHome. This is what shallow-spawn uses so
+// --reload-daemon does not SIGTERM another shallow profile's daemon.
+func DetectForCodexHome(codexHome string) (procs []Process, supported bool) {
+	all, supported := Detect()
+	if !supported {
+		return nil, false
+	}
+	target := normalizePath(codexHome)
+	if target == "" {
+		return all, true
+	}
+	for _, p := range all {
+		if p.UsesCodexHome(target) {
+			procs = append(procs, p)
+		}
+	}
+	return procs, true
+}
+
+// UsesCodexHome reports whether this daemon appears to use codexHome.
+func (p Process) UsesCodexHome(codexHome string) bool {
+	target := normalizePath(codexHome)
+	if target == "" {
+		return false
+	}
+	if normalizePath(p.CodexHome) == target {
+		return true
+	}
+	if p.Home != "" && normalizePath(filepath.Join(p.Home, ".codex")) == target {
+		return true
+	}
+	return false
+}
+
+func processEnvMetadata(pid int) (codexHome, home, shallowProfile string) {
+	if readProcessEnviron == nil {
+		return "", "", ""
+	}
+	data, ok := readProcessEnviron(pid)
+	if !ok || len(data) == 0 {
+		return "", "", ""
+	}
+	for _, part := range strings.Split(string(data), "\x00") {
+		key, value, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "CODEX_HOME":
+			codexHome = value
+		case "HOME":
+			home = value
+		case "SHALLOW_PROFILE":
+			shallowProfile = value
+		}
+	}
+	return codexHome, home, shallowProfile
+}
+
+func normalizePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
 }
 
 // daemonSubcommands maps a recognized first token of a codex daemon subcommand

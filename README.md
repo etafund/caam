@@ -36,6 +36,12 @@ caam status --json
 
 # Switch accounts
 caam activate claude alice@gmail.com --json
+
+# Discover machine-readable CAAM docs (commands/flags/examples/exit-codes)
+caam robot docs
+
+# Discover machine-readable schema metadata references
+caam schema
 ```
 
 ---

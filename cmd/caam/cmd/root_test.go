@@ -83,6 +83,7 @@ func TestSubcommandRegistration(t *testing.T) {
 		"profile",
 		"login",
 		"exec",
+		"schema",
 		"doctor",
 		"sessions",
 		"env",

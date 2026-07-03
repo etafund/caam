@@ -588,15 +588,19 @@ func diagnoseShallowProfile(mgr *shallow.Manager, name string) shallowDoctorResu
 		}
 		return res
 	}
-	if prof.Meta == nil || prof.Meta.Provider == "" {
+	provider := ""
+	if prof.Meta != nil {
+		provider = prof.Meta.ResolvedProvider()
+	}
+	if prof.Meta == nil || provider == "" {
 		res.Error = "malformed metadata (no recorded provider); recreate it"
 		return res
 	}
-	res.Provider = prof.Meta.Provider
-	layout, err := shallow.LayoutForProvider(prof.Meta.Provider)
+	res.Provider = provider
+	layout, err := shallow.LayoutForProvider(provider)
 	if err != nil {
 		res.Error = fmt.Sprintf("unsupported provider %q (supported: %s)",
-			prof.Meta.Provider, strings.Join(shallow.SupportedProviders(), ", "))
+			provider, strings.Join(shallow.SupportedProviders(), ", "))
 		return res
 	}
 	if err := mgr.ValidateProfileShape(name, layout); err != nil {
@@ -735,7 +739,7 @@ func init() {
 	shallowSpawnCmd.Flags().String("base", "", "shallow profiles base dir")
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print eval-able export/unset statements and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("json", false, "output as JSON (errors and --print-env)")
-	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
+	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon for this shallow profile so the switched auth takes effect (it respawns on next use)")
 }
 
 // shallowSpawnPrintEnvOutput is the --print-env --json shape: the env transform
@@ -787,6 +791,10 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		}
 		return emit(fmt.Errorf("load shallow profile: %w", err))
 	}
+	provider := ""
+	if prof.Meta != nil {
+		provider = prof.Meta.ResolvedProvider()
+	}
 
 	// STRICT: a profile with missing/unreadable metadata (Meta == nil) or no
 	// recorded provider is malformed — refuse, never silently assume Claude. A
@@ -794,13 +802,13 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	// ~/.codex auth. Emit spawn-specific messages (don't wrap the engine's
 	// LayoutForProvider error — its wording differs and tests depend on the
 	// exact spawn phrasing).
-	if prof.Meta == nil || prof.Meta.Provider == "" {
+	if prof.Meta == nil || provider == "" {
 		return emit(fmt.Errorf("shallow profile %q has no recorded provider (missing or malformed metadata); recreate it", name))
 	}
-	layout, err := shallow.LayoutForProvider(prof.Meta.Provider) // strict: empty/unknown → error
+	layout, err := shallow.LayoutForProvider(provider) // strict: empty/unknown → error
 	if err != nil {
 		return emit(fmt.Errorf("shallow profile %q uses unsupported provider %q (supported: %s)",
-			name, prof.Meta.Provider, strings.Join(shallow.SupportedProviders(), ", ")))
+			name, provider, strings.Join(shallow.SupportedProviders(), ", ")))
 	}
 
 	// Full pre-spawn integrity check, BEFORE both --print-env and exec: every
@@ -871,7 +879,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		envSlice = append(envSlice, k+"="+v)
 	}
 
-	daemonWarn := runShallowCodexDaemonCheck(prof.Meta.Provider, reloadDaemon)
+	daemonWarn := runShallowCodexDaemonCheck(provider, reloadDaemon, envMap["CODEX_HOME"])
 	printShallowCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
 
 	// On Unix, exec the target so signals/exit propagate naturally and we don't
@@ -879,7 +887,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 	return spawnExec(binPath, rest, envSlice)
 }
 
-var runShallowCodexDaemonCheck = checkCodexDaemon
+var runShallowCodexDaemonCheck = checkCodexDaemonForCodexHome
 
 var printShallowCodexDaemonWarning = printCodexDaemonWarning
 

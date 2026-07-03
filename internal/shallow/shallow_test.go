@@ -367,6 +367,24 @@ func TestCreateRefusesDuplicateWithoutForce(t *testing.T) {
 	}
 }
 
+func TestCreateDuplicateWithoutForceReportsExistingProvider(t *testing.T) {
+	home := fakeHome(t)
+	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Create("alice", CreateOptions{Provider: "claude"}); err != nil {
+		t.Fatalf("create first profile: %v", err)
+	}
+	_, err = mgr.Create("alice", CreateOptions{Provider: "codex"})
+	if err == nil {
+		t.Fatalf("expected duplicate create error")
+	}
+	if !strings.Contains(err.Error(), "already exists for claude") {
+		t.Fatalf("expected provider-aware duplicate error, got: %v", err)
+	}
+}
+
 func TestCreateRejectsBadName(t *testing.T) {
 	home := fakeHome(t)
 	mgr, err := NewManager(filepath.Join(t.TempDir(), "homes"), home)
@@ -867,6 +885,55 @@ func TestCreateCodexLayoutWritesFreshMinimalConfig(t *testing.T) {
 	}
 }
 
+// 4. Codex config sanitization preserves MCP server sections.
+func TestCreateCodexLayoutPreservesMCPServers(t *testing.T) {
+	home := fakeHome(t)
+	realCfg := filepath.Join(home, ".codex", "config.toml")
+	if err := os.WriteFile(realCfg, []byte(`model = "gpt-5.3"
+[projects."/home/ubuntu"]
+trust_level = "trusted"
+
+[mcp_servers.mcp_agent_mail]
+url = "http://127.0.0.1:8765/mcp/"
+http_headers = { Authorization = "Bearer TOKEN" }
+
+[mcp_servers.mcp_agent_mail.tools.send_message]
+approval_mode = "approve"
+
+[hooks]
+enabled = true
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"codex":"token"}`)
+	got, err := mgr.Create("alice", CreateOptions{Provider: "codex", CredentialSource: src})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	cfg := filepath.Join(got, ".codex", "config.toml")
+	body, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("read config.toml: %v", err)
+	}
+	s := string(body)
+	if !strings.Contains(s, `url = "http://127.0.0.1:8765/mcp/"`) {
+		t.Fatalf("expected MCP server url to be preserved: %q", s)
+	}
+	if !strings.Contains(s, `approval_mode = "approve"`) {
+		t.Fatalf("expected MCP tool override to be preserved: %q", s)
+	}
+	if strings.Contains(s, `model = "gpt-5.3"`) {
+		t.Fatalf("expected top-level model to be stripped from shallow profile: %q", s)
+	}
+	if strings.Contains(s, `[hooks]`) {
+		t.Fatalf("expected unknown top-level hooks table to be stripped from shallow profile: %q", s)
+	}
+	if !strings.Contains(s, `cli_auth_credentials_store = "file"`) {
+		t.Fatalf("expected credential-store directive in sanitized codex config: %q", s)
+	}
+}
+
 // 5. Codex with no credential source → empty real 0600 auth.json.
 func TestCreateCodexLayoutEmptyAuth(t *testing.T) {
 	home := fakeHome(t)
@@ -1025,6 +1092,39 @@ func TestMetaRecordsProvider(t *testing.T) {
 	}
 	if meta.RealHome != home {
 		t.Fatalf("real_home = %q, want %q", meta.RealHome, home)
+	}
+}
+
+func TestReadMetaInfersProviderFromLegacyCredentialFrom(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	metaPath := filepath.Join(mgr.BaseDir(), "alice", ProfileMetaFilename)
+	if err := os.WriteFile(metaPath,
+		[]byte(`{"name":"alice","real_home":"`+home+`","credential_from":"vault:claude/alice","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := readMeta(filepath.Join(mgr.BaseDir(), "alice"))
+	if err != nil {
+		t.Fatalf("readMeta: %v", err)
+	}
+	if meta.Provider != "claude" {
+		t.Fatalf("inferred provider = %q, want claude", meta.Provider)
+	}
+
+	if err := os.WriteFile(metaPath,
+		[]byte(`{"name":"alice","real_home":"`+home+`","credential_from":"vault:unknown/alice","version":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta, err = readMeta(filepath.Join(mgr.BaseDir(), "alice"))
+	if err != nil {
+		t.Fatalf("readMeta legacy unsupported provider: %v", err)
+	}
+	if meta.Provider != "" {
+		t.Fatalf("unknown provider should remain unknown, got %q", meta.Provider)
 	}
 }
 

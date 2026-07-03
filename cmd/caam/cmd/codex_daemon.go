@@ -40,11 +40,25 @@ type codexDaemonWarning struct {
 //	next session respawns one with the new auth. This is opt-in because
 //	killing a daemon can disrupt an in-flight session.
 func checkCodexDaemon(tool string, reload bool) codexDaemonWarning {
+	return checkCodexDaemonScoped(tool, reload, "")
+}
+
+func checkCodexDaemonForCodexHome(tool string, reload bool, codexHome string) codexDaemonWarning {
+	return checkCodexDaemonScoped(tool, reload, codexHome)
+}
+
+func checkCodexDaemonScoped(tool string, reload bool, codexHome string) codexDaemonWarning {
 	if strings.ToLower(strings.TrimSpace(tool)) != "codex" {
 		return codexDaemonWarning{}
 	}
 
-	procs, supported := codexd.Detect()
+	var procs []codexd.Process
+	var supported bool
+	if strings.TrimSpace(codexHome) != "" {
+		procs, supported = codexd.DetectForCodexHome(codexHome)
+	} else {
+		procs, supported = codexd.Detect()
+	}
 	if !supported || len(procs) == 0 {
 		// Either we cannot scan (e.g. Windows) or no daemon is running. In both
 		// cases there is nothing actionable to warn about; a switch with no

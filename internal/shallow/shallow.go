@@ -14,6 +14,8 @@
 package shallow
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -657,6 +659,21 @@ func createClaudeManagedFiles(m *Manager, home string, opts CreateOptions) error
 
 func createCodexManagedFiles(m *Manager, home string, opts CreateOptions) error {
 	codexDir := filepath.Join(home, ".codex")
+	realConfigPath := filepath.Join(m.realHome, ".codex", "config.toml")
+	if data, err := os.ReadFile(realConfigPath); err == nil {
+		cfgOut := filepath.Join(codexDir, "config.toml")
+		if err := writeFileAtomic(cfgOut, sanitizeCodexConfigForShallowProfile(data), 0o600); err != nil {
+			return fmt.Errorf("write sanitized codex config: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		// Any read error should not break profile creation; fallback to a minimal
+		// file and let `EnsureFileCredentialStore` enforce the required setting.
+		requirement := []byte("# Failed to read real ~/.codex/config.toml; continuing with managed defaults.\n")
+		cfgOut := filepath.Join(codexDir, "config.toml")
+		if err := writeFileAtomic(cfgOut, requirement, 0o600); err != nil {
+			return fmt.Errorf("write managed codex config fallback: %w", err)
+		}
+	}
 	// Write a FRESH minimal config.toml (just the file credential store) — do NOT
 	// copy the real ~/.codex/config.toml. A copied config can carry PATH-bearing keys
 	// that escape isolation: `log_dir`/`sqlite_home` pointing back at the real
@@ -667,6 +684,42 @@ func createCodexManagedFiles(m *Manager, home string, opts CreateOptions) error 
 		return fmt.Errorf("configure codex credential store: %w", err)
 	}
 	return nil
+}
+
+// sanitizeCodexConfigForShallowProfile keeps only Codex MCP server config sections
+// plus optional existing cli_auth_credentials_store overrides. This preserves MCP
+// integrations (like MCP Agent Mail) while avoiding copying path-bearing or env
+// auth aliases that could re-point this shallow profile at external state.
+func sanitizeCodexConfigForShallowProfile(raw []byte) []byte {
+	var out bytes.Buffer
+	inMCPSection := false
+	s := bufio.NewScanner(bytes.NewReader(raw))
+	for s.Scan() {
+		line := s.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inMCPSection = strings.HasPrefix(trimmed, "[mcp_servers")
+			if inMCPSection {
+				out.WriteString(line)
+				out.WriteByte('\n')
+			}
+			continue
+		}
+
+		if inMCPSection {
+			out.WriteString(line)
+			out.WriteByte('\n')
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "cli_auth_credentials_store") {
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+	}
+
+	return out.Bytes()
 }
 
 // Meta is the JSON sidecar persisted at ~/orch-homes/<name>/.caam-shallow.json.
@@ -839,6 +892,9 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 			return "", fmt.Errorf("shallow profile %q is a symlink; refusing (potential identity hijack)", name)
 		}
 		if !opts.Force {
+			if meta, merr := readMeta(home); merr == nil && meta != nil && strings.TrimSpace(meta.Provider) != "" {
+				return "", fmt.Errorf("shallow profile %q already exists for %s (use --force to overwrite)", name, meta.Provider)
+			}
 			return "", fmt.Errorf("shallow profile %q already exists at %s (use --force to overwrite)", name, home)
 		}
 		if err := m.assertIsShallowProfile(home); err != nil {
@@ -2317,5 +2373,55 @@ func readMeta(home string) (*Meta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
+	m.Provider = m.ResolvedProvider()
 	return &m, nil // Provider is taken verbatim; may be "" or unknown for a hand-edited sidecar
+}
+
+// ResolvedProvider returns the metadata provider when set, otherwise infers it from
+// the legacy credential_from label where possible.
+func (m *Meta) ResolvedProvider() string {
+	if m == nil {
+		return ""
+	}
+	provider := strings.TrimSpace(m.Provider)
+	if provider != "" {
+		return provider
+	}
+	if p, ok := providerFromCredentialLabel(m.CredentialFrom); ok {
+		return p
+	}
+	return ""
+}
+
+// providerFromCredentialLabel attempts legacy metadata inference.
+//
+// Older sidecars stored only the credential source label (for example
+// "vault:claude/alice"), so this reconstructs the provider from that label when
+// provider is absent. It intentionally never guesses from arbitrary strings:
+// only well-formed "vault:<provider>/<profile>" labels that resolve to a known
+// shallow provider are used.
+func providerFromCredentialLabel(label string) (string, bool) {
+	label = strings.TrimSpace(label)
+	const prefix = "vault:"
+	if !strings.HasPrefix(label, prefix) {
+		return "", false
+	}
+	ref := strings.TrimSpace(strings.TrimPrefix(label, prefix))
+	if ref == "" {
+		return "", false
+	}
+	parts := strings.SplitN(ref, "/", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	provider := strings.ToLower(strings.TrimSpace(parts[0]))
+	profile := strings.TrimSpace(parts[1])
+	if provider == "" || profile == "" || profile == "." || profile == ".." ||
+		strings.Contains(profile, "/") || strings.Contains(profile, "\\") {
+		return "", false
+	}
+	if _, err := LayoutForProvider(provider); err != nil {
+		return "", false
+	}
+	return provider, true
 }
