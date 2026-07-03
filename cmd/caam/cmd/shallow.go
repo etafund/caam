@@ -60,19 +60,23 @@ This enables N parallel sessions, each pinned to a different account, while
 preserving shared state (shell history, git config, ssh keys, the harness's
 own conversation history). Unlike 'caam profile add' which gives each profile
 a blank, fully-isolated HOME, shallow profiles only isolate what MUST differ
-(the credentials).
+(the provider's identity files).
 
 Shallow profiles support Claude Code, Codex CLI, and Antigravity (agy). The
 provider is inferred from --from-vault <tool>/<profile>, set explicitly with
 --tool, or defaults to claude.
 
-Layout under ~/orch-homes/<name>/ for Claude:
+Layout under ~/orch-homes/<name>/ (claude shown):
 
   .claude/.credentials.json       (real file — per-identity OAuth tokens)
   .claude/.credentials.lock       (real file — per-identity flock target)
   .claude.json                    (real file — Claude rewrites this on each run)
   .claude/projects, .claude/todos (symlinks → ~/.claude/projects, etc.)
   .bashrc, .gitconfig, .ssh, ...  (symlinks → ~/.bashrc, etc.)
+
+  codex: .codex/auth.json + .codex/config.toml are real (CODEX_HOME is pinned).
+  agy:   .gemini/antigravity-cli/antigravity-oauth-token (+ optional Google
+         identity files) are real (GEMINI_HOME is pinned).
 
 Spawn under a shallow identity with:
 
@@ -98,7 +102,7 @@ var shallowProfileCreateCmd = &cobra.Command{
 	Use:   "create <name>",
 	Short: "Create a new shallow profile",
 	Long: `Create a new shallow profile. Provisions the symlink farm and copies a
-credential file into the provider's auth path inside the shallow HOME.
+credential file into the provider's primary auth path inside the shallow HOME.
 
 Provider resolution:
   --from-vault <tool>/<profile>   provider is <tool> (claude, codex, or agy)
@@ -106,9 +110,10 @@ Provider resolution:
   (neither)                       defaults to claude
 
 Credential source (one of):
-  --from-vault <tool>/<profile>   Use an existing caam vault profile's credentials
-  --from-file <path>              Copy credentials from an arbitrary path
-  (none)                          Leave credentials empty; populate later via login
+  --from-vault <tool>/<profile>   Use an existing caam vault profile (infers --tool)
+  --from-file <path>              Copy the primary auth file from a path (needs --tool
+                                  for non-claude providers)
+  (none)                          Leave the credential empty; populate later via login
 
 Examples:
   caam shallow-profile create alice --from-vault claude/alice@example.com
@@ -140,6 +145,7 @@ type shallowCreateOutput struct {
 	Name           string   `json:"name"`
 	Provider       string   `json:"provider"`
 	Path           string   `json:"path"`
+	CredentialPath string   `json:"credential_path,omitempty"`
 	CredentialFrom string   `json:"credential_from,omitempty"`
 	ManagedFiles   []string `json:"managed_files,omitempty"`
 	Error          string   `json:"error,omitempty"`
@@ -222,10 +228,11 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	name := args[0]
 	jsonOut, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
+	tool, _ := cmd.Flags().GetString("tool")
+	tool = strings.ToLower(strings.TrimSpace(tool))
 	fromVault, _ := cmd.Flags().GetString("from-vault")
 	fromFile, _ := cmd.Flags().GetString("from-file")
 	fromClaudeJSON, _ := cmd.Flags().GetString("from-claude-json")
-	tool, _ := cmd.Flags().GetString("tool")
 
 	output := shallowCreateOutput{Name: name}
 	emit := func(err error) error {
@@ -269,6 +276,7 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 
 	opts := shallow.CreateOptions{Provider: providerID, Force: force, SourceClaudeJSON: fromClaudeJSON}
 
+	// Resolve the credential source.
 	switch {
 	case fromVault != "":
 		ref, _ := parseShallowVaultRef(fromVault) // already validated inside inferShallowProvider
@@ -293,7 +301,7 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	default:
 		// No credential source — terse stderr nudge unless json.
 		if !jsonOut {
-			fmt.Fprintln(cmd.ErrOrStderr(), "note: no --from-vault/--from-file given; the credential file will be empty.")
+			fmt.Fprintln(cmd.ErrOrStderr(), "note: no --from-vault/--from-file given; the primary credential will be empty.")
 			fmt.Fprintln(cmd.ErrOrStderr(), "      Populate it before running 'shallow-spawn' (e.g. by signing in inside the shallow HOME).")
 		}
 	}
@@ -314,6 +322,9 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	output.Path = home
 	output.CredentialFrom = opts.CredentialFromLabel
 	output.ManagedFiles = layout.ManagedFilePaths(home)
+	if credPath, perr := mgr.CredentialPath(name); perr == nil {
+		output.CredentialPath = credPath
+	}
 	if jsonOut {
 		output.Success = true
 		enc := json.NewEncoder(cmd.OutOrStdout())
@@ -718,6 +729,7 @@ Examples:
   caam shallow-spawn cbob  -- codex
   caam shallow-spawn alice -- claude --print "explain this codebase"
   caam shallow-spawn alice -- bash -c 'echo $HOME'
+  caam shallow-spawn codex-bob --reload-daemon -- codex
 
 Use 'caam shallow-spawn <name> --print-env' to print eval-able shell statements
 (export KEY='value' for the vars set, unset KEY for the vars cleared) that
@@ -730,7 +742,12 @@ out="$(caam shallow-spawn <name> --print-env)" && eval "$out".
 
 Pass --json to get machine-readable output instead: errors become
 {"success":false,"error":...} on stdout, and --print-env --json emits
-{"success":true,"home":...,"shallow_profile":...,"set":{...},"unset":[...]}.`,
+{"success":true,"home":...,"shallow_profile":...,"set":{...},"unset":[...]}.
+
+--reload-daemon (codex only) mirrors 'caam activate/next': after the on-disk
+auth swap it SIGTERMs any running codex app-server/mcp-server daemon so the
+new identity takes effect. It is a shallow-spawn flag (place it BEFORE '--'),
+consumed here and never forwarded to the spawned command.`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runShallowSpawn,
 }
@@ -879,8 +896,10 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		envSlice = append(envSlice, k+"="+v)
 	}
 
-	daemonWarn := runShallowCodexDaemonCheck(provider, reloadDaemon, envMap["CODEX_HOME"])
-	printShallowCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
+	if provider == shallow.ProviderCodex {
+		daemonWarn := runShallowCodexDaemonCheck(provider, reloadDaemon, envMap["CODEX_HOME"])
+		printShallowCodexDaemonWarning(cmd.ErrOrStderr(), daemonWarn)
+	}
 
 	// On Unix, exec the target so signals/exit propagate naturally and we don't
 	// add a stray caam process to the tree.

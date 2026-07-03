@@ -105,10 +105,10 @@ func newShallowTestRoot() *cobra.Command {
 		Args: shallowProfileCreateCmd.Args,
 		RunE: shallowProfileCreateCmd.RunE,
 	}
+	create.Flags().String("tool", "", "")
 	create.Flags().String("from-vault", "", "")
 	create.Flags().String("from-file", "", "")
 	create.Flags().String("from-claude-json", "", "")
-	create.Flags().String("tool", "", "")
 	create.Flags().Bool("force", false, "")
 	create.Flags().Bool("json", false, "")
 
@@ -390,6 +390,34 @@ func TestShallowSpawnUnknownProfile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestShallowSpawnFailsClosedOnIndeterminateProvider verifies that shallow-spawn
+// refuses to run (rather than silently assuming the Claude env-isolation policy)
+// when a profile's provider can be neither read from metadata nor inferred from
+// disk — the fail-closed behavior added for issue #43.
+func TestShallowSpawnFailsClosedOnIndeterminateProvider(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	// Break the profile so its provider is indeterminate: remove the metadata
+	// sidecar and the real .claude layout so on-disk inference has nothing to
+	// latch onto.
+	profHome := filepath.Join(base, "alice")
+	if err := os.Remove(filepath.Join(profHome, ".caam-shallow.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(profHome, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true")
+	if err == nil {
+		t.Fatalf("expected shallow-spawn to fail closed on an indeterminate provider")
+	}
+	if !strings.Contains(err.Error(), "no recorded provider") {
+		t.Fatalf("unexpected error (want fail-closed refusal): %v", err)
 	}
 }
 
@@ -803,10 +831,8 @@ func TestShallowSpawnCodexDaemonWarningWithoutReload(t *testing.T) {
 	}
 }
 
-// TestShallowSpawnPrintEnvAgy verifies the agy --print-env output sets only
-// HOME/SHALLOW_PROFILE and UNSETS GEMINI_HOME (agy has no ProviderEnvSet —
-// the redirected HOME alone is enough, so GEMINI_HOME must be cleared, not
-// repointed, unlike codex's CODEX_HOME).
+// TestShallowSpawnPrintEnvAgy verifies the agy --print-env output pins the
+// provider home inside the shallow HOME and unsets unrelated provider vars.
 func TestShallowSpawnPrintEnvAgy(t *testing.T) {
 	base, _ := shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "agy-alice",
@@ -821,7 +847,7 @@ func TestShallowSpawnPrintEnvAgy(t *testing.T) {
 	mustContain := []string{
 		"export HOME='" + homePath + "'",
 		"export SHALLOW_PROFILE='agy-alice'",
-		"unset GEMINI_HOME",
+		"export GEMINI_HOME='" + filepath.Join(homePath, ".gemini") + "'",
 		"unset CLAUDE_CONFIG_DIR",
 		"unset CODEX_HOME",
 		"unset CAAM_HOME",
@@ -831,13 +857,13 @@ func TestShallowSpawnPrintEnvAgy(t *testing.T) {
 			t.Fatalf("print-env missing %q in:\n%s", want, stdout)
 		}
 	}
-	if strings.Contains(stdout, "export GEMINI_HOME") {
-		t.Fatalf("agy must not set GEMINI_HOME explicitly; got:\n%s", stdout)
+	if strings.Contains(stdout, "unset GEMINI_HOME") {
+		t.Fatalf("agy must not unset GEMINI_HOME after explicitly setting it; got:\n%s", stdout)
 	}
 }
 
-// TestShallowSpawnAgyStripsLeakyEnv asserts the exec env redirects HOME to the
-// shallow agy dir and clears an inherited GEMINI_HOME rather than leaking it.
+// TestShallowSpawnAgyStripsLeakyEnv asserts the exec env redirects HOME and
+// GEMINI_HOME to the shallow agy profile rather than leaking inherited values.
 func TestShallowSpawnAgyStripsLeakyEnv(t *testing.T) {
 	base, _ := shallowEnv(t)
 	t.Setenv("GEMINI_HOME", "/bogus")
@@ -862,11 +888,16 @@ func TestShallowSpawnAgyStripsLeakyEnv(t *testing.T) {
 	}
 
 	wantHome := "HOME=" + filepath.Join(base, "agy-alice")
+	wantGeminiHome := "GEMINI_HOME=" + filepath.Join(base, "agy-alice", ".gemini")
 	foundHome := false
-	forbidden := map[string]bool{"GEMINI_HOME": false, "CODEX_HOME": false, "CAAM_HOME": false}
+	foundGeminiHome := false
+	forbidden := map[string]bool{"CODEX_HOME": false, "CAAM_HOME": false}
 	for _, e := range gotEnv {
 		if e == wantHome {
 			foundHome = true
+		}
+		if e == wantGeminiHome {
+			foundGeminiHome = true
 		}
 		if idx := strings.IndexByte(e, '='); idx > 0 {
 			if _, ok := forbidden[e[:idx]]; ok {
@@ -876,6 +907,9 @@ func TestShallowSpawnAgyStripsLeakyEnv(t *testing.T) {
 	}
 	if !foundHome {
 		t.Fatalf("env missing %s; got %v", wantHome, gotEnv)
+	}
+	if !foundGeminiHome {
+		t.Fatalf("env missing %s; got %v", wantGeminiHome, gotEnv)
 	}
 	for k, present := range forbidden {
 		if present {
@@ -1251,6 +1285,7 @@ func TestShallowPrintEnvGolden(t *testing.T) {
 		"unset CODEX_API_KEY",
 		"unset GEMINI_HOME",
 		"unset OPENAI_API_KEY",
+		"unset XDG_DATA_HOME",
 	}
 	sort.Strings(wantCodex)
 	if got := normalize(codexOut); !equalStringSlices(got, wantCodex) {
@@ -1284,6 +1319,7 @@ func TestShallowPrintEnvGolden(t *testing.T) {
 		"unset CODEX_SQLITE_HOME",
 		"unset GEMINI_HOME",
 		"unset OPENAI_API_KEY",
+		"unset XDG_DATA_HOME",
 	}
 	sort.Strings(wantClaude)
 	if got := normalize(claudeOut); !equalStringSlices(got, wantClaude) {

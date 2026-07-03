@@ -41,6 +41,7 @@ daemon:
 
 	env := os.Environ()
 	env = append(env, "GO_WANT_DAEMON_HELPER=1")
+	env = append(env, fmt.Sprintf("XDG_DATA_HOME=%s", rootDir))
 	env = append(env, fmt.Sprintf("XDG_CONFIG_HOME=%s", rootDir))
 	// Critical: Set CAAM_HOME so LoadSPMConfig finds the isolated config.yaml
 	env = append(env, fmt.Sprintf("CAAM_HOME=%s", configDir))

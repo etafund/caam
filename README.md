@@ -144,21 +144,26 @@ Each profile gets its own `$HOME` and `$CODEX_HOME` with symlinks to your real `
 
 ### 3. Shallow Profiles (Concurrent Multi-Account Multiplexing)
 
-A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel sessions across N subscription accounts on the same machine. Supports **Claude Code**, **Codex**, and **Antigravity (`agy`)** (the engine is built around a provider-keyed layout registry, so a new harness drops in as one descriptor).
+A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everything else is a symlink back to your real `~/`**. Designed for orchestrators that fan N parallel agent sessions across N accounts on the same machine.
+
+**Supported providers:** `claude`, `codex`, and `agy` (Antigravity). Each provider keeps only *its own* identity files real and private; everything else symlinks back to your real `~/`. The provider is inferred from `--from-vault <tool>/<profile>`, or set explicitly with `--tool claude|codex|agy` (defaults to `claude`). On spawn, caam repoints `HOME` at the shallow profile and pins the provider's home var (`CODEX_HOME` / `GEMINI_HOME`) so a stray inherited value can't pull the real identity back in.
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
 caam backup claude alice@example.com
 caam backup codex  bob@example.com
+caam backup agy    carol@example.com
 
 # Create a shallow profile per identity. The provider is INFERRED from the vault
 # spec, so no --tool flag is needed for --from-vault:
 caam shallow-profile create alice --from-vault claude/alice@example.com   # → claude
 caam shallow-profile create bob   --from-vault codex/bob@example.com      # → codex
+caam shallow-profile create carol --from-vault agy/carol@example.com      # → agy
 
 # Spawn concurrent sessions, each pinned to its own identity and provider.
 caam shallow-spawn alice -- claude  &   # session 1, alice's Claude quota
-caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex quota
+caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex identity
+caam shallow-spawn carol -- agy     &   # session 3, carol's Antigravity identity
 wait
 ```
 
@@ -179,7 +184,15 @@ caam shallow-profile create scratch                                            #
 | `.claude/.credentials.lock` | **real file**, `0600` | Per-identity flock target so two sessions don't serialize on a shared lock. |
 | `.claude.json` | **real file**, `0600` | Claude Code rewrites this on every run; a symlink would mutate the user's real settings under the shallow identity. |
 | `.claude/projects/`, `.claude/todos/`, `.claude/shell-snapshots/` | symlink → `~/.claude/...` | Conversation history is shared. |
-| `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.codex/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
+| `.bashrc`, `.zshrc`, `.gitconfig`, `.ssh/`, `.cargo/`, `.bun/`, `.config/`, `.docker/`, ... | symlink → `~/...` | Dev tooling, shell, git, ssh — all pass through. |
+
+Per-provider real (private) files — everything else under the provider's home is symlinked through, so non-auth state (sessions, history, caches) stays shared:
+
+| Provider | Real / private files | Spawn pins |
+|----------|----------------------|------------|
+| `claude` | `.claude/.credentials.json`, `.claude/.credentials.lock`, `.claude.json` | scrubs `CLAUDE_CONFIG_DIR` |
+| `codex`  | `.codex/auth.json`, `.codex/config.toml` (file credential store enforced) | `CODEX_HOME=<profile>/.codex` |
+| `agy`    | `.gemini/antigravity-cli/antigravity-oauth-token` (+ optional `.gemini/google_accounts.json`, `.gemini/oauth_creds.json`, `.gemini/antigravity-cli/settings.json`) | `GEMINI_HOME=<profile>/.gemini` |
 
 **Codex layout** under `<base>/<name>/`:
 
@@ -274,7 +287,7 @@ wait
 
 | Tool | Auth Location | Login Command |
 |------|--------------|---------------|
-| **Claude Code** | OAuth: `~/.claude.json` + `~/.config/claude-code/auth.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
+| **Claude Code** | OAuth: `~/.claude/.credentials.json` + `~/.claude.json` + `~/.config/claude-code/auth.json` + (macOS) `~/Library/Application Support/Claude/config.json` • API key: `~/.claude/settings.json` | `/login` in CLI |
 | **Codex CLI** | `~/.codex/auth.json` (file store enforced) | `codex login` (or `--device-auth`) |
 | **Antigravity CLI** | OAuth: `~/.gemini/antigravity-cli/antigravity-oauth-token` (+ `~/.gemini/google_accounts.json`) | `agy` interactive (Google OAuth) |
 | **Gemini CLI** (legacy) | OAuth: `~/.gemini/settings.json` (+ `oauth_creds.json`) • API key: `~/.gemini/.env` | `gemini` interactive |
@@ -284,9 +297,11 @@ wait
 **Subscription:** Claude Max ($200/month)
 
 **Auth Files:**
-- `~/.claude.json` — Main authentication token
+- `~/.claude/.credentials.json` — Claude Code OAuth credentials (primary)
+- `~/.claude.json` — Session/account state
 - `~/.config/claude-code/auth.json` — Secondary auth data
 - `~/.claude/settings.json` — API key mode via `apiKeyHelper`
+- `~/Library/Application Support/Claude/config.json` — macOS: Claude Desktop's encrypted OAuth token cache (only its `oauth:tokenCache*` fields are tracked, so recent Claude Code builds can't reassert the previous account after a switch)
 
 **Login Command:** Inside Claude Code, type `/login`
 

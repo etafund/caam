@@ -37,6 +37,17 @@ import (
 // shallow profile was created and which credential source was used.
 const ProfileMetaFilename = ".caam-shallow.json"
 
+// reservedDirPrefix marks caam's own transient working directories (build
+// staging and swap backups) inside the shallow base dir. Entries with this
+// prefix are internal scaffolding, never a user profile: List() hides them and
+// Create() refuses to mint a profile whose name would collide with them.
+const reservedDirPrefix = ".caam-tmp-"
+
+const (
+	stagingDirPrefix = reservedDirPrefix + "staging-"
+	backupDirPrefix  = reservedDirPrefix + "backup-"
+)
+
 // alwaysSkip lists top-level entries in the user's real HOME that should
 // NEVER be symlinked. We never want to recursively expose the real HOME
 // inside the shallow HOME, and we never want to capture leftover orch-homes
@@ -211,7 +222,7 @@ var credentialOverrideEnvVars = []string{
 // tool/script in a shallow shell isn't *handed* a pointer to the vault/profiles via
 // the environment. This is a courtesy, NOT a boundary: per the threat model a
 // same-UID process can read the vault regardless (it's the same user).
-var caamDiscoveryEnvVars = []string{"CAAM_HOME", "CAAM_SHALLOW_HOMES_DIR"}
+var caamDiscoveryEnvVars = []string{"CAAM_HOME", "CAAM_SHALLOW_HOMES_DIR", "XDG_DATA_HOME"}
 
 func clearedEnvVars() []string {
 	out := append([]string{}, repointingEnvVars...)
@@ -617,12 +628,12 @@ func AgyLayout() Layout {
 			{VaultName: "settings.json", DestRel: ".gemini/antigravity-cli/settings.json"},
 		},
 		InnerSymlinkRoots: []string{".gemini", ".gemini/antigravity-cli"},
-		// No ProviderEnvSet: GEMINI_HOME is already in repointingEnvVars, so it's
-		// cleared on every spawn; the redirected HOME alone then makes agy's own
-		// geminiHome() resolve to <home>/.gemini, same as claude needs nothing extra
-		// beyond the HOME redirect. No CreateManagedFiles: agy has no non-credential
-		// real file (no lock file, no config.toml) — all of its real files above are
-		// Credentials entries, so the generic provisioning path covers them.
+		ProviderEnvSet: func(home string) []EnvVar {
+			return []EnvVar{{Key: "GEMINI_HOME", Value: filepath.Join(home, ".gemini")}}
+		},
+		// No CreateManagedFiles: agy has no non-credential real file (no lock file,
+		// no config.toml) — all of its real files above are Credentials entries, so
+		// the generic provisioning path covers them.
 	}
 }
 
@@ -850,8 +861,12 @@ type CreateOptions struct {
 }
 
 // Create provisions a new shallow profile.
-func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retErr error) {
-	provider, err := NormalizeProvider(opts.Provider) // user-input default: "" → claude
+//
+// Create is crash- and failure-safe with respect to an existing profile of the
+// same name (--force): it builds the entire replacement in a staging directory
+// first and only swaps it into place once it is fully built.
+func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
+	provider, err := NormalizeProvider(opts.Provider) // user-input default: "" -> claude
 	if err != nil {
 		return "", err
 	}
@@ -865,28 +880,33 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		return "", fmt.Errorf("--from-claude-json is only valid for provider claude (got %q)", provider)
 	}
 	if opts.CredentialSourceDir != "" && opts.CredentialSource != "" {
-		// Engine-level guard (the CLI also makes --from-vault/--from-file mutually
-		// exclusive). Manager.Create is a package API; bad callers must fail loudly.
 		return "", fmt.Errorf("CredentialSourceDir and CredentialSource are mutually exclusive")
 	}
 
-	home, err := m.HomeFor(name)
+	clean, err := validateProfileName(name)
 	if err != nil {
 		return "", err
 	}
+	if strings.HasPrefix(clean, reservedDirPrefix) {
+		return "", fmt.Errorf("invalid profile name %q: the %q prefix is reserved for caam's internal use", name, reservedDirPrefix)
+	}
+	home := filepath.Join(m.baseDir, clean)
+	if m.wouldRemoveRealHome(home) {
+		return "", fmt.Errorf("refusing to use %q as a shallow profile home: it contains your real HOME directory (%q)", home, m.realHome)
+	}
 
-	// Preflight source paths BEFORE the --force RemoveAll below. Otherwise a bad
-	// --from-file / --from-claude-json / --from-vault path would destroy the
-	// existing profile and THEN fail in provisionCredentials/CreateManagedFiles,
-	// leaving the user with nothing. (provisionCredentials still does the real
-	// copy later; this is purely a "fail before we delete anything" check.)
+	// Preflight everything that could fail after moving an existing profile aside.
 	if err := m.preflightSources(home, layout, opts); err != nil {
 		return "", err
 	}
+	if err := m.assertRealHomeReadable(); err != nil {
+		return "", err
+	}
+	if err := m.assertInnerRootsReadable(layout); err != nil {
+		return "", err
+	}
 
-	// Existing-dir + --force handling: reject a symlinked profile path (identity
-	// hijack), and the --force RemoveAll must only delete a genuine shallow profile,
-	// never an arbitrary path reached via a symlinked base.
+	exists := false
 	if st, err := os.Lstat(home); err == nil {
 		if st.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("shallow profile %q is a symlink; refusing (potential identity hijack)", name)
@@ -900,23 +920,6 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		if err := m.assertIsShallowProfile(home); err != nil {
 			return "", err
 		}
-		// Catastrophic-blast guard: never let a --force RemoveAll target the real
-		// HOME. A pathological --base $(dirname $HOME) + name $(basename $HOME) with a
-		// stray ~/.caam-shallow.json present would otherwise satisfy
-		// assertIsShallowProfile and delete the entire real HOME. Compare BOTH the
-		// lexical-cleaned forms AND the symlink-resolved forms, so a symlink-equivalent
-		// spelling of the real HOME is caught too. (Mirrors Delete's real-HOME guard.)
-		if m.wouldRemoveRealHome(home) {
-			return "", fmt.Errorf("refusing to remove %q: it contains your real HOME directory (%q)", home, m.realHome)
-		}
-		// FIX 2 (HOME binding): don't --force-overwrite a profile that belongs to a
-		// DIFFERENT HOME. The existing profile's meta records the RealHome it was
-		// created under; if that differs from the current m.realHome, the destructive
-		// RemoveAll + rebuild would be operating on another HOME's profile. Load the
-		// meta via the same sidecar assertIsShallowProfile just validated and refuse on
-		// mismatch BEFORE the RemoveAll. Fail closed: a present-but-unreadable sidecar
-		// means we cannot verify HOME ownership, so refuse to --force-overwrite rather
-		// than risk destroying another HOME's data.
 		meta, merr := readMeta(home)
 		if merr != nil {
 			return "", fmt.Errorf("shallow profile %q has unreadable metadata (%w); refusing to overwrite — remove %q manually if you intend to replace it", name, merr, home)
@@ -924,74 +927,55 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
 			return "", err
 		}
-		// preflight that the real HOME is an existing, readable directory
-		// BEFORE the RemoveAll. populateSymlinks (run after RemoveAll) reads
-		// m.realHome; if it's missing/unreadable, that read fails AFTER the old
-		// profile is gone and the cleanup defer removes the half-built replacement,
-		// leaving the user with NOTHING. Fail here instead, while the old profile
-		// still exists.
-		if err := m.assertRealHomeReadable(); err != nil {
-			return "", err
-		}
-		// FIX 1: also preflight each InnerSymlinkRoot SOURCE in the real HOME
-		// (e.g. ~/.claude, ~/.codex). populateInnerSymlinks (run AFTER the RemoveAll)
-		// os.ReadDir's these; an unreadable inner root (e.g. chmod 000 ~/.claude)
-		// would fail AFTER the old profile is gone — old profile lost. Check it here,
-		// with EXACTLY populateInnerSymlinks's missing/ENOTDIR/non-dir tolerance, so
-		// the failure leaves the existing profile intact.
-		if err := m.assertInnerRootsReadable(layout); err != nil {
-			return "", err
-		}
-		if err := os.RemoveAll(home); err != nil {
-			return "", fmt.Errorf("remove existing profile: %w", err)
-		}
+		exists = true
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", fmt.Errorf("stat profile dir: %w", err)
 	}
 
+	if err := os.MkdirAll(m.baseDir, 0o700); err != nil {
+		return "", fmt.Errorf("create base dir: %w", err)
+	}
+	staging, err := os.MkdirTemp(m.baseDir, stagingDirPrefix+clean+"-")
+	if err != nil {
+		return "", fmt.Errorf("create staging dir: %w", err)
+	}
+	if err := m.buildProfile(staging, name, layout, opts); err != nil {
+		_ = m.removeInternalTempDir(staging)
+		return "", err
+	}
+	if err := m.swapIntoPlace(staging, home, clean, exists); err != nil {
+		_ = m.removeInternalTempDir(staging)
+		return "", err
+	}
+	return home, nil
+}
+
+func (m *Manager) buildProfile(home, name string, layout Layout, opts CreateOptions) error {
 	if err := os.MkdirAll(home, 0o700); err != nil {
-		return "", fmt.Errorf("create profile dir: %w", err)
+		return fmt.Errorf("create profile dir: %w", err)
 	}
-
-	// Transactional hygiene: once we own a freshly-created (or just --force-cleared)
-	// `home`, remove the half-built profile on ANY later error, so a failed create
-	// never leaves a meta-less directory that blocks re-create and that shallow-spawn
-	// can't classify. The "exists && !force" early-return above happens BEFORE this
-	// defer is armed, so we never delete a profile we didn't just create.
-	defer func() {
-		if retErr != nil {
-			_ = os.RemoveAll(home)
-		}
-	}()
-
-	for _, d := range layout.RealDirs { // MkdirAll handles nested parents
+	for _, d := range layout.RealDirs {
 		if err := os.MkdirAll(filepath.Join(home, filepath.FromSlash(d)), 0o700); err != nil {
-			return "", fmt.Errorf("create real dir %s: %w", d, err)
+			return fmt.Errorf("create real dir %s: %w", d, err)
 		}
 	}
-
 	if err := m.populateSymlinks(home, layout); err != nil {
-		return "", fmt.Errorf("populate symlinks: %w", err)
+		return fmt.Errorf("populate symlinks: %w", err)
 	}
 	for _, root := range layout.InnerSymlinkRoots {
 		if err := m.populateInnerSymlinks(home, layout, root); err != nil {
-			return "", fmt.Errorf("populate %s symlinks: %w", root, err)
+			return fmt.Errorf("populate %s symlinks: %w", root, err)
 		}
 	}
-
 	if err := m.provisionCredentials(home, layout, opts); err != nil {
-		return "", err
+		return err
 	}
-
 	if layout.CreateManagedFiles != nil {
 		if err := layout.CreateManagedFiles(m, home, opts); err != nil {
-			return "", err
+			return err
 		}
 	}
 
-	// Post-create invariant: every real file the layout declares (RealFiles ∪ the
-	// credential dests, i.e. realFileSet minus the meta sidecar) must now exist as a
-	// REAL regular file with no symlinked ancestor inside the profile.
 	optionalDest := map[string]bool{}
 	for _, c := range layout.Credentials {
 		if !c.Primary && !c.Required {
@@ -1004,32 +988,71 @@ func (m *Manager) Create(name string, opts CreateOptions) (retHome string, retEr
 		}
 		abs := filepath.Join(home, filepath.FromSlash(f))
 		if err := assertNoSymlinkAncestor(home, abs); err != nil {
-			return "", fmt.Errorf("post-create %s: %w", f, err)
+			return fmt.Errorf("post-create %s: %w", f, err)
 		}
 		st, err := os.Lstat(abs)
 		if errors.Is(err, os.ErrNotExist) {
 			if optionalDest[f] {
-				continue // optional + absent = fine
+				continue
 			}
-			return "", fmt.Errorf("post-create: required managed file %s was not created", f)
+			return fmt.Errorf("post-create: required managed file %s was not created", f)
 		}
 		if err != nil || st.Mode()&os.ModeSymlink != 0 || !st.Mode().IsRegular() {
-			return "", fmt.Errorf("post-create: managed file %s is not a regular file", f)
+			return fmt.Errorf("post-create: managed file %s is not a regular file", f)
 		}
 	}
 
 	meta := Meta{
 		Name:           name,
-		Provider:       provider,
+		Provider:       layout.Provider,
 		CreatedAt:      time.Now().UTC(),
 		CredentialFrom: opts.CredentialFromLabel,
 		RealHome:       m.realHome,
 		Version:        2,
 	}
 	if err := writeMeta(home, &meta); err != nil {
-		return "", fmt.Errorf("write metadata: %w", err)
+		return fmt.Errorf("write metadata: %w", err)
 	}
-	return home, nil
+	return nil
+}
+
+func (m *Manager) removeInternalTempDir(path string) error {
+	base := filepath.Base(filepath.Clean(path))
+	if !strings.HasPrefix(base, reservedDirPrefix) {
+		return fmt.Errorf("refusing to remove non-caam temp dir %q", path)
+	}
+	if !pathEqualOrUnder(filepath.Clean(path), filepath.Clean(m.baseDir)) {
+		return fmt.Errorf("refusing to remove temp dir outside shallow base: %q", path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (m *Manager) swapIntoPlace(staging, home, clean string, exists bool) error {
+	if !exists {
+		if err := os.Rename(staging, home); err != nil {
+			return fmt.Errorf("activate new profile: %w", err)
+		}
+		return nil
+	}
+
+	backup, err := os.MkdirTemp(m.baseDir, backupDirPrefix+clean+"-")
+	if err != nil {
+		return fmt.Errorf("create backup dir: %w", err)
+	}
+	if err := os.Remove(backup); err != nil {
+		return fmt.Errorf("prepare backup slot: %w", err)
+	}
+	if err := os.Rename(home, backup); err != nil {
+		return fmt.Errorf("move existing profile aside: %w", err)
+	}
+	if err := os.Rename(staging, home); err != nil {
+		if rbErr := os.Rename(backup, home); rbErr != nil {
+			return fmt.Errorf("activate rebuilt profile: %w (original profile preserved at %s; restore failed: %v)", err, backup, rbErr)
+		}
+		return fmt.Errorf("activate rebuilt profile: %w (original profile restored)", err)
+	}
+	_ = m.removeInternalTempDir(backup)
+	return nil
 }
 
 // requiredCredCount returns how many of a layout's credentials are Required.
@@ -1379,6 +1402,143 @@ func allProviderReservedTops() map[string]bool {
 	return tops
 }
 
+// caamOwnedRoots returns absolute, cleaned paths of caam's own state roots that
+// must NEVER be reachable from inside a shallow profile — chiefly the credential
+// vault's data dir, the master store of EVERY stored account's tokens. If any of
+// these were symlinked into a profile, an agent pinned to identity A could read
+// and exfiltrate identities B and C through its own HOME (issue #41).
+//
+// The default vault lives at <realHome>/.local/share/caam/vault; we withhold the
+// whole <...>/caam data dir so the entire caam subtree — not just the vault — is
+// unreachable. The CAAM_HOME / XDG_DATA_HOME candidates mirror the precedence in
+// authfile.DefaultVaultPath so the relocated-vault variants are covered too.
+// Callers compare these both lexically and symlink-resolved (see mirrorEntry) so
+// a symlinked HOME component cannot hide the nesting.
+func (m *Manager) caamOwnedRoots() []string {
+	seen := map[string]bool{}
+	var roots []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if !seen[p] {
+			seen[p] = true
+			roots = append(roots, p)
+		}
+	}
+	// Default location, rooted at THIS manager's real HOME (which is what the
+	// farm mirrors) rather than os.UserHomeDir.
+	add(filepath.Join(m.realHome, ".local", "share", "caam"))
+	add(m.baseDir)
+	add(m.canonBase)
+	// Relocated-vault variants. We withhold ALL candidate caam roots regardless
+	// of precedence: whichever one actually holds the vault must be hidden, and
+	// over-withholding an empty caam dir is harmless.
+	if caamHome := strings.TrimSpace(os.Getenv("CAAM_HOME")); caamHome != "" {
+		add(caamHome)
+	}
+	if xdg := strings.TrimSpace(os.Getenv("XDG_DATA_HOME")); xdg != "" {
+		add(filepath.Join(xdg, "caam"))
+	}
+	if m.vaultRoot != "" {
+		add(m.vaultRoot)
+		if filepath.Base(m.vaultRoot) == "vault" {
+			add(filepath.Dir(m.vaultRoot))
+		}
+	}
+	return roots
+}
+
+// rootRel classifies how a real-HOME path relates to caam's own state roots.
+type rootRel int
+
+const (
+	rootUnrelated rootRel = iota // symlink wholesale (the normal passthrough)
+	rootEquals                   // path IS a caam root — withhold entirely
+	rootContains                 // path CONTAINS a caam root — carve it out
+)
+
+// classifyAgainstRoots reports how srcAbs relates to the caam-owned roots,
+// comparing both lexically and with symlinks resolved (a symlinked HOME
+// component must not hide the nesting — e.g. ~/.local -> /data/local while the
+// vault sits at /data/local/share/caam).
+func classifyAgainstRoots(srcAbs string, caamRoots []string) rootRel {
+	srcVariants := []string{filepath.Clean(srcAbs), canonical(srcAbs)}
+	rel := rootUnrelated
+	for _, root := range caamRoots {
+		for _, r := range []string{root, canonical(root)} {
+			for _, s := range srcVariants {
+				if s == r {
+					return rootEquals // strongest verdict
+				}
+				if isEqualOrAncestor(s, r) {
+					// s is a strict ancestor of a caam root: it must be carved.
+					rel = rootContains
+				}
+			}
+		}
+	}
+	return rel
+}
+
+// mirrorEntry places the real-HOME entry srcAbs into the profile at dstAbs.
+// Normally this is a single wholesale symlink (the "everything else is
+// symlinked" design). But a wholesale symlink of a directory that is, or
+// contains, one of caam's own state roots would expose the credential vault
+// through the profile HOME (issue #41), so:
+//   - if srcAbs IS a caam-owned root, it is withheld entirely (no symlink);
+//   - if srcAbs merely CONTAINS a caam-owned root, srcAbs is recreated as a real
+//     directory and its children are mirrored one level deeper, carving out the
+//     caam subtree while every sibling (e.g. ~/.local/bin, ~/.local/share/<app>)
+//     still passes through as a symlink.
+func (m *Manager) mirrorEntry(srcAbs, dstAbs string, caamRoots []string) error {
+	if st, err := os.Lstat(srcAbs); err == nil && st.Mode()&os.ModeSymlink != 0 && m.isProtectedSource(srcAbs) {
+		return nil
+	}
+	switch classifyAgainstRoots(srcAbs, caamRoots) {
+	case rootEquals:
+		return nil // withhold caam-owned root entirely
+	case rootContains:
+		return m.mirrorInto(srcAbs, dstAbs, caamRoots)
+	default:
+		return atomicSymlink(srcAbs, dstAbs)
+	}
+}
+
+// mirrorInto recreates srcDir as a real directory at dstDir and mirrors each of
+// its children via mirrorEntry. Recursion is bounded: it only runs for a dir
+// that strictly contains a caam root, and each step descends one level toward
+// the finite set of roots, bottoming out at rootEquals (withheld) or
+// rootUnrelated (symlinked).
+func (m *Manager) mirrorInto(srcDir, dstDir string, caamRoots []string) error {
+	if err := os.MkdirAll(dstDir, 0o700); err != nil {
+		return fmt.Errorf("create carve-out dir %s: %w", dstDir, err)
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", srcDir, err)
+	}
+	for _, e := range entries {
+		childSrc := filepath.Join(srcDir, e.Name())
+		childDst := filepath.Join(dstDir, e.Name())
+		if _, err := os.Lstat(childSrc); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue // vanished mid-iteration
+			}
+			return fmt.Errorf("stat %s: %w", childSrc, err)
+		}
+		if err := m.mirrorEntry(childSrc, childDst, caamRoots); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // populateSymlinks reads top-level entries in realHome and creates a symlink in
 // home for each, skipping names that collide with the layout's real files/dirs,
 // alwaysSkip, and the CAAM-owned roots (vault, base, $CAAM_HOME).
@@ -1409,12 +1569,13 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 	for t := range allProviderReservedTops() {
 		skip[t] = true
 	}
-	// Shadow CAAM-owned roots (the shallow base, $CAAM_HOME, and the vault root)
-	// when they nest under realHome — so no shallow HOME can reach the vault or
-	// another profile. caamShadowTops() subsumes the old base-dir nesting guard.
+	// Skip the shallow base itself, including when its existing ancestors resolve
+	// through a symlink under the real HOME. CAAM data/vault roots are handled by
+	// mirrorEntry below so safe siblings can still pass through.
 	for t := range m.caamShadowTops() {
 		skip[t] = true
 	}
+	caamRoots := m.caamOwnedRoots()
 
 	for _, e := range entries {
 		name := e.Name()
@@ -1423,17 +1584,6 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 		}
 		src := filepath.Join(m.realHome, name)
 		dst := filepath.Join(home, name)
-		// Don't create a DIRECT symlink whose target is (or contains/is inside) a
-		// CAAM-owned root (vault / base / $CAAM_HOME), so those aren't enumerable
-		// entries in the shallow HOME. In ADDITION to the caamShadowTops skip set
-		// above (which also covers the not-yet-existing by-name case). NOTE: this
-		// is not full path isolation — `..` traversal through ANY directory
-		// passthrough symlink (e.g. .ssh/../.local/share/caam) can still reach a
-		// protected root. That's accepted under the cooperative, not-a-sandbox
-		// model (see README "Limitations").
-		if m.isProtectedSource(src) {
-			continue
-		}
 		// If the source has vanished mid-iteration, skip silently.
 		if _, err := os.Lstat(src); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -1441,8 +1591,10 @@ func (m *Manager) populateSymlinks(home string, layout Layout) error {
 			}
 			return fmt.Errorf("stat source %s: %w", src, err)
 		}
-		if err := atomicSymlink(src, dst); err != nil {
-			return fmt.Errorf("symlink %s -> %s: %w", dst, src, err)
+		// Normally a wholesale symlink; mirrorEntry carves out caam's own state
+		// roots so the profile cannot read the master vault through its HOME.
+		if err := m.mirrorEntry(src, dst, caamRoots); err != nil {
+			return fmt.Errorf("mirror %s -> %s: %w", dst, src, err)
 		}
 	}
 	return nil
@@ -1596,8 +1748,6 @@ func (m *Manager) caamShadowTops() map[string]bool {
 	}
 	add(m.baseDir)
 	add(m.canonBase) // the shallow base (lexical + canonical)
-	add(os.Getenv("CAAM_HOME"))
-	add(m.vaultRoot) // configured vault root; defaulted in NewManager (never "")
 	return tops
 }
 
@@ -1702,6 +1852,20 @@ func pathEqualOrUnder(child, parent string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func isEqualOrAncestor(ancestor, child string) bool {
+	return pathEqualOrUnder(child, ancestor)
+}
+
+func canonical(p string) string {
+	if resolved, err := resolveExistingSymlinks(filepath.Clean(p)); err == nil {
+		return filepath.Clean(resolved)
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(p)
 }
 
 // sameFileOrUnderExisting reports whether `child` IS (the same inode/device as)
@@ -1986,6 +2150,11 @@ func (m *Manager) List() ([]Profile, error) {
 			continue
 		}
 		name := e.Name()
+		// Skip caam's own transient staging/backup scaffolding — these are not
+		// user profiles (they only exist mid-Create or after a crashed swap).
+		if strings.HasPrefix(name, reservedDirPrefix) {
+			continue
+		}
 		if _, err := validateProfileName(name); err != nil {
 			continue
 		}
