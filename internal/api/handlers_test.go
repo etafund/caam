@@ -241,7 +241,7 @@ func TestGetActivityReturnsRedactedRecentEvents(t *testing.T) {
 func TestGetCoordinators(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
-	coords, err := h.GetCoordinators(context.TODO())
+	coords, err := h.GetCoordinators(context.Background())
 	if err != nil {
 		t.Fatalf("GetCoordinators() error = %v", err)
 	}
@@ -271,7 +271,7 @@ func TestGetCoordinatorsQueriesConfiguredEndpoint(t *testing.T) {
 		Token:    "token-1",
 	}})
 
-	coords, err := h.GetCoordinators(context.TODO())
+	coords, err := h.GetCoordinators(context.Background())
 	if err != nil {
 		t.Fatalf("GetCoordinators() error = %v", err)
 	}

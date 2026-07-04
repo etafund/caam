@@ -449,7 +449,7 @@ func (h *Handlers) GetActivity(limit int) (*ActivityResponse, error) {
 // GetCoordinators returns live status for configured coordinator endpoints.
 func (h *Handlers) GetCoordinators(ctx context.Context) (*CoordinatorsResponse, error) {
 	if ctx == nil {
-		ctx = context.TODO()
+		ctx = context.Background()
 	}
 
 	resp := &CoordinatorsResponse{
