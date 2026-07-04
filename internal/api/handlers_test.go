@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 func TestFormatDuration(t *testing.T) {
@@ -60,8 +62,8 @@ func TestGetStatusWithNilDeps(t *testing.T) {
 	if status == nil {
 		t.Fatal("GetStatus() returned nil")
 	}
-	if status.Version == "" {
-		t.Error("GetStatus() version is empty")
+	if status.Version != version.Info() {
+		t.Fatalf("GetStatus() version = %q, want %q", status.Version, version.Info())
 	}
 	if status.Timestamp == "" {
 		t.Error("GetStatus() timestamp is empty")
@@ -98,12 +100,30 @@ func TestGetUsageWithNilDeps(t *testing.T) {
 	if usage == nil {
 		t.Fatal("GetUsage() returned nil")
 	}
-	if len(usage.Usage) != 0 {
-		t.Errorf("GetUsage() with nil deps should return empty, got %d entries", len(usage.Usage))
+	if usage.Metric != "health_error_count" {
+		t.Fatalf("Metric = %q, want health_error_count", usage.Metric)
+	}
+	if usage.Window != "1h" {
+		t.Fatalf("Window = %q, want 1h", usage.Window)
+	}
+	if len(usage.Entries) != 0 {
+		t.Errorf("GetUsage() with nil deps should return empty, got %d entries", len(usage.Entries))
 	}
 }
 
-func TestGetUsageOmitsUntrackedTotalCalls(t *testing.T) {
+func TestGetUsageRejectsUnknownTool(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	usage, err := h.GetUsage("unknown")
+	if err == nil || !strings.Contains(err.Error(), "unknown tool") {
+		t.Fatalf("GetUsage() error = %v, want unknown tool", err)
+	}
+	if usage != nil {
+		t.Fatalf("GetUsage() usage = %+v, want nil", usage)
+	}
+}
+
+func TestGetUsageReturnsHealthErrorCountersOnly(t *testing.T) {
 	tmpDir := t.TempDir()
 	vaultDir := filepath.Join(tmpDir, "vault")
 	if err := os.MkdirAll(filepath.Join(vaultDir, "codex", "work"), 0700); err != nil {
@@ -124,18 +144,21 @@ func TestGetUsageOmitsUntrackedTotalCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetUsage() error = %v", err)
 	}
-	if len(usage.Usage) != 1 {
-		t.Fatalf("GetUsage() entries = %d, want 1", len(usage.Usage))
+	if usage.Metric != "health_error_count" || usage.Window != "1h" {
+		t.Fatalf("usage metadata = %s/%s, want health_error_count/1h", usage.Metric, usage.Window)
 	}
-	entry := usage.Usage[0]
+	if len(usage.Entries) != 1 {
+		t.Fatalf("GetUsage() entries = %d, want 1", len(usage.Entries))
+	}
+	entry := usage.Entries[0]
 	if entry.Tool != "codex" || entry.Profile != "work" {
 		t.Fatalf("usage entry = %s/%s, want codex/work", entry.Tool, entry.Profile)
 	}
-	if entry.ErrorCount != 2 {
-		t.Fatalf("ErrorCount = %d, want 2", entry.ErrorCount)
+	if entry.HealthErrorCount1h != 2 {
+		t.Fatalf("HealthErrorCount1h = %d, want 2", entry.HealthErrorCount1h)
 	}
-	if entry.LastUsed != lastChecked.Format(time.RFC3339) {
-		t.Fatalf("LastUsed = %q, want %q", entry.LastUsed, lastChecked.Format(time.RFC3339))
+	if entry.LastChecked != lastChecked.Format(time.RFC3339) {
+		t.Fatalf("LastChecked = %q, want %q", entry.LastChecked, lastChecked.Format(time.RFC3339))
 	}
 
 	body, err := json.Marshal(usage)
@@ -145,12 +168,80 @@ func TestGetUsageOmitsUntrackedTotalCalls(t *testing.T) {
 	if strings.Contains(string(body), "total_calls") {
 		t.Fatalf("usage JSON contains untracked total_calls field: %s", body)
 	}
+	if strings.Contains(string(body), "last_used") {
+		t.Fatalf("usage JSON contains misleading last_used field: %s", body)
+	}
+}
+
+func TestGetActivityWithNilDB(t *testing.T) {
+	h := NewHandlers(nil, nil, nil)
+
+	activity, err := h.GetActivity(20)
+	if err != nil {
+		t.Fatalf("GetActivity() error = %v", err)
+	}
+	if activity == nil {
+		t.Fatal("GetActivity() returned nil")
+	}
+	if len(activity.Events) != 0 || activity.Count != 0 {
+		t.Fatalf("GetActivity() = %+v, want empty", activity)
+	}
+}
+
+func TestGetActivityReturnsRedactedRecentEvents(t *testing.T) {
+	db, err := caamdb.OpenAt(filepath.Join(t.TempDir(), "activity.db"))
+	if err != nil {
+		t.Fatalf("OpenAt: %v", err)
+	}
+	defer db.Close()
+
+	ts := time.Date(2026, 7, 3, 13, 0, 0, 0, time.UTC)
+	privateMarker := "must-not-leak"
+	if err := db.LogEvent(caamdb.Event{
+		Timestamp:   ts,
+		Type:        caamdb.EventActivate,
+		Provider:    "codex",
+		ProfileName: "work",
+		Details:     map[string]any{"private_detail": privateMarker},
+		Duration:    2 * time.Minute,
+	}); err != nil {
+		t.Fatalf("LogEvent: %v", err)
+	}
+
+	h := NewHandlers(nil, nil, db)
+	activity, err := h.GetActivity(10)
+	if err != nil {
+		t.Fatalf("GetActivity() error = %v", err)
+	}
+	if activity.Count != 1 || len(activity.Events) != 1 {
+		t.Fatalf("activity = %+v, want one event", activity)
+	}
+	event := activity.Events[0]
+	if event.Timestamp != ts.Format(time.RFC3339) {
+		t.Fatalf("Timestamp = %q, want %q", event.Timestamp, ts.Format(time.RFC3339))
+	}
+	if event.Type != caamdb.EventActivate || event.Tool != "codex" || event.Profile != "work" {
+		t.Fatalf("event identity = %+v, want activate codex/work", event)
+	}
+	if event.Message != "Activated codex/work" {
+		t.Fatalf("Message = %q, want activated message", event.Message)
+	}
+	if event.DurationSeconds != 120 {
+		t.Fatalf("DurationSeconds = %d, want 120", event.DurationSeconds)
+	}
+	body, err := json.Marshal(activity)
+	if err != nil {
+		t.Fatalf("Marshal activity: %v", err)
+	}
+	if strings.Contains(string(body), privateMarker) || strings.Contains(string(body), "details") {
+		t.Fatalf("activity JSON leaked raw details: %s", body)
+	}
 }
 
 func TestGetCoordinators(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
-	coords, err := h.GetCoordinators(context.Background())
+	coords, err := h.GetCoordinators(context.TODO())
 	if err != nil {
 		t.Fatalf("GetCoordinators() error = %v", err)
 	}
@@ -180,7 +271,7 @@ func TestGetCoordinatorsQueriesConfiguredEndpoint(t *testing.T) {
 		Token:    "token-1",
 	}})
 
-	coords, err := h.GetCoordinators(context.Background())
+	coords, err := h.GetCoordinators(context.TODO())
 	if err != nil {
 		t.Fatalf("GetCoordinators() error = %v", err)
 	}

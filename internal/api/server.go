@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -146,6 +147,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/profiles", s.authMiddleware(s.handleProfiles))
 	mux.HandleFunc("/api/v1/profiles/", s.authMiddleware(s.handleProfileAction))
 	mux.HandleFunc("/api/v1/usage", s.authMiddleware(s.handleUsage))
+	mux.HandleFunc("/api/v1/activity", s.authMiddleware(s.handleActivity))
 	mux.HandleFunc("/api/v1/coordinators", s.authMiddleware(s.handleCoordinators))
 	mux.HandleFunc("/api/v1/actions/activate", s.authMiddleware(s.handleActivate))
 	mux.HandleFunc("/api/v1/actions/backup", s.authMiddleware(s.handleBackup))
@@ -160,6 +162,11 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
+	defer func() {
+		if err := listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.logger.Warn("listener close failed", "error", err)
+		}
+	}()
 
 	s.httpServer = &http.Server{
 		Handler:      handler,
@@ -271,7 +278,9 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) jsonError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
+	if err := json.NewEncoder(w).Encode(map[string]string{"error": message}); err != nil {
+		s.logger.Error("json error encode failed", "error", err)
+	}
 }
 
 // jsonResponse writes a JSON response.
@@ -293,7 +302,7 @@ func decodeJSONRequest(w http.ResponseWriter, r *http.Request, dst interface{}) 
 	}
 
 	var extra struct{}
-	if err := dec.Decode(&extra); err != io.EOF {
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return fmt.Errorf("request body must contain only one JSON object")
 		}
@@ -393,7 +402,7 @@ func (s *Server) handleProfileAction(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleUsage returns usage statistics.
+// handleUsage returns health-derived error counters.
 func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -408,6 +417,22 @@ func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.jsonResponse(w, usage)
+}
+
+// handleActivity returns recent activity-log events.
+func (s *Server) handleActivity(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	activity, err := s.handlers.GetActivity(20)
+	if err != nil {
+		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.jsonResponse(w, activity)
 }
 
 // handleCoordinators returns coordinator status.
@@ -504,14 +529,10 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 
 	// Create client channel
 	clientCh := make(chan Event, 10)
-	s.sseMu.Lock()
-	s.sseClients[clientCh] = struct{}{}
-	s.sseMu.Unlock()
+	s.addSSEClient(clientCh)
 
 	defer func() {
-		s.sseMu.Lock()
-		delete(s.sseClients, clientCh)
-		s.sseMu.Unlock()
+		s.removeSSEClient(clientCh)
 		close(clientCh)
 	}()
 
@@ -542,6 +563,18 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+func (s *Server) addSSEClient(clientCh chan Event) {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	s.sseClients[clientCh] = struct{}{}
+}
+
+func (s *Server) removeSSEClient(clientCh chan Event) {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	delete(s.sseClients, clientCh)
 }
 
 // splitPath splits a URL path into segments.

@@ -4,10 +4,8 @@ import { motion } from "framer-motion";
 import {
   Home,
   Users,
-  Key,
   Settings,
   Activity,
-  RefreshCw,
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
@@ -22,11 +20,9 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { label: "Dashboard", href: "/", icon: Home },
-  { label: "Profiles", href: "/profiles", icon: Users },
-  { label: "Credentials", href: "/credentials", icon: Key },
-  { label: "Sync", href: "/sync", icon: RefreshCw },
-  { label: "Activity", href: "/activity", icon: Activity },
-  { label: "Settings", href: "/settings", icon: Settings },
+  { label: "Profiles", href: "/#profiles", icon: Users },
+  { label: "Activity", href: "/#activity", icon: Activity },
+  { label: "Diagnostics", href: "/debug", icon: Settings },
 ];
 
 export function Sidebar() {
@@ -77,11 +73,10 @@ export function Sidebar() {
       {/* Footer */}
       <div className="border-t border-border p-4">
         <div className="rounded-lg bg-surface-muted p-3">
-          <p className="text-xs text-muted">Connected Providers</p>
+          <p className="text-xs text-muted">Data source</p>
           <div className="mt-2 flex gap-2">
-            <Badge tone="accent">Claude</Badge>
-            <Badge tone="success">Codex</Badge>
-            <Badge tone="warning">Gemini</Badge>
+            <Badge tone="accent">Local API</Badge>
+            <Badge tone="neutral">Bearer token</Badge>
           </div>
         </div>
       </div>

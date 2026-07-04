@@ -28,7 +28,8 @@ ENDPOINTS:
   GET  /api/v1/profiles?tool=X  List profiles for a specific tool
   GET  /api/v1/profiles/X/Y     Get profile details
   DELETE /api/v1/profiles/X/Y   Delete a profile
-  GET  /api/v1/usage            Usage statistics
+  GET  /api/v1/usage            Health error counters
+  GET  /api/v1/activity         Recent activity log
   GET  /api/v1/coordinators     Coordinator status
   POST /api/v1/actions/activate Activate a profile
   POST /api/v1/actions/backup   Backup current auth to a profile
@@ -145,7 +146,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 	fmt.Println("  GET  /health              - Health check")
 	fmt.Println("  GET  /api/v1/status       - Overall status")
 	fmt.Println("  GET  /api/v1/profiles     - List profiles")
-	fmt.Println("  GET  /api/v1/usage        - Usage statistics")
+	fmt.Println("  GET  /api/v1/usage        - Health error counters")
+	fmt.Println("  GET  /api/v1/activity     - Recent activity log")
 	fmt.Println("  GET  /api/v1/events       - SSE live updates")
 	fmt.Println("  POST /api/v1/actions/*    - Actions (activate, backup)")
 	fmt.Println()
@@ -163,7 +165,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Graceful shutdown with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), 5*time.Second)
 	defer shutdownCancel()
 
 	if err := server.Stop(shutdownCtx); err != nil {

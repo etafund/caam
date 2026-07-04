@@ -13,12 +13,17 @@ import (
 	caamdb "github.com/Dicklesworthstone/coding_agent_account_manager/internal/db"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 const coordinatorProbeMaxBytes = 1 << 20
 
 type coordinatorHTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
+}
+
+func sameProfileName(a, b string) bool {
+	return strings.Compare(a, b) == 0
 }
 
 // Handlers provides the business logic for API endpoints.
@@ -102,18 +107,39 @@ type ProfileInfo struct {
 }
 
 // UsageResponse is the response for GET /usage.
+//
+// The route reports health-derived error counters. It deliberately does not
+// expose synthetic API-call totals or token usage because those are not tracked
+// by this API surface.
 type UsageResponse struct {
-	Tool   string       `json:"tool,omitempty"`
-	Period string       `json:"period"`
-	Usage  []UsageEntry `json:"usage"`
+	Tool    string       `json:"tool,omitempty"`
+	Window  string       `json:"window"`
+	Metric  string       `json:"metric"`
+	Entries []UsageEntry `json:"entries"`
 }
 
 // UsageEntry represents usage for a profile.
 type UsageEntry struct {
-	Tool       string `json:"tool"`
-	Profile    string `json:"profile"`
-	ErrorCount int    `json:"error_count"`
-	LastUsed   string `json:"last_used,omitempty"`
+	Tool               string `json:"tool"`
+	Profile            string `json:"profile"`
+	HealthErrorCount1h int    `json:"health_error_count_1h"`
+	LastChecked        string `json:"last_checked,omitempty"`
+}
+
+// ActivityResponse is the response for GET /activity.
+type ActivityResponse struct {
+	Events []ActivityEntry `json:"events"`
+	Count  int             `json:"count"`
+}
+
+// ActivityEntry represents a redacted activity-log event.
+type ActivityEntry struct {
+	Timestamp       string `json:"timestamp"`
+	Type            string `json:"type"`
+	Tool            string `json:"tool"`
+	Profile         string `json:"profile"`
+	Message         string `json:"message"`
+	DurationSeconds int64  `json:"duration_seconds,omitempty"`
 }
 
 // CoordinatorsResponse is the response for GET /coordinators.
@@ -180,7 +206,7 @@ var tools = map[string]func() authfile.AuthFileSet{
 // GetStatus returns overall caam status.
 func (h *Handlers) GetStatus() (*StatusResponse, error) {
 	resp := &StatusResponse{
-		Version:   "1.0.0",
+		Version:   version.Info(),
 		Timestamp: time.Now().Format(time.RFC3339),
 		Tools:     []ToolStatus{},
 	}
@@ -235,7 +261,7 @@ func (h *Handlers) GetProfiles(tool string) (*ProfilesResponse, error) {
 			pi := ProfileInfo{
 				Tool:     tool,
 				Name:     name,
-				Active:   name == activeProfile,
+				Active:   sameProfileName(name, activeProfile),
 				System:   authfile.IsSystemProfile(name),
 				Health:   h.getProfileHealth(tool, name),
 				Identity: h.getProfileIdentity(tool, name),
@@ -263,7 +289,7 @@ func (h *Handlers) GetProfiles(tool string) (*ProfilesResponse, error) {
 				pi := ProfileInfo{
 					Tool:     tool,
 					Name:     name,
-					Active:   name == activeProfile,
+					Active:   sameProfileName(name, activeProfile),
 					System:   authfile.IsSystemProfile(name),
 					Health:   h.getProfileHealth(tool, name),
 					Identity: h.getProfileIdentity(tool, name),
@@ -292,7 +318,7 @@ func (h *Handlers) GetProfile(tool, name string) (*ProfileInfo, error) {
 
 	found := false
 	for _, p := range profiles {
-		if p == name {
+		if sameProfileName(p, name) {
 			found = true
 			break
 		}
@@ -307,7 +333,7 @@ func (h *Handlers) GetProfile(tool, name string) (*ProfileInfo, error) {
 	return &ProfileInfo{
 		Tool:     tool,
 		Name:     name,
-		Active:   name == activeProfile,
+		Active:   sameProfileName(name, activeProfile),
 		System:   authfile.IsSystemProfile(name),
 		Health:   h.getProfileHealth(tool, name),
 		Identity: h.getProfileIdentity(tool, name),
@@ -331,12 +357,19 @@ func (h *Handlers) DeleteProfile(tool, name string) error {
 	return h.vault.Delete(tool, name)
 }
 
-// GetUsage returns usage statistics.
+// GetUsage returns health-derived usage counters.
 func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
+	if tool != "" {
+		if _, ok := tools[tool]; !ok {
+			return nil, fmt.Errorf("unknown tool: %s", tool)
+		}
+	}
+
 	resp := &UsageResponse{
-		Tool:   tool,
-		Period: "1h",
-		Usage:  []UsageEntry{},
+		Tool:    tool,
+		Window:  "1h",
+		Metric:  "health_error_count",
+		Entries: []UsageEntry{},
 	}
 
 	if h.healthStore == nil {
@@ -355,7 +388,7 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 	for _, t := range toolsToCheck {
 		profiles, err := h.vault.List(t)
 		if err != nil {
-			continue
+			return nil, err
 		}
 
 		for _, name := range profiles {
@@ -365,24 +398,58 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 			}
 
 			entry := UsageEntry{
-				Tool:       t,
-				Profile:    name,
-				ErrorCount: ph.ErrorCount1h,
+				Tool:               t,
+				Profile:            name,
+				HealthErrorCount1h: ph.ErrorCount1h,
 			}
 			if !ph.LastChecked.IsZero() {
-				entry.LastUsed = ph.LastChecked.Format(time.RFC3339)
+				entry.LastChecked = ph.LastChecked.Format(time.RFC3339)
 			}
-			resp.Usage = append(resp.Usage, entry)
+			resp.Entries = append(resp.Entries, entry)
 		}
 	}
 
 	return resp, nil
 }
 
+// GetActivity returns recent redacted activity-log events.
+func (h *Handlers) GetActivity(limit int) (*ActivityResponse, error) {
+	resp := &ActivityResponse{
+		Events: []ActivityEntry{},
+	}
+	if h.db == nil {
+		return resp, nil
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	events, err := h.db.ListRecentEvents(limit)
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range events {
+		entry := ActivityEntry{
+			Timestamp:       event.Timestamp.Format(time.RFC3339),
+			Type:            event.Type,
+			Tool:            event.Provider,
+			Profile:         event.ProfileName,
+			Message:         formatActivityMessage(event),
+			DurationSeconds: int64(event.Duration / time.Second),
+		}
+		resp.Events = append(resp.Events, entry)
+	}
+	resp.Count = len(resp.Events)
+	return resp, nil
+}
+
 // GetCoordinators returns live status for configured coordinator endpoints.
 func (h *Handlers) GetCoordinators(ctx context.Context) (*CoordinatorsResponse, error) {
 	if ctx == nil {
-		ctx = context.Background()
+		ctx = context.TODO()
 	}
 
 	resp := &CoordinatorsResponse{
@@ -552,7 +619,10 @@ func (h *Handlers) getProfileHealth(tool, name string) *HealthStatus {
 	}
 
 	ph, err := h.healthStore.GetProfile(tool, name)
-	if err != nil || ph == nil {
+	if err != nil {
+		ph = nil
+	}
+	if ph == nil {
 		return nil
 	}
 
@@ -613,13 +683,43 @@ func (h *Handlers) getProfileIdentity(tool, name string) *identity.Identity {
 	}
 
 	if err != nil {
-		return nil
+		id = nil
 	}
 
 	// Identity fields are already safe for API responses
 	// (no sensitive tokens are included in the Identity struct)
 
 	return id
+}
+
+func formatActivityMessage(event caamdb.Event) string {
+	target := strings.TrimSpace(event.Provider)
+	if profile := strings.TrimSpace(event.ProfileName); profile != "" {
+		if target != "" {
+			target += "/"
+		}
+		target += profile
+	}
+	if target == "" {
+		target = "profile"
+	}
+
+	switch event.Type {
+	case caamdb.EventActivate:
+		return fmt.Sprintf("Activated %s", target)
+	case caamdb.EventLogin:
+		return fmt.Sprintf("Logged in %s", target)
+	case caamdb.EventRefresh:
+		return fmt.Sprintf("Refreshed %s", target)
+	case caamdb.EventError:
+		return fmt.Sprintf("Recorded error for %s", target)
+	case caamdb.EventSwitch:
+		return fmt.Sprintf("Switched to %s", target)
+	case caamdb.EventDeactivate:
+		return fmt.Sprintf("Deactivated %s", target)
+	default:
+		return fmt.Sprintf("%s event for %s", event.Type, target)
+	}
 }
 
 // formatDuration formats a duration for display.

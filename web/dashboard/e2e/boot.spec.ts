@@ -16,12 +16,13 @@ test.describe("App Boot", () => {
 
     // Check for stat cards
     await expect(page.getByText("Active Profiles")).toBeVisible();
-    await expect(page.getByText("API Calls Today")).toBeVisible();
+    await expect(page.getByText("Health Errors (1h)")).toBeVisible();
 
     // Check for sidebar navigation
+    const navigation = page.getByRole("navigation");
     await expect(page.getByRole("link", { name: "Dashboard" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Profiles" })).toBeVisible();
-    await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
+    await expect(navigation.getByRole("link", { name: "Profiles" })).toBeVisible();
+    await expect(navigation.getByRole("link", { name: "Diagnostics" })).toBeVisible();
   });
 
   test("sidebar navigation highlights current page", async ({ page }) => {
@@ -36,7 +37,7 @@ test.describe("App Boot", () => {
     await page.goto("/");
 
     // Check for search input
-    const searchInput = page.getByPlaceholder("Search profiles, commands...");
+    const searchInput = page.getByPlaceholder("Filter profiles and activity...");
     await expect(searchInput).toBeVisible();
 
     // Type in search
@@ -48,8 +49,8 @@ test.describe("App Boot", () => {
     await page.goto("/");
 
     // Find quick action buttons
-    const switchProfileBtn = page.getByRole("button", { name: "Switch Profile" });
-    await expect(switchProfileBtn).toBeVisible();
-    await expect(switchProfileBtn).toBeEnabled();
+    const copyTokenBtn = page.getByRole("button", { name: "Copy Token Command" });
+    await expect(copyTokenBtn).toBeVisible();
+    await expect(copyTokenBtn).toBeEnabled();
   });
 });

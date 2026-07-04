@@ -120,6 +120,18 @@
   }
 }
 
+:root.dark {
+  --background: var(--color-neutral-950);
+  --foreground: var(--color-neutral-100);
+  --surface: var(--color-neutral-900);
+  --surface-muted: var(--color-neutral-800);
+  --border: var(--color-neutral-700);
+  --border-muted: var(--color-neutral-800);
+  --muted: var(--color-neutral-400);
+  --accent: var(--color-accent-500);
+  --accent-foreground: #ffffff;
+}
+
 /* --- Tailwind Theme Integration --- */
 @theme inline {
   --color-background: var(--background);

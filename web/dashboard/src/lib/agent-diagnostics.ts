@@ -60,7 +60,7 @@ export function collectAgentDiagnostics(env: EnvLike = process.env): AgentDiagno
       {
         path: "/",
         kind: "page",
-        purpose: "Main CAAM dashboard shell and current static UI state.",
+        purpose: "Main CAAM dashboard shell backed by the local authenticated API.",
       },
       {
         path: "/debug",
@@ -82,4 +82,3 @@ export function collectAgentDiagnostics(env: EnvLike = process.env): AgentDiagno
     },
   };
 }
-
