@@ -460,6 +460,23 @@ func TestSyncerContextCancellation(t *testing.T) {
 	}
 }
 
+func TestSyncerRecordFullSync(t *testing.T) {
+	state := NewSyncState(t.TempDir())
+	syncer := &Syncer{state: state}
+
+	before := time.Now()
+	syncer.RecordFullSync()
+	after := time.Now()
+
+	if state.Pool.LastFullSync.Before(before) || state.Pool.LastFullSync.After(after) {
+		t.Fatalf("LastFullSync = %v, want between %v and %v", state.Pool.LastFullSync, before, after)
+	}
+
+	var nilSyncer *Syncer
+	nilSyncer.RecordFullSync()
+	(&Syncer{}).RecordFullSync()
+}
+
 // TestDetermineSyncOperationBothNil tests determining operation when both are nil.
 func TestDetermineSyncOperationBothNil(t *testing.T) {
 	// This is a unit test for the logic, we'll test without actual SSH

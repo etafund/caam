@@ -28,6 +28,8 @@ type ProfileInfo struct {
 	TokenExpiry    time.Time
 	ErrorCount     int
 	Penalty        float64
+	SyncStatus     string // Optional sync state: synced, syncing, pending, error
+	SyncDetail     string // Optional short detail such as target machine or error summary
 }
 
 // ProfilesPanel renders the center panel showing profiles for the selected provider.
@@ -479,20 +481,24 @@ func (p *ProfilesPanel) View() string {
 		name     int
 		auth     int
 		status   int
+		sync     int
 		lastUsed int
 		account  int
 	}{
 		name:     18,
 		auth:     8,
 		status:   14,
+		sync:     13,
 		lastUsed: 12,
 		account:  16,
 	}
 
+	showSync := p.hasSyncStatus() && layout != "narrow"
 	switch layout {
 	case "compact":
 		colWidths.name = 22
 		colWidths.status = 14
+		colWidths.sync = 12
 		colWidths.lastUsed = 12
 		colWidths.auth = 0
 		colWidths.account = 0
@@ -510,8 +516,14 @@ func (p *ProfilesPanel) View() string {
 	} else if layout == "compact" {
 		columnCount = 3
 	}
+	if showSync {
+		columnCount++
+	}
 
 	sumWidths := colWidths.name + colWidths.status
+	if showSync {
+		sumWidths += colWidths.sync
+	}
 	if layout == "full" {
 		sumWidths += colWidths.auth + colWidths.lastUsed + colWidths.account
 	} else if layout == "compact" {
@@ -537,6 +549,9 @@ func (p *ProfilesPanel) View() string {
 		headerCells = append(headerCells, padRight("Auth", colWidths.auth))
 	}
 	headerCells = append(headerCells, padRight("Status", colWidths.status))
+	if showSync {
+		headerCells = append(headerCells, padRight("Sync", colWidths.sync))
+	}
 	if layout != "narrow" {
 		headerCells = append(headerCells, padRight("Last Used", colWidths.lastUsed))
 	}
@@ -580,6 +595,7 @@ func (p *ProfilesPanel) View() string {
 		paddedName := padRight(formatNameWithBadge(prof.Name, prof.Badge, colWidths.name-2), colWidths.name-2)
 		paddedStatusText := padRight(statusText, colWidths.status)
 		renderedStatus := statusBadgeStyle.Render(paddedStatusText)
+		syncText, syncStyle := p.formatProfileSyncStatus(prof, colWidths.sync)
 
 		rowParts := []string{indicator + paddedName}
 		if layout == "full" {
@@ -587,6 +603,9 @@ func (p *ProfilesPanel) View() string {
 			rowParts = append(rowParts, p.styles.RowMetadata.Render(padRight(prof.AuthMode, colWidths.auth)))
 		}
 		rowParts = append(rowParts, renderedStatus)
+		if showSync {
+			rowParts = append(rowParts, syncStyle.Render(padRight(syncText, colWidths.sync)))
+		}
 		if layout != "narrow" {
 			// Right-aligned time value
 			rowParts = append(rowParts, p.styles.RowMetadata.Render(padRight(lastUsed, colWidths.lastUsed)))
@@ -626,6 +645,50 @@ func (p *ProfilesPanel) View() string {
 		return p.styles.Border.Width(p.width - 2).Render(inner)
 	}
 	return p.styles.Border.Render(inner)
+}
+
+func (p *ProfilesPanel) hasSyncStatus() bool {
+	for _, prof := range p.profiles {
+		if prof.SyncStatus != "" || prof.SyncDetail != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ProfilesPanel) formatProfileSyncStatus(prof ProfileInfo, width int) (string, lipgloss.Style) {
+	label := strings.TrimSpace(prof.SyncStatus)
+	detail := strings.TrimSpace(prof.SyncDetail)
+	if label == "" && detail == "" {
+		return "-", p.styles.StatusMuted
+	}
+
+	style := p.styles.StatusMuted
+	switch strings.ToLower(label) {
+	case "synced", "ok", "complete":
+		label = "🟢 synced"
+		style = p.styles.StatusOK
+	case "syncing", "active", "running":
+		label = "🔄 syncing"
+		style = p.styles.StatusWarn
+	case "pending", "queued", "dirty":
+		label = "⚠️ pending"
+		style = p.styles.StatusWarn
+	case "error", "failed":
+		label = "🔴 error"
+		style = p.styles.StatusBad
+	default:
+		if label == "" {
+			label = detail
+			detail = ""
+		}
+	}
+
+	text := label
+	if detail != "" {
+		text += " " + detail
+	}
+	return truncateWithEllipsis(text, width), style
 }
 
 func emptyProfilesMessage(provider string) string {

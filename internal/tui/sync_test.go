@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // =============================================================================
@@ -707,6 +709,241 @@ func TestSyncPanelViewWithNonDefaultPort(t *testing.T) {
 
 	if !strings.Contains(view, "2222") {
 		t.Error("View should show non-default port number")
+	}
+}
+
+func TestSyncMachineDialogEnterMachineDetails(t *testing.T) {
+	dialog := newSyncMachineDialog("Add Sync Machine", nil)
+
+	dialog.inputs[0].SetValue("  work-laptop  ")
+	dialog.inputs[1].SetValue("  192.0.2.40  ")
+	dialog.inputs[2].SetValue("  2222  ")
+	dialog.inputs[3].SetValue("  alice  ")
+	dialog.inputs[4].SetValue("  ~/.ssh/caam  ")
+
+	values := syncDialogValuesFromMap(dialog.ValueMap())
+	if values.Name != "work-laptop" {
+		t.Fatalf("Name = %q, want trimmed work-laptop", values.Name)
+	}
+	if values.Address != "192.0.2.40" {
+		t.Fatalf("Address = %q, want trimmed 192.0.2.40", values.Address)
+	}
+	if values.Port != "2222" {
+		t.Fatalf("Port = %q, want trimmed 2222", values.Port)
+	}
+	if values.User != "alice" {
+		t.Fatalf("User = %q, want trimmed alice", values.User)
+	}
+	if values.KeyPath != "~/.ssh/caam" {
+		t.Fatalf("KeyPath = %q, want trimmed ~/.ssh/caam", values.KeyPath)
+	}
+}
+
+func TestSyncMachineEditDialogPrefillsMachineDetails(t *testing.T) {
+	machine := sync.NewMachine("desktop", "192.0.2.41")
+	machine.Port = 2200
+	machine.SSHUser = "bob"
+	machine.SSHKeyPath = "~/.ssh/desktop"
+
+	dialog := newSyncMachineDialog("Edit Sync Machine", machine)
+	values := dialog.ValueMap()
+
+	if values["Name"] != "desktop" {
+		t.Fatalf("Name field = %q, want desktop", values["Name"])
+	}
+	if values["Address"] != "192.0.2.41" {
+		t.Fatalf("Address field = %q, want 192.0.2.41", values["Address"])
+	}
+	if values["Port"] != "2200" {
+		t.Fatalf("Port field = %q, want 2200", values["Port"])
+	}
+	if values["User"] != "bob" {
+		t.Fatalf("User field = %q, want bob", values["User"])
+	}
+	if values["Key Path"] != "~/.ssh/desktop" {
+		t.Fatalf("Key Path field = %q, want ~/.ssh/desktop", values["Key Path"])
+	}
+}
+
+func TestModel_SyncAddDialogRequiresNameAndAddress(t *testing.T) {
+	m := New()
+	m.state = stateSyncAdd
+	m.syncAddDialog = newSyncMachineDialog("Add Sync Machine", nil)
+	m.syncAddDialog.inputs[0].SetValue("work-laptop")
+	m.syncAddDialog.inputs[1].SetValue("   ")
+	m.syncAddDialog.focused = len(m.syncAddDialog.inputs) - 1
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = model.(Model)
+
+	if cmd != nil {
+		t.Fatalf("invalid add dialog returned command")
+	}
+	if m.state != stateSyncAdd {
+		t.Fatalf("state = %v, want stateSyncAdd", m.state)
+	}
+	if m.syncAddDialog == nil {
+		t.Fatalf("dialog closed after invalid submit")
+	}
+	if want := "Name and address are required"; m.statusMsg != want {
+		t.Fatalf("statusMsg = %q, want %q", m.statusMsg, want)
+	}
+}
+
+func TestModel_SyncAddDialogEnterAddsWithoutConnectionTest(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("CAAM_HOME", tmpDir)
+
+	m := New()
+	m.state = stateSyncAdd
+	m.syncAddDialog = newSyncMachineDialog("Add Sync Machine", nil)
+	m.syncAddDialog.inputs[0].SetValue("work-laptop")
+	m.syncAddDialog.inputs[1].SetValue("192.0.2.42")
+	m.syncAddDialog.inputs[2].SetValue("2222")
+	m.syncAddDialog.inputs[3].SetValue("alice")
+	m.syncAddDialog.inputs[4].SetValue("~/.ssh/work")
+	m.syncAddDialog.focused = len(m.syncAddDialog.inputs) - 1
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = model.(Model)
+
+	if cmd == nil {
+		t.Fatalf("valid add dialog did not return add command")
+	}
+	if m.state != stateList {
+		t.Fatalf("state = %v, want stateList", m.state)
+	}
+	if m.syncAddDialog != nil {
+		t.Fatalf("add dialog remained open after submit")
+	}
+	if want := "Adding machine..."; m.statusMsg != want {
+		t.Fatalf("statusMsg = %q, want %q", m.statusMsg, want)
+	}
+
+	msg := cmd()
+	added, ok := msg.(syncMachineAddedMsg)
+	if !ok {
+		t.Fatalf("add command returned %T, want syncMachineAddedMsg", msg)
+	}
+	if added.err != nil {
+		t.Fatalf("add command error = %v", added.err)
+	}
+	if added.machine == nil {
+		t.Fatalf("add command returned nil machine")
+	}
+	if added.machine.Name != "work-laptop" {
+		t.Fatalf("machine name = %q, want work-laptop", added.machine.Name)
+	}
+	if added.machine.Address != "192.0.2.42" {
+		t.Fatalf("machine address = %q, want 192.0.2.42", added.machine.Address)
+	}
+	if added.machine.Port != 2222 {
+		t.Fatalf("machine port = %d, want 2222", added.machine.Port)
+	}
+	if added.machine.SSHUser != "alice" {
+		t.Fatalf("machine SSHUser = %q, want alice", added.machine.SSHUser)
+	}
+	if added.machine.SSHKeyPath != "~/.ssh/work" {
+		t.Fatalf("machine SSHKeyPath = %q, want ~/.ssh/work", added.machine.SSHKeyPath)
+	}
+}
+
+func TestModel_SyncStartedAndCompletedDriveProgressOverlay(t *testing.T) {
+	m := New()
+	m.syncPanel.Toggle()
+
+	model, cmd := m.Update(syncStartedMsg{machineID: "m1", machineName: "work-laptop"})
+	m = model.(Model)
+
+	if !m.syncPanel.Syncing() {
+		t.Fatalf("syncStartedMsg did not mark sync panel syncing")
+	}
+	if !strings.Contains(m.statusMsg, "Syncing work-laptop") {
+		t.Fatalf("statusMsg = %q, want syncing machine name", m.statusMsg)
+	}
+	if cmd == nil {
+		t.Fatalf("syncStartedMsg did not return spinner command")
+	}
+
+	model, _ = m.Update(syncCompletedMsg{
+		machineID:   "m1",
+		machineName: "work-laptop",
+		stats:       sync.SyncStats{Pushed: 1, Pulled: 2, Skipped: 3, Failed: 4},
+	})
+	m = model.(Model)
+
+	if m.syncPanel.Syncing() {
+		t.Fatalf("syncCompletedMsg left sync panel syncing")
+	}
+	for _, want := range []string{"Sync complete (work-laptop)", "1 pushed", "2 pulled", "3 skipped", "4 failed"} {
+		if !strings.Contains(m.statusMsg, want) {
+			t.Fatalf("statusMsg = %q, want substring %q", m.statusMsg, want)
+		}
+	}
+}
+
+func TestModel_SyncProfilesPanelPreservesProfileListStatus(t *testing.T) {
+	m := New()
+	m.providers = []string{"codex"}
+	m.activeProvider = 0
+	m.profiles = map[string][]Profile{
+		"codex": {
+			{Name: "primary", Provider: "codex", IsActive: true},
+			{Name: "backup", Provider: "codex", IsActive: false},
+		},
+	}
+	m.selectedProfileName = "primary"
+	m.healthStorage = nil
+
+	m.syncProfilesPanel()
+
+	if got := m.profilesPanel.Count(); got != 2 {
+		t.Fatalf("profile count = %d, want 2", got)
+	}
+	selected := m.profilesPanel.GetSelectedProfile()
+	if selected == nil {
+		t.Fatalf("selected profile is nil")
+	}
+	if selected.Name != "primary" {
+		t.Fatalf("selected profile = %q, want primary", selected.Name)
+	}
+	if !selected.IsActive {
+		t.Fatalf("selected profile did not preserve active status")
+	}
+	if selected.HealthStatus != health.StatusUnknown {
+		t.Fatalf("health status = %v, want unknown without health storage", selected.HealthStatus)
+	}
+}
+
+func TestProfilesPanelViewShowsSyncStatusWhenPopulated(t *testing.T) {
+	panel := NewProfilesPanel()
+	panel.SetProvider("codex")
+	panel.SetSize(120, 20)
+	panel.SetProfiles([]ProfileInfo{
+		{
+			Name:         "primary",
+			AuthMode:     "oauth",
+			LoggedIn:     true,
+			IsActive:     true,
+			HealthStatus: health.StatusHealthy,
+			SyncStatus:   "synced",
+			SyncDetail:   "lap",
+		},
+		{
+			Name:         "backup",
+			AuthMode:     "oauth",
+			LoggedIn:     true,
+			HealthStatus: health.StatusWarning,
+			SyncStatus:   "pending",
+			SyncDetail:   "desk",
+		},
+	})
+
+	view := panel.View()
+	for _, want := range []string{"Sync", "synced", "lap", "pending"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("profile panel view missing %q, got: %s", want, view)
+		}
 	}
 }
 

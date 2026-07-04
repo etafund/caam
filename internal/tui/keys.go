@@ -22,6 +22,7 @@ type keyMap struct {
 	Project key.Binding
 	Usage   key.Binding
 	Sync    key.Binding
+	SyncNow key.Binding
 	Export  key.Binding
 	Import  key.Binding
 	Palette key.Binding
@@ -98,6 +99,10 @@ func defaultKeyMap() keyMap {
 			key.WithKeys("S"),
 			key.WithHelp("S", "sync pool"),
 		),
+		SyncNow: key.NewBinding(
+			key.WithKeys("ctrl+s"),
+			key.WithHelp("ctrl+s", "sync now"),
+		),
 		Export: key.NewBinding(
 			key.WithKeys("E"),
 			key.WithHelp("E", "export vault"),
@@ -140,7 +145,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Left, k.Right},
 		{k.Enter, k.Backup, k.Delete, k.Edit},
 		{k.Login, k.Open, k.Search, k.Project, k.Usage},
-		{k.Sync, k.Export, k.Import},
+		{k.Sync, k.SyncNow, k.Export, k.Import},
 		{k.Help, k.Quit},
 	}
 }

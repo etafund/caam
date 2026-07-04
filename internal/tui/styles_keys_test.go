@@ -306,6 +306,7 @@ func TestDefaultKeyMap(t *testing.T) {
 		assertKeyBinding(t, km.Project, "Project")
 		assertKeyBinding(t, km.Usage, "Usage")
 		assertKeyBinding(t, km.Sync, "Sync")
+		assertKeyBinding(t, km.SyncNow, "SyncNow")
 		assertKeyBinding(t, km.Export, "Export")
 		assertKeyBinding(t, km.Import, "Import")
 	})
@@ -373,9 +374,20 @@ func TestKeyMapFullHelp(t *testing.T) {
 		t.Errorf("Secondary actions group should have 5 bindings, got %d", len(fullHelp[2]))
 	}
 
-	// Group 4: Advanced (Sync, Export, Import)
-	if len(fullHelp[3]) != 3 {
-		t.Errorf("Advanced group should have 3 bindings, got %d", len(fullHelp[3]))
+	// Group 4: Advanced (Sync, SyncNow, Export, Import)
+	if len(fullHelp[3]) != 4 {
+		t.Errorf("Advanced group should have 4 bindings, got %d", len(fullHelp[3]))
+	}
+
+	foundCtrlS := false
+	for _, binding := range fullHelp[3] {
+		if binding.Help().Key == "ctrl+s" {
+			foundCtrlS = true
+			break
+		}
+	}
+	if !foundCtrlS {
+		t.Errorf("Advanced group should include ctrl+s sync-now help")
 	}
 
 	// Group 5: General (Help, Quit)
@@ -407,6 +419,7 @@ func TestKeyBindingsHaveKeys(t *testing.T) {
 		{"Project", km.Project},
 		{"Usage", km.Usage},
 		{"Sync", km.Sync},
+		{"SyncNow", km.SyncNow},
 		{"Export", km.Export},
 		{"Import", km.Import},
 		{"Confirm", km.Confirm},
@@ -448,6 +461,7 @@ func TestKeyBindingsHaveHelp(t *testing.T) {
 		{"Project", km.Project, "set project association"},
 		{"Usage", km.Usage, "usage stats"},
 		{"Sync", km.Sync, "sync pool"},
+		{"SyncNow", km.SyncNow, "sync now"},
 		{"Export", km.Export, "export vault"},
 		{"Import", km.Import, "import bundle"},
 		{"Confirm", km.Confirm, "confirm"},

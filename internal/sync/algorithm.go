@@ -130,6 +130,14 @@ func (s *Syncer) Close() error {
 	return s.state.Save()
 }
 
+// RecordFullSync records that the current syncer completed a clean full sync.
+func (s *Syncer) RecordFullSync() {
+	if s == nil || s.state == nil || s.state.Pool == nil {
+		return
+	}
+	s.state.Pool.RecordFullSync()
+}
+
 // SyncWithMachine synchronizes all profiles with a single machine.
 func (s *Syncer) SyncWithMachine(ctx context.Context, m *Machine) ([]*SyncResult, error) {
 	results := []*SyncResult{}
@@ -557,29 +565,44 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 	}
 
 	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
+		_ = f.Close()
+		if cleanupErr := cleanupTempFile(tmpPath); cleanupErr != nil {
+			return fmt.Errorf("write temp file: %w; cleanup temp file: %v", err, cleanupErr)
+		}
 		return fmt.Errorf("write temp file: %w", err)
 	}
 
 	// Sync to disk before rename to ensure durability
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
+		_ = f.Close()
+		if cleanupErr := cleanupTempFile(tmpPath); cleanupErr != nil {
+			return fmt.Errorf("sync temp file: %w; cleanup temp file: %v", err, cleanupErr)
+		}
 		return fmt.Errorf("sync temp file: %w", err)
 	}
 
 	if err := f.Close(); err != nil {
-		os.Remove(tmpPath)
+		if cleanupErr := cleanupTempFile(tmpPath); cleanupErr != nil {
+			return fmt.Errorf("close temp file: %w; cleanup temp file: %v", err, cleanupErr)
+		}
 		return fmt.Errorf("close temp file: %w", err)
 	}
 
 	// Atomic rename
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		if cleanupErr := cleanupTempFile(tmpPath); cleanupErr != nil {
+			return fmt.Errorf("rename temp file: %w; cleanup temp file: %v", err, cleanupErr)
+		}
 		return fmt.Errorf("rename temp file: %w", err)
 	}
 
+	return nil
+}
+
+func cleanupTempFile(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
 }
 

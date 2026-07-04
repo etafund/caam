@@ -8,10 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/browser"
@@ -126,6 +129,9 @@ const (
 	stateEditProfile
 	stateSyncAdd
 	stateSyncEdit
+	stateSyncRemoveConfirm
+	stateSyncDetail
+	stateSyncLog
 	stateCommandPalette
 )
 
@@ -186,6 +192,23 @@ type Profile struct {
 type vaultProfileMeta struct {
 	Description string
 	Account     string
+}
+
+type syncLogLoadedMsg struct {
+	text string
+	err  error
+}
+
+type syncTestAndAddResultMsg struct {
+	values  syncMachineDialogValues
+	machine *sync.Machine
+	message string
+	err     error
+}
+
+type syncCSVEditorFinishedMsg struct {
+	path string
+	err  error
 }
 
 // Model is the main Bubble Tea model for the caam TUI.
@@ -256,6 +279,7 @@ type Model struct {
 	pendingSyncMachine  string
 	pendingEditProvider string
 	pendingEditProfile  string
+	syncLogText         string
 
 	// Command palette dialog
 	commandPalette *CommandPaletteDialog
@@ -357,6 +381,7 @@ func NewWithProvidersAndConfig(providers []string, cfg *config.SPMConfig) Model 
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		m.loadProfiles,
+		m.loadSyncState(),
 		m.loadProjectContext(),
 		m.initSignals(),
 	}
@@ -762,6 +787,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.syncPanel != nil {
 			m.syncPanel.SetState(msg.state)
 		}
+		m.syncProfilesPanel()
 		return m, nil
 
 	case syncMachineAddedMsg:
@@ -800,6 +826,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case syncTestAndAddResultMsg:
+		if msg.err != nil {
+			m.syncAddDialog = newSyncMachineDialogWithValues("Add Sync Machine", msg.values)
+			m.syncAddDialog.SetStyles(m.styles)
+			m.syncAddDialog.SetWidth(m.dialogWidth(m.syncAddDialog.width))
+			m.state = stateSyncAdd
+			m.statusMsg = "Test & add failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.syncAddDialog = nil
+		m.state = stateList
+		if msg.machine == nil {
+			m.statusMsg = "Machine added"
+			return m, m.loadSyncState()
+		}
+		if msg.message != "" {
+			m.statusMsg = "Machine added: " + msg.machine.Name + " (" + msg.message + ")"
+		} else {
+			m.statusMsg = "Machine added: " + msg.machine.Name
+		}
+		return m, m.loadSyncState()
+
 	case syncStartedMsg:
 		var spinnerCmd tea.Cmd
 		if m.syncPanel != nil {
@@ -833,6 +881,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				stats.Failed,
 			)
 		}
+		return m, m.loadSyncState()
+
+	case syncLogLoadedMsg:
+		if msg.err != nil {
+			m.syncLogText = "Failed to load sync history: " + msg.err.Error()
+		} else {
+			m.syncLogText = msg.text
+		}
+		return m, nil
+
+	case syncCSVEditorFinishedMsg:
+		if msg.err != nil {
+			m.statusMsg = "Edit sync CSV failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.statusMsg = "Edited sync CSV: " + msg.path
 		return m, m.loadSyncState()
 
 	case spinner.TickMsg:
@@ -1136,6 +1200,10 @@ func (m Model) mouseOverDetail(msg tea.MouseMsg) bool {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.SyncNow) {
+		return m.handleSyncNow()
+	}
+
 	// Usage panel overlay gets first crack at keys.
 	if m.usagePanel != nil && m.usagePanel.Visible() {
 		if msg.Type == tea.KeyEscape {
@@ -1165,11 +1233,6 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	// Sync panel overlay gets keys when visible.
-	if m.syncPanel != nil && m.syncPanel.Visible() {
-		return m.handleSyncPanelKeys(msg)
-	}
-
 	// Handle state-specific key handling
 	switch m.state {
 	case stateConfirm:
@@ -1194,8 +1257,19 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSyncAddKeys(msg)
 	case stateSyncEdit:
 		return m.handleSyncEditKeys(msg)
+	case stateSyncRemoveConfirm:
+		return m.handleSyncRemoveConfirmKeys(msg)
+	case stateSyncDetail:
+		return m.handleSyncDetailKeys(msg)
+	case stateSyncLog:
+		return m.handleSyncLogKeys(msg)
 	case stateCommandPalette:
 		return m.handleCommandPaletteKeys(msg)
+	}
+
+	// Sync panel overlay gets keys when visible.
+	if m.syncPanel != nil && m.syncPanel.Visible() {
+		return m.handleSyncPanelKeys(msg)
 	}
 
 	// Normal list view key handling
@@ -1616,6 +1690,20 @@ func (m Model) handleConfirmOverwriteKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m Model) handleSyncNow() (tea.Model, tea.Cmd) {
+	if m.syncPanel != nil && m.syncPanel.Syncing() {
+		m.statusMsg = "Sync already in progress"
+		return m, nil
+	}
+
+	var spinnerCmd tea.Cmd
+	if m.syncPanel != nil {
+		spinnerCmd = m.syncPanel.SetSyncing(true)
+	}
+	m.statusMsg = "Syncing all machines..."
+	return m, tea.Batch(spinnerCmd, m.syncAllMachines())
+}
+
 // handleSyncPanelKeys handles keys when the sync panel is visible.
 func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.syncPanel == nil {
@@ -1635,6 +1723,9 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.syncPanel.MoveDown()
 		return m, nil
 
+	case "enter":
+		return m.openSelectedSyncMachineDetails()
+
 	case "a":
 		m.syncAddDialog = newSyncMachineDialog("Add Sync Machine", nil)
 		m.syncAddDialog.SetStyles(m.styles)
@@ -1645,21 +1736,26 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "r":
 		if machine := m.syncPanel.SelectedMachine(); machine != nil {
-			return m, m.removeSyncMachine(machine.ID)
-		}
-		return m, nil
-
-	case "e":
-		if machine := m.syncPanel.SelectedMachine(); machine != nil {
 			m.pendingSyncMachine = machine.ID
-			m.syncEditDialog = newSyncMachineDialog("Edit Sync Machine", machine)
-			m.syncEditDialog.SetStyles(m.styles)
-			m.syncEditDialog.SetWidth(m.dialogWidth(m.syncEditDialog.width))
-			m.state = stateSyncEdit
+			m.confirmDialog = NewConfirmDialog(
+				"Remove Sync Machine",
+				fmt.Sprintf("Remove '%s' from the sync pool?", machine.Name),
+			)
+			m.confirmDialog.SetStyles(m.styles)
+			m.confirmDialog.SetLabels("Remove", "Cancel")
+			m.confirmDialog.SetDestructive(true)
+			m.confirmDialog.SetWidth(m.dialogWidth(56))
+			m.state = stateSyncRemoveConfirm
 			m.statusMsg = ""
 			return m, nil
 		}
 		return m, nil
+
+	case "e":
+		return m.openSyncCSVEditor()
+
+	case "m":
+		return m.openSelectedSyncMachineDialog()
 
 	case "t":
 		if machine := m.syncPanel.SelectedMachine(); machine != nil {
@@ -1677,11 +1773,131 @@ func (m Model) handleSyncPanelKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "l":
-		m.statusMsg = "View sync history via CLI: caam sync log"
-		return m, nil
+		return m.openSyncLog()
+
+	case "c":
+		return m.openSyncCSVEditor()
 	}
 
 	return m, nil
+}
+
+func (m Model) openSelectedSyncMachineDetails() (tea.Model, tea.Cmd) {
+	if m.syncPanel == nil || m.syncPanel.SelectedMachine() == nil {
+		m.statusMsg = "No sync machine selected"
+		return m, nil
+	}
+	m.state = stateSyncDetail
+	m.statusMsg = ""
+	return m, nil
+}
+
+func (m Model) openSelectedSyncMachineDialog() (tea.Model, tea.Cmd) {
+	if m.syncPanel == nil {
+		return m, nil
+	}
+	machine := m.syncPanel.SelectedMachine()
+	if machine == nil {
+		m.statusMsg = "No sync machine selected"
+		return m, nil
+	}
+	m.pendingSyncMachine = machine.ID
+	m.syncEditDialog = newSyncMachineDialog("Edit Sync Machine", machine)
+	m.syncEditDialog.SetStyles(m.styles)
+	m.syncEditDialog.SetWidth(m.dialogWidth(m.syncEditDialog.width))
+	m.state = stateSyncEdit
+	m.statusMsg = ""
+	return m, nil
+}
+
+func (m Model) handleSyncRemoveConfirmKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.confirmDialog == nil {
+		m.state = stateList
+		m.pendingSyncMachine = ""
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.confirmDialog, cmd = m.confirmDialog.Update(msg)
+
+	switch m.confirmDialog.Result() {
+	case DialogResultSubmit:
+		if m.confirmDialog.Confirmed() {
+			machineID := m.pendingSyncMachine
+			m.confirmDialog = nil
+			m.pendingSyncMachine = ""
+			m.state = stateList
+			m.statusMsg = "Removing machine..."
+			return m, m.removeSyncMachine(machineID)
+		}
+		m.confirmDialog = nil
+		m.pendingSyncMachine = ""
+		m.state = stateList
+		m.statusMsg = "Remove cancelled"
+		return m, nil
+	case DialogResultCancel:
+		m.confirmDialog = nil
+		m.pendingSyncMachine = ""
+		m.state = stateList
+		m.statusMsg = "Remove cancelled"
+		return m, nil
+	}
+
+	return m, cmd
+}
+
+func (m Model) openSyncLog() (tea.Model, tea.Cmd) {
+	m.state = stateSyncLog
+	m.syncLogText = "Loading sync history..."
+	m.statusMsg = ""
+	return m, m.loadSyncLog()
+}
+
+func (m Model) handleSyncDetailKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "enter", "m":
+		m.state = stateList
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) handleSyncLogKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "enter", "l":
+		m.state = stateList
+		m.syncLogText = ""
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m Model) openSyncCSVEditor() (tea.Model, tea.Cmd) {
+	csvPath := sync.CSVPath()
+	created, err := sync.EnsureCSVFile()
+	if err != nil {
+		m.statusMsg = "Create sync CSV failed: " + err.Error()
+		return m, nil
+	}
+
+	editorCmd, err := syncEditorCommand(csvPath)
+	if err != nil {
+		m.statusMsg = "Editor command invalid: " + err.Error()
+		return m, nil
+	}
+	if editorCmd == nil {
+		m.statusMsg = "No editor found; set EDITOR or VISUAL"
+		return m, nil
+	}
+
+	if created {
+		m.statusMsg = "Created sync CSV; opening editor: " + csvPath
+	} else {
+		m.statusMsg = "Opening sync CSV: " + csvPath
+	}
+	return m, tea.ExecProcess(editorCmd, func(err error) tea.Msg {
+		return syncCSVEditorFinishedMsg{path: csvPath, err: err}
+	})
 }
 
 // executeBackup performs the actual backup operation.
@@ -1962,6 +2178,10 @@ func newSyncMachineDialogWithValues(title string, values syncMachineDialogValues
 		{Label: "User", Placeholder: "ssh user (optional)", Value: values.User, Required: false},
 		{Label: "Key Path", Placeholder: "~/.ssh/id_rsa (optional)", Value: values.KeyPath, Required: false},
 	}
+	if strings.Contains(strings.ToLower(title), "add") {
+		fields[0].Hint = "Ctrl+T tests the connection before adding."
+		fields[1].Hint = "Ctrl+T tests the connection before adding."
+	}
 	dialog := NewMultiFieldDialog(title, fields)
 	dialog.SetWidth(64)
 	return dialog
@@ -1975,6 +2195,22 @@ func (m Model) handleSyncAddKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.syncAddDialog == nil {
 		m.state = stateList
 		return m, nil
+	}
+
+	if msg.String() == "ctrl+t" {
+		values := syncDialogValuesFromMap(m.syncAddDialog.ValueMap())
+		if values.Name == "" || values.Address == "" {
+			m.statusMsg = "Name and address are required"
+			m.syncAddDialog = newSyncMachineDialogWithValues("Add Sync Machine", values)
+			m.syncAddDialog.SetStyles(m.styles)
+			m.syncAddDialog.SetWidth(m.dialogWidth(m.syncAddDialog.width))
+			m.state = stateSyncAdd
+			return m, nil
+		}
+		m.syncAddDialog = nil
+		m.state = stateList
+		m.statusMsg = "Testing connection before adding " + values.Name + "..."
+		return m, m.testAndAddSyncMachine(values)
 	}
 
 	var cmd tea.Cmd
@@ -2042,6 +2278,233 @@ func (m Model) handleSyncEditKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, cmd
+}
+
+func syncMachineFromDialogValues(values syncMachineDialogValues) *sync.Machine {
+	machine := sync.NewMachine(values.Name, values.Address)
+	if values.Port != "" {
+		if port, err := strconv.Atoi(values.Port); err == nil && port > 0 {
+			machine.Port = port
+		}
+	}
+	machine.SSHUser = values.User
+	machine.SSHKeyPath = values.KeyPath
+	machine.Source = sync.SourceManual
+	return machine
+}
+
+func (m Model) testAndAddSyncMachine(values syncMachineDialogValues) tea.Cmd {
+	return func() tea.Msg {
+		machine := syncMachineFromDialogValues(values)
+		result := sync.TestMachineConnectivity(machine, sync.DefaultConnectOptions())
+		if !result.Success {
+			message := ""
+			if result.Error != nil {
+				message = result.Error.Error()
+			}
+			if strings.TrimSpace(message) == "" {
+				message = "connection test failed"
+			}
+			return syncTestAndAddResultMsg{values: values, err: fmt.Errorf("%s", message)}
+		}
+
+		state, err := sync.LoadSyncState()
+		if err != nil {
+			return syncTestAndAddResultMsg{values: values, err: err}
+		}
+		if err := state.Pool.AddMachine(machine); err != nil {
+			return syncTestAndAddResultMsg{values: values, err: err}
+		}
+		if err := state.Save(); err != nil {
+			return syncTestAndAddResultMsg{values: values, err: err}
+		}
+
+		message := fmt.Sprintf("latency: %v, SFTP: %v", result.Latency, result.SFTPWorks)
+		return syncTestAndAddResultMsg{values: values, machine: machine, message: message}
+	}
+}
+
+func (m Model) syncAllMachines() tea.Cmd {
+	return func() tea.Msg {
+		state, err := sync.LoadSyncState()
+		if err != nil {
+			return syncCompletedMsg{machineName: "all machines", err: err}
+		}
+		if state.Pool == nil {
+			return syncCompletedMsg{machineName: "all machines", err: fmt.Errorf("sync pool is not configured")}
+		}
+
+		machines := state.Pool.ListMachines()
+		if len(machines) == 0 {
+			return syncCompletedMsg{machineName: "all machines", err: fmt.Errorf("no machines in sync pool")}
+		}
+
+		syncer, err := sync.NewSyncer(sync.DefaultSyncerConfig())
+		if err != nil {
+			return syncCompletedMsg{machineName: "all machines", err: err}
+		}
+		defer syncer.Close()
+
+		var allResults []*sync.SyncResult
+		machineFailures := 0
+		for _, machine := range machines {
+			results, err := syncer.SyncWithMachine(context.Background(), machine)
+			if err != nil {
+				machineFailures++
+				continue
+			}
+			allResults = append(allResults, results...)
+		}
+
+		stats := sync.AggregateResults(allResults)
+		stats.Failed += machineFailures
+		stats.Total += machineFailures
+		if stats.Failed == 0 {
+			syncer.RecordFullSync()
+		}
+		return syncCompletedMsg{
+			machineName: "all machines",
+			stats:       stats,
+		}
+	}
+}
+
+func (m Model) loadSyncLog() tea.Cmd {
+	return func() tea.Msg {
+		state, err := sync.LoadSyncState()
+		if err != nil {
+			return syncLogLoadedMsg{err: err}
+		}
+		return syncLogLoadedMsg{text: formatSyncLog(state, 20)}
+	}
+}
+
+func formatSyncLog(state *sync.SyncState, limit int) string {
+	if state == nil || state.History == nil || len(state.History.Entries) == 0 {
+		return "No sync history yet."
+	}
+	if limit <= 0 {
+		limit = 20
+	}
+
+	entries := state.RecentHistory(limit)
+	if len(entries) == 0 {
+		return "No sync history yet."
+	}
+
+	var out strings.Builder
+	out.WriteString(fmt.Sprintf("Sync History (last %d entries)\n\n", len(entries)))
+	out.WriteString(fmt.Sprintf("%-19s  %-14s  %-22s  %-8s  %s\n", "Time", "Machine", "Profile", "Action", "Status"))
+	for _, entry := range entries {
+		status := "ok"
+		if !entry.Success {
+			status = "error"
+			if entry.Error != "" {
+				status += ": " + entry.Error
+			}
+		}
+		profile := strings.Trim(entry.Provider+"/"+entry.Profile, "/")
+		out.WriteString(fmt.Sprintf("%-19s  %-14s  %-22s  %-8s  %s\n",
+			entry.Timestamp.Format("2006-01-02 15:04:05"),
+			truncatePlain(entry.Machine, 14),
+			truncatePlain(profile, 22),
+			truncatePlain(entry.Action, 8),
+			status,
+		))
+	}
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func truncatePlain(value string, width int) string {
+	if width <= 0 || len(value) <= width {
+		return value
+	}
+	if width <= 1 {
+		return value[:width]
+	}
+	return value[:width-1] + "."
+}
+
+func syncEditorCommand(csvPath string) (*exec.Cmd, error) {
+	for _, env := range []string{"EDITOR", "VISUAL"} {
+		if editor := strings.TrimSpace(os.Getenv(env)); editor != "" {
+			parts, err := splitEditorCommand(editor)
+			if err != nil {
+				return nil, err
+			}
+			if len(parts) == 0 {
+				continue
+			}
+			args := append([]string{}, parts[1:]...)
+			args = append(args, csvPath)
+			return exec.CommandContext(context.Background(), parts[0], args...), nil
+		}
+	}
+	for _, editor := range []string{"nano", "vim", "vi"} {
+		exe, err := exec.LookPath(editor)
+		if err == nil {
+			return exec.CommandContext(context.Background(), exe, csvPath), nil
+		}
+	}
+	return nil, nil
+}
+
+func splitEditorCommand(command string) ([]string, error) {
+	var fields []string
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	inField := false
+
+	flush := func() {
+		if !inField {
+			return
+		}
+		fields = append(fields, current.String())
+		current.Reset()
+		inField = false
+	}
+
+	for _, r := range command {
+		if escaped {
+			current.WriteRune(r)
+			inField = true
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			inField = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+				continue
+			}
+			current.WriteRune(r)
+			inField = true
+			continue
+		}
+		switch {
+		case r == '\'' || r == '"':
+			quote = r
+			inField = true
+		case unicode.IsSpace(r):
+			flush()
+		default:
+			current.WriteRune(r)
+			inField = true
+		}
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quote in %s", command)
+	}
+	flush()
+	return fields, nil
 }
 
 // handleEnterSearchMode enters search/filter mode.
@@ -2407,6 +2870,8 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 		}
 	}
 
+	syncStatus, syncDetail := m.profileSyncDisplay(provider, p.Name)
+
 	return ProfileInfo{
 		Name:           p.Name,
 		Badge:          m.badgeFor(provider, p.Name),
@@ -2422,7 +2887,57 @@ func (m Model) buildProfileInfo(provider string, p Profile, projectDefault strin
 		TokenExpiry:    tokenExpiry,
 		ErrorCount:     errorCount,
 		Penalty:        penalty,
+		SyncStatus:     syncStatus,
+		SyncDetail:     syncDetail,
 	}
+}
+
+func (m Model) profileSyncDisplay(provider, name string) (string, string) {
+	if m.syncPanel == nil || provider == "" || name == "" {
+		return "", ""
+	}
+	state := m.syncPanel.State()
+	if state == nil {
+		return "", ""
+	}
+
+	if m.syncPanel.Syncing() {
+		if machine := m.syncPanel.SelectedMachine(); machine != nil {
+			return "syncing", machine.Name
+		}
+		return "syncing", "all"
+	}
+
+	if state.Queue != nil {
+		for _, entry := range state.Queue.Entries {
+			if entry.Provider != provider || entry.Profile != name {
+				continue
+			}
+			if entry.LastError != "" {
+				return "error", truncatePlain(entry.LastError, 24)
+			}
+			return "pending", truncatePlain(entry.Machine, 24)
+		}
+	}
+
+	for _, entry := range state.RecentHistory(100) {
+		if entry.Provider != provider || entry.Profile != name {
+			continue
+		}
+		if !entry.Success {
+			if entry.Error != "" {
+				return "error", truncatePlain(entry.Error, 24)
+			}
+			return "error", truncatePlain(entry.Machine, 24)
+		}
+		detail := truncatePlain(entry.Machine, 24)
+		if !entry.Timestamp.IsZero() {
+			detail = formatTimeAgo(entry.Timestamp)
+		}
+		return "synced", detail
+	}
+
+	return "", ""
 }
 
 // updateProviderCounts updates the provider panel with current profile counts.
@@ -2640,6 +3155,15 @@ func (m Model) view() string {
 			return m.dialogOverlayView(m.syncEditDialog.View())
 		}
 		return m.mainView()
+	case stateSyncRemoveConfirm:
+		if m.confirmDialog != nil {
+			return m.dialogOverlayView(m.confirmDialog.View())
+		}
+		return m.mainView()
+	case stateSyncDetail:
+		return m.dialogOverlayView(m.syncMachineDetailView())
+	case stateSyncLog:
+		return m.dialogOverlayView(m.syncLogView())
 	case stateCommandPalette:
 		if m.commandPalette != nil {
 			return m.dialogOverlayView(m.commandPalette.View())
@@ -2656,6 +3180,40 @@ func (m Model) view() string {
 		}
 		return m.mainView()
 	}
+}
+
+func (m Model) syncMachineDetailView() string {
+	var content strings.Builder
+	content.WriteString(m.styles.DialogTitle.Render("Sync Machine Details"))
+	content.WriteString("\n\n")
+	if m.syncPanel == nil || m.syncPanel.SelectedMachine() == nil {
+		content.WriteString("No sync machine selected.")
+	} else {
+		content.WriteString(strings.TrimSpace(m.syncPanel.renderSelectedMachineDetails()))
+	}
+	content.WriteString("\n\n")
+	content.WriteString(m.styles.StatusKey.Render("enter/esc") + " close")
+
+	return m.styles.Dialog.
+		Width(m.dialogWidth(88)).
+		Render(content.String())
+}
+
+func (m Model) syncLogView() string {
+	var content strings.Builder
+	content.WriteString(m.styles.DialogTitle.Render("Sync History"))
+	content.WriteString("\n\n")
+	if strings.TrimSpace(m.syncLogText) == "" {
+		content.WriteString("Loading sync history...")
+	} else {
+		content.WriteString(m.syncLogText)
+	}
+	content.WriteString("\n\n")
+	content.WriteString(m.styles.StatusKey.Render("enter/esc/l") + " close")
+
+	return m.styles.Dialog.
+		Width(m.dialogWidth(96)).
+		Render(content.String())
 }
 
 // dialogOverlayView renders the main view with a dialog overlay centered on top.

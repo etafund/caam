@@ -3,7 +3,9 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/sync"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -71,6 +73,244 @@ func TestModel_SyncPanel_ToggleWithKey(t *testing.T) {
 	}
 }
 
+func TestModel_CtrlSStartsSyncFromAnyView(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("CAAM_HOME", tmpDir)
+
+	tests := []struct {
+		name        string
+		configure   func(*Model)
+		wantState   viewState
+		wantSyncing bool
+		wantVisible bool
+		wantStatus  string
+		wantCommand bool
+	}{
+		{
+			name:        "list",
+			wantState:   stateList,
+			wantSyncing: true,
+			wantStatus:  "Syncing all machines...",
+			wantCommand: true,
+		},
+		{
+			name: "help",
+			configure: func(m *Model) {
+				m.state = stateHelp
+			},
+			wantState:   stateHelp,
+			wantSyncing: true,
+			wantStatus:  "Syncing all machines...",
+			wantCommand: true,
+		},
+		{
+			name: "sync log",
+			configure: func(m *Model) {
+				m.state = stateSyncLog
+				m.syncLogText = "already open"
+			},
+			wantState:   stateSyncLog,
+			wantSyncing: true,
+			wantStatus:  "Syncing all machines...",
+			wantCommand: true,
+		},
+		{
+			name: "visible sync panel",
+			configure: func(m *Model) {
+				m.syncPanel.Toggle()
+			},
+			wantState:   stateList,
+			wantSyncing: true,
+			wantVisible: true,
+			wantStatus:  "Syncing all machines...",
+			wantCommand: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New()
+			m.width = 120
+			m.height = 40
+			if tt.configure != nil {
+				tt.configure(&m)
+			}
+
+			model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			m = model.(Model)
+
+			if (cmd != nil) != tt.wantCommand {
+				t.Fatalf("cmd nil = %v, want command=%v", cmd == nil, tt.wantCommand)
+			}
+			if m.state != tt.wantState {
+				t.Fatalf("state = %v, want %v", m.state, tt.wantState)
+			}
+			if m.statusMsg != tt.wantStatus {
+				t.Fatalf("statusMsg = %q, want %q", m.statusMsg, tt.wantStatus)
+			}
+			if m.syncPanel == nil {
+				t.Fatalf("sync panel was not initialized")
+			}
+			if m.syncPanel.Visible() != tt.wantVisible {
+				t.Fatalf("sync panel visible = %v, want %v", m.syncPanel.Visible(), tt.wantVisible)
+			}
+			if m.syncPanel.Syncing() != tt.wantSyncing {
+				t.Fatalf("sync panel syncing = %v, want %v", m.syncPanel.Syncing(), tt.wantSyncing)
+			}
+		})
+	}
+}
+
+func TestModel_CtrlSBlocksOverlappingSync(t *testing.T) {
+	m := New()
+	m.width = 120
+	m.height = 40
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = model.(Model)
+	if cmd == nil {
+		t.Fatalf("first ctrl+s did not start sync")
+	}
+	if !m.syncPanel.Syncing() {
+		t.Fatalf("first ctrl+s did not mark sync in progress")
+	}
+
+	model, cmd = m.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m = model.(Model)
+	if cmd != nil {
+		t.Fatalf("second ctrl+s returned command while sync already in progress")
+	}
+	if m.statusMsg != "Sync already in progress" {
+		t.Fatalf("statusMsg = %q, want sync-in-progress guard", m.statusMsg)
+	}
+}
+
+func TestModel_SyncPanelRemoveKeyOpensConfirmation(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("CAAM_HOME", tmpDir)
+
+	state := sync.NewSyncState(tmpDir)
+	machine := sync.NewMachine("laptop", "192.0.2.10")
+	if err := state.Pool.AddMachine(machine); err != nil {
+		t.Fatalf("AddMachine() error = %v", err)
+	}
+
+	m := New()
+	m.width = 120
+	m.height = 40
+	m.syncPanel.Toggle()
+	m.syncPanel.SetState(state)
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	m = model.(Model)
+
+	if cmd != nil {
+		t.Fatalf("remove key returned command; removal must wait for confirmation")
+	}
+	if m.state != stateSyncRemoveConfirm {
+		t.Fatalf("state = %v, want stateSyncRemoveConfirm", m.state)
+	}
+	if m.confirmDialog == nil {
+		t.Fatalf("remove key did not open confirmation dialog")
+	}
+	if m.pendingSyncMachine != machine.ID {
+		t.Fatalf("pendingSyncMachine = %q, want %q", m.pendingSyncMachine, machine.ID)
+	}
+	if got := state.Pool.GetMachine(machine.ID); got == nil {
+		t.Fatalf("machine was removed before confirmation")
+	}
+	if m.statusMsg != "" {
+		t.Fatalf("statusMsg = %q, want empty while confirmation is open", m.statusMsg)
+	}
+}
+
+func TestModel_SyncPanelLogKeyOpensInTUILog(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("CAAM_HOME", tmpDir)
+
+	state := sync.NewSyncState("")
+	state.AddToHistory(sync.HistoryEntry{
+		Timestamp: time.Date(2026, 7, 4, 1, 2, 3, 0, time.UTC),
+		Provider:  "codex",
+		Profile:   "primary",
+		Machine:   "laptop",
+		Action:    "push",
+		Success:   true,
+	})
+	if err := state.Save(); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	m := New()
+	m.width = 120
+	m.height = 40
+	m.syncPanel.Toggle()
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = model.(Model)
+
+	if cmd != nil {
+		msg := cmd()
+		model, _ = m.Update(msg)
+		m = model.(Model)
+	} else {
+		t.Fatalf("sync log key did not return load command")
+	}
+	if m.state != stateSyncLog {
+		t.Fatalf("state = %v, want stateSyncLog", m.state)
+	}
+	for _, want := range []string{"Sync History", "codex/primary", "laptop", "push", "ok"} {
+		if !strings.Contains(m.syncLogText, want) {
+			t.Fatalf("syncLogText = %q, want substring %q", m.syncLogText, want)
+		}
+	}
+
+	model, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = model.(Model)
+	if cmd != nil {
+		t.Fatalf("closing sync log returned unexpected command")
+	}
+	if m.state != stateList {
+		t.Fatalf("state = %v, want stateList after toggling log closed", m.state)
+	}
+	if m.syncLogText != "" {
+		t.Fatalf("syncLogText = %q, want empty after closing log", m.syncLogText)
+	}
+}
+
+func TestModel_SyncPanelEnterOpensSelectedMachineDetails(t *testing.T) {
+	state := sync.NewSyncState("")
+	machine := sync.NewMachine("laptop", "192.0.2.10")
+	machine.Port = 2222
+	machine.SSHUser = "alice"
+	machine.SSHKeyPath = "~/.ssh/laptop"
+	if err := state.Pool.AddMachine(machine); err != nil {
+		t.Fatalf("AddMachine() error = %v", err)
+	}
+
+	m := New()
+	m.width = 120
+	m.height = 40
+	m.syncPanel.Toggle()
+	m.syncPanel.SetState(state)
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = model.(Model)
+
+	if cmd != nil {
+		t.Fatalf("enter returned unexpected command")
+	}
+	if m.state != stateSyncDetail {
+		t.Fatalf("state = %v, want stateSyncDetail", m.state)
+	}
+	view := m.View()
+	for _, want := range []string{"Sync Machine Details", "laptop", "192.0.2.10:2222", "alice", "~/.ssh/laptop"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("details view missing %q, got: %s", want, view)
+		}
+	}
+}
+
 func TestSyncPanel_SetLoading(t *testing.T) {
 	p := NewSyncPanel()
 	p.SetSize(120, 40)
@@ -85,6 +325,30 @@ func TestSyncPanel_SetLoading(t *testing.T) {
 	out = p.View()
 	if strings.Contains(out, "Loading") {
 		t.Fatalf("View() should not show loading after SetLoading(false)")
+	}
+}
+
+func TestSyncPanel_SyncingViewShowsProgressOverlayState(t *testing.T) {
+	p := NewSyncPanel()
+	p.SetSize(120, 40)
+
+	state := &sync.SyncState{Pool: sync.NewSyncPool()}
+	machine := sync.NewMachine("office", "192.0.2.11")
+	if err := state.Pool.AddMachine(machine); err != nil {
+		t.Fatalf("AddMachine() error = %v", err)
+	}
+	p.SetState(state)
+	p.SetSyncing(true)
+
+	out := p.View()
+	if !strings.Contains(out, "Syncing") {
+		t.Fatalf("syncing view missing progress text, got: %s", out)
+	}
+	if !strings.Contains(out, "office") {
+		t.Fatalf("syncing overlay should show per-machine state, got: %s", out)
+	}
+	if strings.Contains(out, "%") {
+		t.Fatalf("syncing overlay should not show fake percentage progress, got: %s", out)
 	}
 }
 

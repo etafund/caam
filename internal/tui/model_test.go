@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -500,6 +501,50 @@ func TestInitWithFileWatching(t *testing.T) {
 	cmd := m.Init()
 	if cmd == nil {
 		t.Error("expected Init to return a non-nil command with file watching")
+	}
+}
+
+func TestSplitEditorCommand(t *testing.T) {
+	tests := []struct {
+		name    string
+		command string
+		want    []string
+		wantErr bool
+	}{
+		{name: "single binary", command: "vim", want: []string{"vim"}},
+		{name: "binary with arg", command: "code --wait", want: []string{"code", "--wait"}},
+		{name: "quoted binary", command: `"/opt/My Editor/bin/edit" --wait`, want: []string{"/opt/My Editor/bin/edit", "--wait"}},
+		{name: "quoted arg", command: `vim +'set ft=csv'`, want: []string{"vim", "+set ft=csv"}},
+		{name: "unterminated quote", command: `vim "unterminated`, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := splitEditorCommand(tt.command)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("splitEditorCommand() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("splitEditorCommand() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("splitEditorCommand() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAddSyncMachineDialogShowsTestAndAddHint(t *testing.T) {
+	dialog := newSyncMachineDialogWithValues("Add Sync Machine", syncMachineDialogValues{})
+	dialog.SetStyles(NewStyles(DefaultTheme()))
+	dialog.SetWidth(80)
+
+	view := dialog.View()
+	if !strings.Contains(view, "Ctrl+T tests the connection before adding") {
+		t.Fatalf("add sync dialog missing Ctrl+T hint: %s", view)
 	}
 }
 
