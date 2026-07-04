@@ -915,6 +915,19 @@ func TestFormatTUIStatus(t *testing.T) {
 	}
 }
 
+func BenchmarkProfilesPanelView1000(b *testing.B) {
+	panel := NewProfilesPanelWithTheme(NewTheme(ThemeOptions{NoColor: true}))
+	panel.SetProvider("claude")
+	panel.SetSize(90, 32)
+	panel.SetProfiles(profileInfos(1000))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = panel.View()
+	}
+}
+
 func normalizePanelSnapshot(s string) string {
 	plain := ansi.Strip(s)
 	lines := strings.Split(plain, "\n")

@@ -292,13 +292,13 @@ func TestE2E_CompleteBackupActivateSwitchWorkflow(t *testing.T) {
 
 	// Verify vault structure
 	expectedStructure := map[string]string{
-		"codex":                              "dir",
-		"codex/account1":         "dir",
-		"codex/account2":         "dir",
+		"codex":                    "dir",
+		"codex/account1":           "dir",
+		"codex/account2":           "dir",
 		"codex/account1/auth.json": "file",
 		"codex/account2/auth.json": "file",
-		"claude":                             "dir",
-		"claude/personal":        "dir",
+		"claude":                   "dir",
+		"claude/personal":          "dir",
 	}
 
 	allMatch := true

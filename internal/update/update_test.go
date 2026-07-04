@@ -299,10 +299,10 @@ ghi789  SHA256SUMS.sig
 	}
 
 	tests := []struct {
-		name        string
-		assetName   string
-		wantHash    string
-		wantErr     bool
+		name      string
+		assetName string
+		wantHash  string
+		wantErr   bool
 	}{
 		{
 			name:      "exact match",

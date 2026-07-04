@@ -717,7 +717,9 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 // ValidateToken validates that the authentication token works.
 // For passive validation: checks file existence, format, and expiry timestamps.
-// For active validation: attempts minimal API call to Google.
+// Active validation is not implemented because no safe token probe exists for
+// saved Gemini CLI credentials; active requests return an explicit unsupported
+// result after passive validation passes.
 func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, passive bool) (*provider.ValidationResult, error) {
 	result := &provider.ValidationResult{
 		Provider:  p.ID(),
@@ -865,10 +867,9 @@ func (p *Provider) validateTokenPassive(ctx context.Context, prof *profile.Profi
 	return result, nil
 }
 
-// validateTokenActive performs active validation with network calls.
+// validateTokenActive reports active validation as unsupported when passive
+// checks pass. It must not claim Method=active without a real provider probe.
 func (p *Provider) validateTokenActive(ctx context.Context, prof *profile.Profile, result *provider.ValidationResult) (*provider.ValidationResult, error) {
-	result.Method = "active"
-
 	// First do passive validation
 	passiveResult, err := p.validateTokenPassive(ctx, prof, result)
 	if err != nil {
@@ -878,9 +879,8 @@ func (p *Provider) validateTokenActive(ctx context.Context, prof *profile.Profil
 		return passiveResult, nil
 	}
 
-	// For active validation, we would need to make an API call to Google
-	// to verify the token. For now, we rely on passive validation.
-	result.Valid = true
+	result.Valid = false
+	result.Error = "ACTIVE_VALIDATION_UNSUPPORTED: safe active validation is not implemented for Gemini; passive validation passed"
 	return result, nil
 }
 

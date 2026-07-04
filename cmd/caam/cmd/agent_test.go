@@ -97,3 +97,42 @@ func TestLoadAgentConfigSingle(t *testing.T) {
 		t.Fatalf("CoordinatorToken = %q, want %q", cfg.CoordinatorToken, "shhh")
 	}
 }
+
+func TestLoadConfiguredCoordinatorEndpointsFromExplicitConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "agent.json")
+
+	data := []byte(`{
+  "coordinators": [
+    {"name": "csd", "url": "http://100.64.0.1:7890/", "display_name": "CSD", "token": "abc123"},
+    {"name": "", "url": "", "token": "skip-empty"}
+  ]
+}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	endpoints, err := loadConfiguredCoordinatorEndpoints(path)
+	if err != nil {
+		t.Fatalf("loadConfiguredCoordinatorEndpoints error: %v", err)
+	}
+	if len(endpoints) != 1 {
+		t.Fatalf("endpoint count = %d, want 1", len(endpoints))
+	}
+	if endpoints[0].Name != "csd" || endpoints[0].URL != "http://100.64.0.1:7890" || endpoints[0].Token != "abc123" {
+		t.Fatalf("endpoint = %+v, want normalized csd endpoint", endpoints[0])
+	}
+}
+
+func TestLoadConfiguredCoordinatorEndpointsReturnsEmptyWhenDefaultConfigMissing(t *testing.T) {
+	t.Setenv("CAAM_AGENT_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	endpoints, err := loadConfiguredCoordinatorEndpoints("")
+	if err != nil {
+		t.Fatalf("loadConfiguredCoordinatorEndpoints error: %v", err)
+	}
+	if len(endpoints) != 0 {
+		t.Fatalf("endpoint count = %d, want 0", len(endpoints))
+	}
+}

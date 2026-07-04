@@ -177,14 +177,14 @@ func TestPrecheckResult_Table(t *testing.T) {
 	result := &PrecheckResult{
 		Provider: "claude",
 		Recommended: &ProfileRecommendation{
-			Name:           "work",
-			Score:          150.5,
-			UsagePercent:   45,
-			AvailScore:     77,
-			HealthStatus:   "healthy",
-			TokenExpiry:    "3h",
+			Name:            "work",
+			Score:           150.5,
+			UsagePercent:    45,
+			AvailScore:      77,
+			HealthStatus:    "healthy",
+			TokenExpiry:     "3h",
 			TimeToDepletion: "2h 15m",
-			Reasons:        []string{"+ Healthy token (expires in 3h)"},
+			Reasons:         []string{"+ Healthy token (expires in 3h)"},
 		},
 		Backups: []ProfileRecommendation{
 			{Name: "personal", HealthStatus: "warning", UsagePercent: 60},

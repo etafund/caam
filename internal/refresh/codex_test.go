@@ -3,10 +3,12 @@ package refresh
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -21,7 +23,9 @@ func TestRefreshCodexToken(t *testing.T) {
 		}
 
 		var body map[string]string
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(io.LimitReader(r.Body, maxErrorBodySize)).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
 
 		if body["grant_type"] != "refresh_token" {
 			t.Errorf("expected grant_type refresh_token, got %s", body["grant_type"])
@@ -226,14 +230,39 @@ func TestVerifyCodexToken_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// Override URL via test helper - we need to test with real endpoint
-	// Skip this test since VerifyCodexToken uses a hardcoded URL
-	t.Skip("VerifyCodexToken uses hardcoded URL, tested via integration tests")
+	oldURL := CodexVerifyURL
+	CodexVerifyURL = server.URL
+	defer func() { CodexVerifyURL = oldURL }()
+
+	if err := VerifyCodexToken(context.Background(), "test-token"); err != nil {
+		t.Fatalf("VerifyCodexToken failed: %v", err)
+	}
 }
 
 func TestVerifyCodexToken_Unauthorized(t *testing.T) {
-	// Skip since VerifyCodexToken uses hardcoded URL
-	t.Skip("VerifyCodexToken uses hardcoded URL, tested via integration tests")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "Bearer test-token" {
+			t.Errorf("unexpected auth header: %s", authHeader)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
+	oldURL := CodexVerifyURL
+	CodexVerifyURL = server.URL
+	defer func() { CodexVerifyURL = oldURL }()
+
+	err := VerifyCodexToken(context.Background(), "test-token")
+	if err == nil {
+		t.Fatal("VerifyCodexToken should fail on unauthorized response")
+	}
+	if !strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("error = %q, want status 401", err.Error())
+	}
 }
 
 // =============================================================================

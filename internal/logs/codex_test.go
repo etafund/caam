@@ -10,7 +10,7 @@ import (
 
 func TestNewCodexScanner(t *testing.T) {
 	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome) // Mock HOME for os.UserHomeDir()
+	t.Setenv("HOME", tmpHome)  // Mock HOME for os.UserHomeDir()
 	t.Setenv("CODEX_HOME", "") // Ensure CODEX_HOME is unset
 
 	scanner := NewCodexScanner()

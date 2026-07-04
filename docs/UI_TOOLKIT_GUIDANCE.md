@@ -13,7 +13,7 @@ This document pins the UI toolkit choices for CAAM's CLI, TUI, optional Rust sub
 | Shell prompts | `gum` | Optional external dependency, detected by `caam doctor`; no required runtime dependency |
 | Go TUI | Bubble Tea, Bubbles, Lip Gloss, Glamour | `bubbletea v1.2.4`, `bubbles v0.20.0`, `lipgloss v1.1.1-0.20250404203927-76690c660834`, `glamour v0.10.0` |
 | Rust TUI subtools | ratatui + crossterm | No Rust TUI crate is pinned in this repo yet; future Rust subtools must pin an MSRV and ratatui major version explicitly |
-| Web dashboard | Next.js, React, Tailwind, Lucide, Framer Motion | `next 16.1.4`, `react 19.2.3`, `tailwindcss 4.1.18`, `lucide-react ^0.513.0`, `framer-motion ^12.18.0` |
+| Web dashboard | Next.js, React, Tailwind, Lucide, Framer Motion | `next 16.2.10`, `react 19.2.7`, `tailwindcss 4.3.2`, `lucide-react 1.23.0`, `framer-motion 12.42.2` |
 
 ## Shell UX With Gum
 
@@ -21,10 +21,11 @@ This document pins the UI toolkit choices for CAAM's CLI, TUI, optional Rust sub
 
 Rules:
 
-- Use `gum` only when stdin and stdout are TTYs.
+- Use `gum` only when stdin and the prompt output stream are TTYs; confirmations render prompts on stderr so stdout can stay machine-readable.
 - Always provide a plain-text fallback with the same choices and defaults.
 - Respect `NO_COLOR`, `TERM=dumb`, `CAAM_NO_TUI`, and `NO_TUI`.
-- Never use `gum` for `--json`, `--plain`, CI, or non-interactive paths.
+- Never use `gum` for `--json`, `--plain`, CI, `TERM=dumb`, `CAAM_NO_TUI`, `NO_TUI`, or non-interactive paths.
+- In `--json` mode, require explicit confirmation-skip flags such as `--force` or `--yes`; do not emit prompts alongside machine output.
 - Keep prompt text stable enough for documentation and tests.
 - Do not require users to install `gum`; `caam doctor` should report it as optional.
 
@@ -76,12 +77,12 @@ Rules for any future Rust TUI crate:
 
 The dashboard lives under `web/dashboard` and uses the package pins in `web/dashboard/package.json`:
 
-- `next 16.1.4`
-- `react 19.2.3`
-- `react-dom 19.2.3`
-- `tailwindcss ^4.1.18`
-- `lucide-react ^0.513.0`
-- `framer-motion ^12.18.0`
+- `next 16.2.10`
+- `react 19.2.7`
+- `react-dom 19.2.7`
+- `tailwindcss 4.3.2`
+- `lucide-react 1.23.0`
+- `framer-motion 12.42.2`
 - Node `>=22.0.0`, pnpm `>=10.0.0`, package manager `pnpm@10.23.0`
 
 Rules:
@@ -108,4 +109,3 @@ Rules:
 - A Bubble Tea/Lip Gloss v2 migration should be all-at-once for the Go TUI, with layout snapshots and interaction tests updated in the same bead.
 - A Next/React major update should include package pins, lockfile updates, a production build, lint/typecheck/test output, and one Playwright smoke test.
 - A future ratatui helper should start with a minimal crate, an explicit MSRV, and a snapshot harness before adding interactive features.
-

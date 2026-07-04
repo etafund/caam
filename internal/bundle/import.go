@@ -117,10 +117,10 @@ type ImportResult struct {
 
 // ProfileAction describes what happened to a single profile during import.
 type ProfileAction struct {
-	Provider string
-	Profile  string
-	Action   string // "add", "update", "skip", "error"
-	Reason   string
+	Provider     string
+	Profile      string
+	Action       string // "add", "update", "skip", "error"
+	Reason       string
 	LocalExpiry  *time.Time
 	BundleExpiry *time.Time
 }

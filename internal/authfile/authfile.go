@@ -923,23 +923,30 @@ func (v *Vault) CopyProfile(tool, srcProfile, dstProfile string) error {
 	// Update meta.json with new profile name
 	metaPath := filepath.Join(dstDir, "meta.json")
 	if _, err := os.Stat(metaPath); err == nil {
-		// Read and update meta.json
 		data, err := os.ReadFile(metaPath)
-		if err == nil {
-			var meta map[string]interface{}
-			if json.Unmarshal(data, &meta) == nil {
-				meta["profile"] = dstProfile
-				meta["copied_from"] = srcProfile
-				meta["copied_at"] = time.Now().Format(time.RFC3339)
-				if updated, err := json.MarshalIndent(meta, "", "  "); err == nil {
-					// Atomic write for meta.json
-					tmpPath := metaPath + ".tmp"
-					if err := os.WriteFile(tmpPath, updated, 0600); err == nil {
-						os.Rename(tmpPath, metaPath)
-					}
-				}
-			}
+		if err != nil {
+			return fmt.Errorf("read copied meta.json: %w", err)
 		}
+		var meta map[string]interface{}
+		if err := json.Unmarshal(data, &meta); err != nil {
+			return fmt.Errorf("parse copied meta.json: %w", err)
+		}
+		meta["profile"] = dstProfile
+		meta["copied_from"] = srcProfile
+		meta["copied_at"] = time.Now().Format(time.RFC3339)
+		updated, err := json.MarshalIndent(meta, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal copied meta.json: %w", err)
+		}
+		tmpPath := metaPath + ".tmp"
+		if err := os.WriteFile(tmpPath, updated, 0600); err != nil {
+			return fmt.Errorf("write copied meta.json: %w", err)
+		}
+		if err := os.Rename(tmpPath, metaPath); err != nil {
+			return fmt.Errorf("replace copied meta.json: %w", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat copied meta.json: %w", err)
 	}
 
 	return nil
@@ -959,8 +966,8 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	// Hash the current auth files using stable identity extraction.
 	// Prefer required files for matching; optional files can change frequently
 	// (e.g., settings/session files) and should not break profile detection.
-	currentHashes := make(map[string]string)
-	optionalHashes := make(map[string]string)
+	currentHashes := make(map[string][]string)
+	optionalHashes := make(map[string][]string)
 	requiredFound := false
 	for _, spec := range fileSet.Files {
 		// A Claude Desktop config with no token cache carries no identity; skip it
@@ -973,17 +980,17 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
 			continue
 		}
-		hash, err := stableFileHash(fileSet.Tool, spec.Path)
+		hashes, err := stableFileHashes(fileSet.Tool, spec.Path)
 		if err != nil {
 			continue
 		}
 		base := filepath.Base(spec.Path)
 		if spec.Required {
 			requiredFound = true
-			currentHashes[base] = hash
+			currentHashes[base] = hashes
 			continue
 		}
-		optionalHashes[base] = hash
+		optionalHashes[base] = hashes
 	}
 
 	if !requiredFound {
@@ -1002,19 +1009,20 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 	// profile (same account re-authenticated), and because they sort
 	// alphabetically before most user names (underscore < lowercase letters),
 	// they would otherwise shadow the intended named profile.
+	userMatches := make([]string, 0, len(profiles))
 	var systemMatch string
 	for _, profile := range profiles {
 		profileDir := v.ProfilePath(fileSet.Tool, profile)
 		matches := true
 
-		for filename, currentHash := range currentHashes {
+		for filename, currentFileHashes := range currentHashes {
 			backupPath := filepath.Join(profileDir, filename)
-			backupHash, err := stableFileHash(fileSet.Tool, backupPath)
+			backupHashes, err := stableFileHashes(fileSet.Tool, backupPath)
 			if err != nil {
 				matches = false
 				break
 			}
-			if currentHash != backupHash {
+			if !hashesOverlap(currentFileHashes, backupHashes) {
 				matches = false
 				break
 			}
@@ -1022,7 +1030,8 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 
 		if matches {
 			if !IsSystemProfile(profile) {
-				return profile, nil // Prefer user-named profiles
+				userMatches = append(userMatches, profile)
+				continue
 			}
 			if systemMatch == "" {
 				systemMatch = profile // Remember first system match as fallback
@@ -1030,7 +1039,61 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 		}
 	}
 
+	if len(userMatches) > 0 {
+		return v.preferredActiveProfile(fileSet.Tool, userMatches), nil
+	}
 	return systemMatch, nil // Fall back to system profile, or "" if no match
+}
+
+func (v *Vault) preferredActiveProfile(tool string, matches []string) string {
+	if len(matches) == 1 {
+		return matches[0]
+	}
+	matchSet := make(map[string]bool, len(matches))
+	for _, match := range matches {
+		matchSet[match] = true
+	}
+
+	var preferred string
+	var preferredCopiedAt time.Time
+	for _, match := range matches {
+		meta, ok := v.profileMeta(tool, match)
+		if !ok {
+			continue
+		}
+		copiedFrom, _ := meta["copied_from"].(string)
+		if copiedFrom == "" || !matchSet[copiedFrom] {
+			continue
+		}
+		copiedAt, _ := time.Parse(time.RFC3339, copiedAtString(meta["copied_at"]))
+		if preferred == "" || copiedAt.After(preferredCopiedAt) {
+			preferred = match
+			preferredCopiedAt = copiedAt
+		}
+	}
+	if preferred != "" {
+		return preferred
+	}
+	return matches[0]
+}
+
+func (v *Vault) profileMeta(tool, profile string) (map[string]interface{}, bool) {
+	data, err := os.ReadFile(filepath.Join(v.ProfilePath(tool, profile), "meta.json"))
+	if err != nil {
+		return nil, false
+	}
+	var meta map[string]interface{}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, false
+	}
+	return meta, true
+}
+
+func copiedAtString(value interface{}) string {
+	if s, ok := value.(string); ok {
+		return s
+	}
+	return ""
 }
 
 // HasAuthFiles checks if the tool currently has auth files present.
@@ -1341,6 +1404,41 @@ func stableFileHash(tool, path string) (string, error) {
 	}
 }
 
+func stableFileHashes(tool, path string) ([]string, error) {
+	hash, err := stableFileHash(tool, path)
+	if err != nil {
+		return nil, err
+	}
+	hashes := []string{hash}
+
+	if tool == "claude" && filepath.Base(path) == ".credentials.json" {
+		accessHash, err := hashClaudeCredentialKey(path, "accessToken")
+		if err == nil && accessHash != "" && accessHash != hash {
+			hashes = append(hashes, accessHash)
+		}
+	}
+
+	return hashes, nil
+}
+
+func hashesOverlap(a, b []string) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, hash := range a {
+		if hash != "" {
+			seen[hash] = struct{}{}
+		}
+	}
+	for _, hash := range b {
+		if _, ok := seen[hash]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // stableClaudeHash extracts identity-bearing fields from Claude auth files and
 // hashes only those fields. This handles two file types:
 //
@@ -1349,7 +1447,8 @@ func stableFileHash(tool, path string) (string, error) {
 //   - .claude.json: settings file with oauthAccount (identity) mixed with
 //     volatile fields like changelogLastFetched, numStartups, tipsHistory
 //
-// For .credentials.json, we hash the accessToken and refreshToken.
+// For .credentials.json, we hash the refreshToken when present, falling back to
+// accessToken for legacy files that do not expose a refresh token.
 // For .claude.json, we hash the oauthAccount field only.
 // For other files (settings.json, auth.json), we fall back to whole-file hash.
 func stableClaudeHash(path string) (string, error) {
@@ -1369,10 +1468,10 @@ func stableClaudeHash(path string) (string, error) {
 }
 
 // hashClaudeCredentials hashes the identity-bearing fields from Claude's
-// .credentials.json: the accessToken and refreshToken from claudeAiOauth.
-// These tokens uniquely identify the authenticated account. Volatile fields
-// like expiresAt are excluded since they change on token refresh without
-// changing the account identity.
+// .credentials.json. Claude access tokens rotate, so refreshToken is the stable
+// identity when present. Legacy credentials without refreshToken fall back to
+// accessToken. Volatile fields like expiresAt are excluded since they change on
+// token refresh without changing the account identity.
 func hashClaudeCredentials(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -1391,13 +1490,13 @@ func hashClaudeCredentials(path string) (string, error) {
 		return hashBytes(data), nil
 	}
 
-	// Extract stable identity fields: accessToken and refreshToken uniquely
-	// identify the authenticated session/account.
+	// Prefer refreshToken because accessToken rotates. Keep accessToken as a
+	// fallback for older or partial credential files.
 	identityFields := map[string]interface{}{}
-	for _, key := range []string{"accessToken", "refreshToken"} {
-		if v, exists := oauth[key]; exists {
-			identityFields[key] = v
-		}
+	if v, exists := oauth["refreshToken"]; exists && nonEmptyIdentityValue(v) {
+		identityFields["refreshToken"] = v
+	} else if v, exists := oauth["accessToken"]; exists && nonEmptyIdentityValue(v) {
+		identityFields["accessToken"] = v
 	}
 
 	if len(identityFields) == 0 {
@@ -1414,6 +1513,48 @@ func hashClaudeCredentials(path string) (string, error) {
 	h.Write([]byte("claude:credentials:"))
 	h.Write(canonical)
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func hashClaudeCredentialKey(path string, key string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return "", nil
+	}
+
+	oauth, ok := root["claudeAiOauth"].(map[string]interface{})
+	if !ok {
+		return "", nil
+	}
+
+	v, exists := oauth[key]
+	if !exists || !nonEmptyIdentityValue(v) {
+		return "", nil
+	}
+
+	canonical, err := json.Marshal(map[string]interface{}{key: v})
+	if err != nil {
+		return "", nil
+	}
+
+	h := sha256.New()
+	h.Write([]byte("claude:credentials:"))
+	h.Write(canonical)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func nonEmptyIdentityValue(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	if s, ok := v.(string); ok {
+		return s != ""
+	}
+	return true
 }
 
 // hashClaudeSettings hashes only the identity-bearing oauthAccount field from

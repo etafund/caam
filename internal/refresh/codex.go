@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -12,7 +13,8 @@ import (
 
 // Codex Constants
 var (
-	CodexTokenURL = "https://auth.openai.com/oauth/token"
+	CodexTokenURL  = "https://auth.openai.com/oauth/token"
+	CodexVerifyURL = "https://api.openai.com/v1/me"
 )
 
 const (
@@ -70,7 +72,7 @@ var RefreshCodexToken = func(ctx context.Context, refreshToken string) (*TokenRe
 	}
 
 	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxErrorBodySize)).Decode(&tokenResp); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
@@ -124,7 +126,7 @@ func UpdateCodexAuth(path string, resp *TokenResponse) error {
 
 // VerifyCodexToken verifies if a token works.
 func VerifyCodexToken(ctx context.Context, token string) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.openai.com/v1/me", nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", CodexVerifyURL, nil)
 	if err != nil {
 		return err
 	}

@@ -58,10 +58,10 @@ type Result struct {
 // UsageInfo represents real-time rate limit usage for a profile.
 type UsageInfo struct {
 	ProfileName      string
-	PrimaryPercent   int     // Primary window usage (0-100)
-	SecondaryPercent int     // Secondary window usage (0-100)
-	AvailScore       int     // Availability score (0-100, higher is better)
-	Error            string  // Error message if fetch failed
+	PrimaryPercent   int    // Primary window usage (0-100)
+	SecondaryPercent int    // Secondary window usage (0-100)
+	AvailScore       int    // Availability score (0-100, higher is better)
+	Error            string // Error message if fetch failed
 }
 
 // Selector performs profile selection based on configured algorithm.
@@ -71,7 +71,7 @@ type Selector struct {
 	healthStore *health.Storage
 	db          *caamdb.DB
 	rng         *rand.Rand
-	avoidRecent time.Duration // Don't select profiles used within this duration
+	avoidRecent time.Duration         // Don't select profiles used within this duration
 	usageData   map[string]*UsageInfo // Real-time usage data by profile name
 }
 

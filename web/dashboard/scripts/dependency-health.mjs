@@ -17,45 +17,80 @@ export const dependencyPolicy = {
   packages: {
     next: {
       section: "dependencies",
-      minimum: "16.1.4",
+      minimum: "16.2.10",
       allowedMajors: [16],
       reason: "Next.js carries the App Router/RSC server surface and must stay on the current supported 16.x line.",
     },
     react: {
       section: "dependencies",
-      minimum: "19.2.3",
+      minimum: "19.2.7",
       allowedMajors: [19],
       reason: "React must stay paired with react-dom for RSC/client rendering security fixes.",
     },
     "react-dom": {
       section: "dependencies",
-      minimum: "19.2.3",
+      minimum: "19.2.7",
       allowedMajors: [19],
       reason: "react-dom must match React and receive the same RSC-related security fixes.",
     },
+    vite: {
+      section: "devDependencies",
+      minimum: "8.1.3",
+      allowedMajors: [8],
+      reason: "Vite is used by the dashboard test harness and must stay past patched dev-server releases.",
+    },
+    "@vitejs/plugin-react": {
+      section: "devDependencies",
+      minimum: "6.0.3",
+      allowedMajors: [6],
+      reason: "The Vite React plugin must track the Vite 8 toolchain used by Vitest.",
+    },
     tailwindcss: {
       section: "devDependencies",
-      minimum: "4.1.18",
+      minimum: "4.3.2",
       allowedMajors: [4],
       reason: "Tailwind 4.x is the supported styling toolchain for the dashboard.",
     },
     "@tailwindcss/postcss": {
       section: "devDependencies",
-      minimum: "4.1.18",
+      minimum: "4.3.2",
       allowedMajors: [4],
       reason: "The PostCSS adapter must track the Tailwind 4.x runtime.",
     },
+    eslint: {
+      section: "devDependencies",
+      minimum: "9.39.2",
+      allowedMajors: [9],
+      reason: "ESLint stays on the latest 9.x line supported by Next's lint plugin ecosystem.",
+    },
+    "eslint-config-next": {
+      section: "devDependencies",
+      minimum: "16.2.10",
+      allowedMajors: [16],
+      reason: "Next's ESLint config must match the Next runtime patch line.",
+    },
+    jsdom: {
+      section: "devDependencies",
+      minimum: "29.1.1",
+      allowedMajors: [29],
+      reason: "jsdom carries the browser-like unit-test runtime and transitive WebSocket surface.",
+    },
     vitest: {
       section: "devDependencies",
-      minimum: "3.2.6",
-      allowedMajors: [3],
-      reason: "Vitest 3.2.6 patches GHSA-5xrq-8626-4rwp in the optional UI server.",
+      minimum: "4.1.9",
+      allowedMajors: [4],
+      reason: "Vitest must stay on the current Vite-compatible test runner line.",
     },
   },
 };
 
 function readPackageJson() {
-  return JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  try {
+    return JSON.parse(fs.readFileSync(packagePath, "utf8"));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to parse ${packagePath}: ${reason}`);
+  }
 }
 
 function parseVersion(spec) {
@@ -141,6 +176,17 @@ function fileCheck(name, filePath, details) {
   };
 }
 
+function scriptCheck(pkg, name, expected, details) {
+  const current = pkg.scripts?.[name];
+  return {
+    name: `script:${name}`,
+    status: current === expected ? "ok" : "fail",
+    current,
+    minimum: expected,
+    details,
+  };
+}
+
 export function generateDependencyHealthReport() {
   const pkg = readPackageJson();
   const packageChecks = Object.entries(dependencyPolicy.packages).map(([name, rule]) =>
@@ -148,6 +194,12 @@ export function generateDependencyHealthReport() {
   );
   const checks = [
     ...packageChecks,
+    scriptCheck(
+      pkg,
+      "deps:audit",
+      "pnpm audit --audit-level high",
+      "Security audit gate must fail on high or critical advisories.",
+    ),
     fileCheck("pnpm-lock.yaml", lockfilePath, "Lockfile must be committed so audit results are reproducible."),
     fileCheck("pnpm-workspace.yaml", workspacePath, "Workspace file keeps pnpm commands scoped to the dashboard package."),
   ];
@@ -159,7 +211,7 @@ export function generateDependencyHealthReport() {
     engines: pkg.engines ?? {},
     policy: dependencyPolicy,
     commands: {
-      auditCritical: "pnpm run deps:audit",
+      auditHigh: "pnpm run deps:audit",
       healthCheck: "pnpm run deps:health:check",
       fullSecurityCheck: "pnpm run security:check",
     },
@@ -197,7 +249,7 @@ function renderMarkdown(report) {
     "",
     "## Commands",
     "",
-    `- Critical audit: \`${report.commands.auditCritical}\``,
+    `- High audit: \`${report.commands.auditHigh}\``,
     `- Version policy: \`${report.commands.healthCheck}\``,
     `- Combined gate: \`${report.commands.fullSecurityCheck}\``,
     "",

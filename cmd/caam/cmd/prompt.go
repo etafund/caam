@@ -20,11 +20,12 @@ var (
 	promptRunGumConfirm = runGumConfirm
 )
 
-var errNonInteractivePrompt = errors.New("interactive confirmation requires a terminal; use --plain with explicit input or --yes/--force")
+var errNonInteractivePrompt = errors.New("confirmation requires an interactive terminal or explicit input; pass --plain with yes/no on stdin, or use --yes/--force to skip confirmation when safe")
 
 type promptMode struct {
-	Plain bool
-	NoGum bool
+	Plain   bool
+	NoGum   bool
+	Machine bool
 }
 
 type confirmPromptOptions struct {
@@ -54,9 +55,14 @@ func promptModeFromCommand(cmd *cobra.Command) promptMode {
 	if flag := cmd.Flags().Lookup("no-gum"); flag != nil {
 		noGum, _ = cmd.Flags().GetBool("no-gum")
 	}
+	machine := false
+	if flag := cmd.Flags().Lookup("json"); flag != nil {
+		machine, _ = cmd.Flags().GetBool("json")
+	}
 	return promptMode{
-		Plain: plain,
-		NoGum: noGum,
+		Plain:   plain,
+		NoGum:   noGum,
+		Machine: machine,
 	}
 }
 
@@ -87,16 +93,23 @@ func confirmPrompt(ctx context.Context, opts confirmPromptOptions) (bool, error)
 
 	mode := "plain"
 	interactive := promptStreamsInteractive(opts.In, opts.Err)
+	if opts.Mode.Machine {
+		slog.Debug("prompt confirm", "mode", mode, "prompt", opts.Prompt, "result", false, "error", errNonInteractivePrompt.Error())
+		return false, errNonInteractivePrompt
+	}
+	if !interactive && isCIEnvironment() && !opts.Mode.Plain && !opts.Mode.NoGum {
+		slog.Debug("prompt confirm", "mode", mode, "prompt", opts.Prompt, "result", false, "error", errNonInteractivePrompt.Error())
+		return false, errNonInteractivePrompt
+	}
+	if !interactive && !opts.Mode.Plain && !opts.Mode.NoGum && !promptReaderMayHaveInput(opts.In) {
+		slog.Debug("prompt confirm", "mode", mode, "prompt", opts.Prompt, "result", false, "error", errNonInteractivePrompt.Error())
+		return false, errNonInteractivePrompt
+	}
 	if gumPath, ok := selectGumPrompt(opts.Mode, opts.In, opts.Err); ok {
 		mode = "gum"
 		ok, err := promptRunGumConfirm(ctx, gumPath, opts.Prompt, opts.DefaultYes, opts.In, opts.Err, opts.Err)
 		slog.Debug("prompt confirm", "mode", mode, "prompt", opts.Prompt, "result", ok, "error", errorString(err))
 		return ok, err
-	}
-
-	if !interactive && !opts.Mode.Plain && !opts.Mode.NoGum && isCIEnvironment() {
-		slog.Debug("prompt confirm", "mode", mode, "prompt", opts.Prompt, "result", false, "error", errNonInteractivePrompt.Error())
-		return false, errNonInteractivePrompt
 	}
 
 	ok, err := plainConfirmPrompt(ctx, opts.In, opts.Err, opts.Prompt, opts.DefaultYes, interactive)
@@ -105,10 +118,10 @@ func confirmPrompt(ctx context.Context, opts confirmPromptOptions) (bool, error)
 }
 
 func selectGumPrompt(mode promptMode, in io.Reader, uiOut io.Writer) (string, bool) {
-	if mode.Plain || mode.NoGum {
+	if mode.Plain || mode.NoGum || mode.Machine {
 		return "", false
 	}
-	if isCIEnvironment() || hasNoColor() {
+	if isCIEnvironment() || hasNoColor() || isDumbTerminal() || hasNoTUI() {
 		return "", false
 	}
 	if !promptStreamsInteractive(in, uiOut) {
@@ -130,14 +143,36 @@ func promptStreamsInteractive(in io.Reader, uiOut io.Writer) bool {
 	return promptIsTerminal(int(inFile.Fd())) && promptIsTerminal(int(outFile.Fd()))
 }
 
+func promptReaderMayHaveInput(r io.Reader) bool {
+	type lenReader interface {
+		Len() int
+	}
+	if lr, ok := r.(lenReader); ok {
+		return lr.Len() > 0
+	}
+	return true
+}
+
 func isCIEnvironment() bool {
-	value := strings.TrimSpace(strings.ToLower(os.Getenv("CI")))
+	return envTruthy("CI")
+}
+
+func envTruthy(key string) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
 	return value != "" && value != "0" && value != "false"
+}
+
+func isDumbTerminal() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("TERM")), "dumb")
 }
 
 func hasNoColor() bool {
 	value, ok := os.LookupEnv("NO_COLOR")
 	return ok && value != ""
+}
+
+func hasNoTUI() bool {
+	return envTruthy("CAAM_NO_TUI") || envTruthy("NO_TUI")
 }
 
 func plainConfirmPrompt(ctx context.Context, r io.Reader, w io.Writer, prompt string, defaultYes bool, interactive bool) (bool, error) {
@@ -156,8 +191,14 @@ func plainConfirmPrompt(ctx context.Context, r io.Reader, w io.Writer, prompt st
 	case "n", "no":
 		return false, nil
 	case "":
-		if !hadInput || !interactive {
+		if !hadInput {
+			if !interactive {
+				return false, errNonInteractivePrompt
+			}
 			return false, nil
+		}
+		if !interactive {
+			return false, errNonInteractivePrompt
 		}
 		return defaultYes, nil
 	default:

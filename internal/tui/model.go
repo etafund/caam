@@ -586,9 +586,10 @@ type errMsg struct {
 
 // refreshResultMsg is sent when a token refresh operation completes.
 type refreshResultMsg struct {
-	provider string
-	profile  string
-	err      error
+	provider  string
+	profile   string
+	expiresAt time.Time
+	err       error
 }
 
 // activateResultMsg is sent when a profile activation completes.
@@ -943,7 +944,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.showError(msg.err, "Refresh")
 			return m, nil
 		}
-		m.showRefreshSuccess(msg.profile, time.Time{}) // TODO: pass actual expiry time
+		m.showRefreshSuccess(msg.profile, msg.expiresAt)
 		// Refresh profiles to update any changed state
 		ctx := refreshContext{
 			provider:        msg.provider,
@@ -1733,13 +1734,51 @@ func (m Model) doRefreshProfile(provider, profile string) tea.Cmd {
 		// Perform the refresh
 		ctx := context.Background()
 		err := refresh.RefreshProfile(ctx, provider, profile, vault, store)
+		expiresAt := time.Time{}
+		if err == nil {
+			expiresAt = refreshSuccessExpiry(provider, profile, vault, store)
+		}
 
 		return refreshResultMsg{
-			provider: provider,
-			profile:  profile,
-			err:      err,
+			provider:  provider,
+			profile:   profile,
+			expiresAt: expiresAt,
+			err:       err,
 		}
 	}
+}
+
+func refreshSuccessExpiry(provider, profile string, vault *authfile.Vault, store *health.Storage) time.Time {
+	if store != nil {
+		profileHealth, err := store.GetProfile(provider, profile)
+		if err == nil && profileHealth != nil && !profileHealth.TokenExpiresAt.IsZero() {
+			return profileHealth.TokenExpiresAt
+		}
+	}
+
+	if vault == nil {
+		return time.Time{}
+	}
+
+	profilePath := vault.ProfilePath(provider, profile)
+	var (
+		info *health.ExpiryInfo
+		err  error
+	)
+	switch provider {
+	case "claude":
+		info, err = health.ParseClaudeExpiry(profilePath)
+	case "codex":
+		info, err = health.ParseCodexExpiry(filepath.Join(profilePath, "auth.json"))
+	case "gemini":
+		info, err = health.ParseGeminiExpiry(profilePath)
+	default:
+		return time.Time{}
+	}
+	if err != nil || info == nil {
+		return time.Time{}
+	}
+	return info.ExpiresAt
 }
 
 // doActivateProfile returns a tea.Cmd that performs the profile activation.
@@ -2545,6 +2584,21 @@ func (m Model) syncDetailPanel() {
 
 // View implements tea.Model.
 func (m Model) View() string {
+	if !m.debugEnabled() {
+		return m.view()
+	}
+
+	start := time.Now()
+	rendered := m.view()
+	renderedLines := 0
+	if rendered != "" {
+		renderedLines = strings.Count(rendered, "\n") + 1
+	}
+	m.logDebugRenderTiming("view", time.Since(start), len(rendered), renderedLines)
+	return rendered
+}
+
+func (m Model) view() string {
 	if m.width == 0 {
 		return "Loading..."
 	}

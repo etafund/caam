@@ -2,13 +2,17 @@ package tui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/watcher"
 	tea "github.com/charmbracelet/bubbletea"
@@ -751,6 +755,9 @@ func TestShowRefreshSuccess(t *testing.T) {
 	if !strings.Contains(m.statusMsg, "Refreshed") {
 		t.Errorf("expected 'Refreshed' in status, got %q", m.statusMsg)
 	}
+	if strings.Contains(m.statusMsg, "valid until") {
+		t.Errorf("expected unknown expiry status to omit expiry details, got %q", m.statusMsg)
+	}
 	if !strings.Contains(m.statusMsg, "test@example.com") {
 		t.Errorf("expected profile name in status, got %q", m.statusMsg)
 	}
@@ -760,6 +767,212 @@ func TestShowRefreshSuccess(t *testing.T) {
 	m.showRefreshSuccess("work@company.com", expiry)
 	if !strings.Contains(m.statusMsg, "Mar 15") || !strings.Contains(m.statusMsg, "14:30") {
 		t.Errorf("expected expiry time in status, got %q", m.statusMsg)
+	}
+}
+
+func TestRefreshResultMsgCompletionFeedback(t *testing.T) {
+	expiry := time.Date(2026, time.July, 3, 22, 45, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		msg        refreshResultMsg
+		want       []string
+		wantAbsent []string
+	}{
+		{
+			name: "success with expiry",
+			msg: refreshResultMsg{
+				provider:  "codex",
+				profile:   "work",
+				expiresAt: expiry,
+			},
+			want: []string{"Refreshed work", "Jul 3", "22:45"},
+		},
+		{
+			name: "success without expiry",
+			msg: refreshResultMsg{
+				provider: "codex",
+				profile:  "work",
+			},
+			want:       []string{"Refreshed work"},
+			wantAbsent: []string{"valid until", "Jul 3", "22:45"},
+		},
+		{
+			name: "error ignores expiry",
+			msg: refreshResultMsg{
+				provider:  "codex",
+				profile:   "work",
+				expiresAt: expiry,
+				err:       errors.New("refresh failed"),
+			},
+			want:       []string{"Refresh: refresh failed"},
+			wantAbsent: []string{"valid until", "Jul 3", "22:45"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			updated, _ := New().Update(tt.msg)
+			m := updated.(Model)
+
+			for _, want := range tt.want {
+				if !strings.Contains(m.statusMsg, want) {
+					t.Fatalf("status %q missing %q", m.statusMsg, want)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(m.statusMsg, absent) {
+					t.Fatalf("status %q unexpectedly contains %q", m.statusMsg, absent)
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshSuccessExpiry(t *testing.T) {
+	t.Run("uses health metadata when known", func(t *testing.T) {
+		expiry := time.Date(2026, time.July, 3, 22, 45, 0, 0, time.UTC)
+		store := health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+		if err := store.UpdateProfile("gemini", "work", &health.ProfileHealth{TokenExpiresAt: expiry}); err != nil {
+			t.Fatalf("UpdateProfile() error = %v", err)
+		}
+
+		got := refreshSuccessExpiry("gemini", "work", authfile.NewVault(t.TempDir()), store)
+		if !got.Equal(expiry) {
+			t.Fatalf("expiry = %v, want %v", got, expiry)
+		}
+	})
+
+	t.Run("uses vault auth metadata when health expiry is unknown", func(t *testing.T) {
+		expiry := time.Date(2026, time.July, 3, 22, 45, 0, 0, time.UTC)
+		vault := authfile.NewVault(t.TempDir())
+		profilePath := vault.ProfilePath("codex", "work")
+		if err := os.MkdirAll(profilePath, 0700); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		authJSON := fmt.Sprintf(`{"expires_at":%d}`, expiry.Unix())
+		if err := os.WriteFile(filepath.Join(profilePath, "auth.json"), []byte(authJSON), 0600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+
+		got := refreshSuccessExpiry("codex", "work", vault, nil)
+		if !got.Equal(expiry) {
+			t.Fatalf("expiry = %v, want %v", got, expiry)
+		}
+	})
+
+	t.Run("preserves unknown expiry", func(t *testing.T) {
+		vault := authfile.NewVault(t.TempDir())
+		profilePath := vault.ProfilePath("codex", "work")
+		if err := os.MkdirAll(profilePath, 0700); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(profilePath, "auth.json"), []byte(`{"token_type":"Bearer"}`), 0600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+
+		if got := refreshSuccessExpiry("codex", "work", vault, nil); !got.IsZero() {
+			t.Fatalf("expiry = %v, want zero", got)
+		}
+	})
+}
+
+func TestRefreshSuccessRenderExpiryOnlyWhenKnown(t *testing.T) {
+	expiry := time.Date(2026, time.July, 3, 22, 45, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		expiresAt   time.Time
+		knownExpiry bool
+		want        []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "known expiry",
+			expiresAt:   expiry,
+			knownExpiry: true,
+			want:        []string{"valid until", "Jul 3", "22:45"},
+		},
+		{
+			name:       "unknown expiry",
+			wantAbsent: []string{"valid until", "Jul 3", "22:45"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := refreshRenderTestModel(99, 18)
+			m.showRefreshSuccess("work", tt.expiresAt)
+
+			view := m.View()
+			logRefreshRenderTest(t, "codex", tt.knownExpiry, view)
+
+			for _, want := range tt.want {
+				if !strings.Contains(view, want) {
+					t.Fatalf("rendered view missing %q:\n%s", want, view)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(view, absent) {
+					t.Fatalf("rendered view unexpectedly contains %q:\n%s", absent, view)
+				}
+			}
+			assertRenderedWithinWidth(t, view, m.width)
+		})
+	}
+}
+
+func TestRefreshSuccessRenderDoesNotOverflowCompactLayout(t *testing.T) {
+	expiry := time.Date(2026, time.July, 3, 22, 45, 0, 0, time.UTC)
+	m := refreshRenderTestModel(60, 12)
+	m.showRefreshSuccess("work", expiry)
+
+	view := m.View()
+	logRefreshRenderTest(t, "codex", true, view)
+	assertRenderedWithinWidth(t, view, m.width)
+}
+
+func refreshRenderTestModel(width, height int) Model {
+	m := New()
+	theme := NewTheme(ThemeOptions{NoColor: true})
+	m.theme = theme
+	m.styles = NewStyles(theme)
+	m.width = width
+	m.height = height
+	m.profiles = map[string][]Profile{
+		"claude": {{Name: "work"}},
+	}
+	m.syncProfilesPanel()
+	return m
+}
+
+func logRefreshRenderTest(t *testing.T, provider string, knownExpiry bool, view string) {
+	t.Helper()
+
+	width, height := renderedSize(view)
+	t.Logf("refresh_render provider=%s known_expiry=%t rendered_width=%d rendered_height=%d", provider, knownExpiry, width, height)
+}
+
+func renderedSize(view string) (int, int) {
+	if view == "" {
+		return 0, 0
+	}
+
+	maxWidth := 0
+	lines := strings.Split(view, "\n")
+	for _, line := range lines {
+		maxWidth = max(maxWidth, ansi.StringWidth(line))
+	}
+	return maxWidth, len(lines)
+}
+
+func assertRenderedWithinWidth(t *testing.T, view string, width int) {
+	t.Helper()
+
+	for i, line := range strings.Split(view, "\n") {
+		if got := ansi.StringWidth(line); got > width {
+			t.Fatalf("line %d width = %d, want <= %d: %q", i+1, got, width, line)
+		}
 	}
 }
 
@@ -2192,4 +2405,44 @@ func TestToastTickMsgWithRemaining(t *testing.T) {
 	if cmd == nil {
 		t.Error("expected tick command when toasts remain")
 	}
+}
+
+func BenchmarkModelViewLargeList(b *testing.B) {
+	m := benchmarkModelWithProfiles(1000)
+	m.width = 140
+	m.height = 40
+	m.syncProfilesPanel()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = m.View()
+	}
+}
+
+func BenchmarkModelRapidResizeRenderLoop(b *testing.B) {
+	m := benchmarkModelWithProfiles(1000)
+	sizes := []tea.WindowSizeMsg{
+		{Width: 140, Height: 40},
+		{Width: 100, Height: 28},
+		{Width: 80, Height: 20},
+		{Width: 63, Height: 15},
+		{Width: 180, Height: 50},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		updated, _ := m.Update(sizes[i%len(sizes)])
+		m = updated.(Model)
+		_ = m.View()
+	}
+}
+
+func benchmarkModelWithProfiles(count int) Model {
+	m := NewWithProviders([]string{"claude"})
+	m.theme.NoColor = true
+	m.profiles = map[string][]Profile{"claude": profiles(count)}
+	m.syncProfilesPanel()
+	return m
 }

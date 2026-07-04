@@ -8,6 +8,7 @@ export function AgentDiagnosticsPanel({
   diagnostics,
 }: AgentDiagnosticsPanelProps) {
   const json = JSON.stringify(diagnostics, null, 2);
+  const scriptJson = escapeJsonForScript(json);
 
   return (
     <main className="min-h-screen bg-background p-6 text-foreground">
@@ -94,12 +95,31 @@ export function AgentDiagnosticsPanel({
           <script
             id="caam-agent-diagnostics"
             type="application/json"
-            dangerouslySetInnerHTML={{ __html: json }}
+            dangerouslySetInnerHTML={{ __html: scriptJson }}
           />
         </section>
       </div>
     </main>
   );
+}
+
+export function escapeJsonForScript(json: string) {
+  return json.replace(/[<>&\u2028\u2029]/g, (character) => {
+    switch (character) {
+      case "<":
+        return "\\u003c";
+      case ">":
+        return "\\u003e";
+      case "&":
+        return "\\u0026";
+      case "\u2028":
+        return "\\u2028";
+      case "\u2029":
+        return "\\u2029";
+      default:
+        return character;
+    }
+  });
 }
 
 function SummaryTile({ label, value }: { label: string; value: string }) {
@@ -119,4 +139,3 @@ function Flag({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
-

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -375,6 +376,80 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 	cfg.CoordinatorToken = raw.CoordinatorToken
 
 	return false, cfg, agent.MultiConfig{}, nil
+}
+
+func loadConfiguredCoordinatorEndpoints(configPath string) ([]*agent.CoordinatorEndpoint, error) {
+	path, required, err := resolveAgentConfigPath(configPath)
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, nil
+	}
+
+	useMulti, singleCfg, multiCfg, err := loadAgentConfig(path)
+	if err != nil {
+		if !required && os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if useMulti {
+		return normalizeCoordinatorEndpoints(multiCfg.Coordinators), nil
+	}
+	if strings.TrimSpace(singleCfg.CoordinatorURL) == "" {
+		return nil, nil
+	}
+	return normalizeCoordinatorEndpoints([]*agent.CoordinatorEndpoint{{
+		Name:        "local",
+		URL:         singleCfg.CoordinatorURL,
+		DisplayName: "Local coordinator",
+		Token:       singleCfg.CoordinatorToken,
+	}}), nil
+}
+
+func resolveAgentConfigPath(configPath string) (string, bool, error) {
+	if path := strings.TrimSpace(configPath); path != "" {
+		return path, true, nil
+	}
+	if path := strings.TrimSpace(os.Getenv("CAAM_AGENT_CONFIG")); path != "" {
+		return path, true, nil
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", false, err
+	}
+	path := filepath.Join(configDir, "caam", "distributed-agent.json")
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return path, false, nil
+}
+
+func normalizeCoordinatorEndpoints(endpoints []*agent.CoordinatorEndpoint) []*agent.CoordinatorEndpoint {
+	normalized := make([]*agent.CoordinatorEndpoint, 0, len(endpoints))
+	for i, endpoint := range endpoints {
+		if endpoint == nil || strings.TrimSpace(endpoint.URL) == "" {
+			continue
+		}
+		name := strings.TrimSpace(endpoint.Name)
+		if name == "" {
+			name = strings.TrimSpace(endpoint.DisplayName)
+		}
+		if name == "" {
+			name = fmt.Sprintf("coordinator-%d", i+1)
+		}
+		normalized = append(normalized, &agent.CoordinatorEndpoint{
+			Name:        name,
+			URL:         strings.TrimRight(strings.TrimSpace(endpoint.URL), "/"),
+			DisplayName: strings.TrimSpace(endpoint.DisplayName),
+			Token:       strings.TrimSpace(endpoint.Token),
+		})
+	}
+	return normalized
 }
 
 func parseStrategy(value string) (agent.AccountStrategy, error) {

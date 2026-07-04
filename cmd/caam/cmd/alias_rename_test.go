@@ -148,6 +148,69 @@ func TestRenameDeleteOldDeclinedPreservesOldProfile(t *testing.T) {
 	t.Logf("delete-old declined: preserved codex/%s and copied codex/%s", "auto-20260121-143022", "work-account")
 }
 
+func TestRenameDeleteOldForceSkipsPromptAndDeletesOldProfile(t *testing.T) {
+	testVault := setupAliasRenameCommandTest(t)
+	writeVaultProfile(t, testVault, "codex", "auto-20260121-143022", `{"fixture_profile":"auto"}`)
+
+	renameCmd := newRenameCommandForTest(t)
+	require.NotNil(t, renameCmd.Flags().Lookup("force"))
+	require.NotNil(t, renameCmd.Flags().ShorthandLookup("f"))
+	require.NoError(t, renameCmd.Flags().Set("delete-old", "true"))
+	require.NoError(t, renameCmd.Flags().Set("force", "true"))
+	require.NoError(t, renameCmd.Flags().Set("json", "true"))
+
+	out, err := captureStdout(t, func() error {
+		return runRename(renameCmd, []string{"codex", "auto-20260121-143022", "work-account"})
+	})
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &result))
+	require.Equal(t, true, result["copied"])
+	require.Equal(t, true, result["deleted"])
+	requireProfileMissing(t, testVault, "codex", "auto-20260121-143022")
+	requireProfileExists(t, testVault, "codex", "work-account")
+}
+
+func TestRenameDeleteOldJSONWithoutForceReturnsPromptErrorBeforeCopy(t *testing.T) {
+	testVault := setupAliasRenameCommandTest(t)
+	writeVaultProfile(t, testVault, "codex", "auto-20260121-143022", `{"fixture_profile":"auto"}`)
+
+	renameCmd := newRenameCommandForTest(t)
+	require.NoError(t, renameCmd.Flags().Set("delete-old", "true"))
+	require.NoError(t, renameCmd.Flags().Set("json", "true"))
+
+	out, err := captureStdout(t, func() error {
+		return runRename(renameCmd, []string{"codex", "auto-20260121-143022", "work-account"})
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "confirm delete old profile")
+	require.Contains(t, err.Error(), "--yes/--force")
+	require.Empty(t, out)
+	requireProfileExists(t, testVault, "codex", "auto-20260121-143022")
+	requireProfileMissing(t, testVault, "codex", "work-account")
+}
+
+func TestRenameDeleteOldJSONPlainWithoutForceReturnsPromptErrorBeforeCopy(t *testing.T) {
+	testVault := setupAliasRenameCommandTest(t)
+	writeVaultProfile(t, testVault, "codex", "auto-20260121-143022", `{"fixture_profile":"auto"}`)
+
+	renameCmd := newRenameCommandForTest(t)
+	require.NoError(t, renameCmd.Flags().Set("delete-old", "true"))
+	require.NoError(t, renameCmd.Flags().Set("json", "true"))
+	require.NoError(t, renameCmd.Flags().Set("plain", "true"))
+
+	out, err := captureStdout(t, func() error {
+		return runRename(renameCmd, []string{"codex", "auto-20260121-143022", "work-account"})
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "confirm delete old profile")
+	require.Contains(t, err.Error(), "--yes/--force")
+	require.Empty(t, out)
+	requireProfileExists(t, testVault, "codex", "auto-20260121-143022")
+	requireProfileMissing(t, testVault, "codex", "work-account")
+}
+
 func setupAliasRenameCommandTest(t *testing.T) *authfile.Vault {
 	t.Helper()
 
@@ -182,6 +245,7 @@ func newRenameCommandForTest(t *testing.T) *cobra.Command {
 	cmd.Flags().Bool("delete-old", false, "")
 	cmd.Flags().Bool("migrate-aliases", true, "")
 	cmd.Flags().Bool("json", false, "")
+	cmd.Flags().BoolP("force", "f", false, "")
 	cmd.Flags().BoolP("yes", "y", false, "")
 	addPromptModeFlags(cmd)
 	return cmd
@@ -209,6 +273,13 @@ func requireProfileExists(t *testing.T, testVault *authfile.Vault, tool, profile
 	info, err := os.Stat(testVault.ProfilePath(tool, profileName))
 	require.NoError(t, err)
 	require.True(t, info.IsDir())
+}
+
+func requireProfileMissing(t *testing.T, testVault *authfile.Vault, tool, profileName string) {
+	t.Helper()
+
+	_, err := os.Stat(testVault.ProfilePath(tool, profileName))
+	require.True(t, os.IsNotExist(err), "profile %s/%s exists or stat failed with unexpected error: %v", tool, profileName, err)
 }
 
 func requireFileContent(t *testing.T, path, want string) {

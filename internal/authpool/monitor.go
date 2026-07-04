@@ -53,7 +53,7 @@ type Monitor struct {
 	// State
 	mu        sync.Mutex
 	running   bool
-	stopping  bool      // Set when Stop() is called, prevents new refreshes
+	stopping  bool // Set when Stop() is called, prevents new refreshes
 	stopCh    chan struct{}
 	stopOnce  sync.Once // Ensures stopCh is only closed once
 	refreshWg sync.WaitGroup

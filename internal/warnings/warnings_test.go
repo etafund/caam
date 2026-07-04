@@ -59,9 +59,9 @@ func TestFormatDuration(t *testing.T) {
 
 func TestPrint(t *testing.T) {
 	tests := []struct {
-		name     string
-		warnings []Warning
-		noColor  bool
+		name        string
+		warnings    []Warning
+		noColor     bool
 		wantPrinted bool
 	}{
 		{

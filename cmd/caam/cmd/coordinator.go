@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -68,6 +70,8 @@ var (
 	coordinatorAuthToken    string
 )
 
+const coordinatorStatusMaxBytes = 1 << 20
+
 func init() {
 	rootCmd.AddCommand(coordinatorCmd)
 
@@ -82,6 +86,9 @@ func init() {
 		"Terminal multiplexer backend: wezterm (preferred), tmux, or auto")
 	coordinatorCmd.Flags().StringVar(&coordinatorConfigPath, "config", "", "Path to JSON config file")
 	coordinatorCmd.Flags().StringVar(&coordinatorAuthToken, "auth-token", "", "Auth token for coordinator API (shared secret)")
+
+	coordinatorStatusCmd.Flags().IntVar(&coordinatorPort, "port", 7890, "API server port")
+	coordinatorStatusCmd.Flags().StringVar(&coordinatorAuthToken, "auth-token", "", "Auth token for coordinator API (shared secret)")
 }
 
 func runCoordinator(cmd *cobra.Command, args []string) error {
@@ -324,12 +331,33 @@ var coordinatorStatusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show auth-coordinator status",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// This would make an HTTP request to the coordinator
-		// For now, just show how to check
-		fmt.Println("To check coordinator status:")
-		fmt.Printf("  curl http://localhost:%d/status\n", coordinatorPort)
-		fmt.Println("\nTo see pending auth requests:")
-		fmt.Printf("  curl http://localhost:%d/auth/pending\n", coordinatorPort)
+		status, err := fetchCoordinatorStatus(cmd.Context(), &http.Client{Timeout: 2 * time.Second}, coordinatorPort, coordinatorAuthToken)
+		if err != nil {
+			return err
+		}
+
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "Auth coordinator status\n")
+		fmt.Fprintf(out, "  Running: %t\n", status.Running)
+		fmt.Fprintf(out, "  Backend: %s\n", status.Backend)
+		fmt.Fprintf(out, "  Panes: %d\n", status.PaneCount)
+		fmt.Fprintf(out, "  Pending auths: %d\n", status.PendingAuths)
+		if len(status.Panes) > 0 {
+			fmt.Fprintln(out, "\nPanes:")
+			for _, pane := range status.Panes {
+				details := []string{fmt.Sprintf("state=%s", pane.State)}
+				if pane.RequestID != "" {
+					details = append(details, "request_id="+pane.RequestID)
+				}
+				if pane.Account != "" {
+					details = append(details, "account="+pane.Account)
+				}
+				if pane.Error != "" {
+					details = append(details, "error="+pane.Error)
+				}
+				fmt.Fprintf(out, "  %d: %s\n", pane.PaneID, strings.Join(details, " "))
+			}
+		}
 		return nil
 	},
 }
@@ -344,4 +372,70 @@ func filterClaudePanes(pane coordinator.Pane) bool {
 	return strings.Contains(title, "claude") ||
 		strings.Contains(title, "cc") ||
 		strings.Contains(title, "anthropic")
+}
+
+type coordinatorStatusResponse struct {
+	Running      bool                            `json:"running"`
+	Backend      string                          `json:"backend"`
+	PaneCount    int                             `json:"pane_count"`
+	PendingAuths int                             `json:"pending_auths"`
+	Panes        []coordinatorPaneStatusResponse `json:"panes"`
+}
+
+type coordinatorPaneStatusResponse struct {
+	PaneID       int       `json:"pane_id"`
+	State        string    `json:"state"`
+	StateEntered time.Time `json:"state_entered"`
+	RequestID    string    `json:"request_id,omitempty"`
+	Account      string    `json:"account,omitempty"`
+	Error        string    `json:"error,omitempty"`
+}
+
+type coordinatorStatusHTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+func fetchCoordinatorStatus(ctx context.Context, client coordinatorStatusHTTPClient, port int, token string) (*coordinatorStatusResponse, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	if port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid coordinator port %d", port)
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/status", port)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create coordinator status request: %w", err)
+	}
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else if envToken := strings.TrimSpace(os.Getenv("CAAM_COORDINATOR_TOKEN")); envToken != "" {
+		req.Header.Set("Authorization", "Bearer "+envToken)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("coordinator status unavailable at %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if readErr != nil {
+			return nil, fmt.Errorf("read coordinator status error response from %s: %w", url, readErr)
+		}
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			message = resp.Status
+		}
+		return nil, fmt.Errorf("coordinator status unavailable at %s: HTTP %d: %s", url, resp.StatusCode, message)
+	}
+
+	var status coordinatorStatusResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, coordinatorStatusMaxBytes)).Decode(&status); err != nil {
+		return nil, fmt.Errorf("decode coordinator status response: %w", err)
+	}
+
+	return &status, nil
 }

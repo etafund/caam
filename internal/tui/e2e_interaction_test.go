@@ -183,6 +183,62 @@ func TestE2E_ProfileSelectionWithJK(t *testing.T) {
 	})
 }
 
+func TestE2E_RapidResizeUpdateRenderLoop(t *testing.T) {
+	h := testutil.NewHarness(t)
+	defer h.Close()
+
+	h.Log.SetStep("rapid_resize_update_render")
+
+	m := NewWithProviders([]string{"claude", "codex"})
+	m.profiles = map[string][]Profile{
+		"claude": profiles(120),
+		"codex":  profiles(80),
+	}
+	m.syncProfilesPanel()
+
+	sizes := []tea.WindowSizeMsg{
+		{Width: 140, Height: 40},
+		{Width: 100, Height: 28},
+		{Width: 80, Height: 20},
+		{Width: 63, Height: 15},
+		{Width: 180, Height: 50},
+	}
+
+	for i := 0; i < 200; i++ {
+		size := sizes[i%len(sizes)]
+		updated, _ := m.Update(size)
+		m = updated.(Model)
+
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(Model)
+
+		if i%7 == 0 {
+			updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyTab})
+			m = updated.(Model)
+		}
+
+		view := m.View()
+		if view == "" {
+			t.Fatalf("empty view at iteration %d", i)
+		}
+		if m.width != size.Width || m.height != size.Height {
+			t.Fatalf("size drift at iteration %d: got %dx%d want %dx%d", i, m.width, m.height, size.Width, size.Height)
+		}
+		if profiles := m.currentProfiles(); len(profiles) > 0 && (m.selected < 0 || m.selected >= len(profiles)) {
+			t.Fatalf("selection out of range at iteration %d: selected=%d profiles=%d", i, m.selected, len(profiles))
+		}
+		if d := m.Diagnostics(); d.Width != m.width || d.Height != m.height || d.Focus == "" {
+			t.Fatalf("bad diagnostics at iteration %d: %+v", i, d)
+		}
+	}
+
+	h.Log.Info("Rapid resize/update/render loop verified", map[string]interface{}{
+		"final_size":     []int{m.width, m.height},
+		"final_provider": m.currentProvider(),
+		"final_selected": m.selected,
+	})
+}
+
 // TestE2E_DeleteConfirmationWorkflow tests delete with y/n confirmation.
 func TestE2E_DeleteConfirmationWorkflow(t *testing.T) {
 	h := testutil.NewHarness(t)

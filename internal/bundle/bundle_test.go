@@ -840,9 +840,9 @@ func TestNewEncryptionMetadataDefaults(t *testing.T) {
 // Tests for ValidationError.Error()
 func TestValidationErrorError(t *testing.T) {
 	tests := []struct {
-		name    string
-		err     *ValidationError
-		want    string
+		name string
+		err  *ValidationError
+		want string
 	}{
 		{
 			name: "with field",

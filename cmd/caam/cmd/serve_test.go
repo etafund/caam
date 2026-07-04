@@ -55,6 +55,11 @@ func TestServeFlagsDefaults(t *testing.T) {
 	if jsonFlag.DefValue != "false" {
 		t.Errorf("json default = %s, want false", jsonFlag.DefValue)
 	}
+
+	agentConfigFlag := serveCmd.Flags().Lookup("agent-config")
+	if agentConfigFlag == nil {
+		t.Fatal("agent-config flag not found")
+	}
 }
 
 func TestServeHelpOutput(t *testing.T) {
@@ -105,6 +110,7 @@ func TestServeShowTokenCreatesToken(t *testing.T) {
 	serveVerbose = false
 	serveShowToken = true
 	serveJSONLogs = false
+	serveAgentConfigPath = ""
 
 	// Note: We can't easily test runServe with --show-token because it requires
 	// the full vault/healthStore initialization from PersistentPreRunE.

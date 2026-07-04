@@ -4,26 +4,33 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 )
 
 // TUIDiagnostics is a sanitized snapshot of TUI state for debugging.
 type TUIDiagnostics struct {
-	Provider            string
-	ProviderCount       int
-	ActiveProviderIndex int
-	CurrentProfiles     int
-	TotalProfiles       int
-	SelectedIndex       int
-	State               string
-	Width               int
-	Height              int
-	Layout              string
-	SearchActive        bool
-	SearchQueryLength   int
-	UsageVisible        bool
-	SyncVisible         bool
-	NoColor             bool
-	ReducedMotion       bool
+	Provider             string
+	ProviderCount        int
+	ActiveProviderIndex  int
+	CurrentProfiles      int
+	TotalProfiles        int
+	SelectedIndex        int
+	State                string
+	Width                int
+	Height               int
+	Layout               string
+	SearchActive         bool
+	SearchQueryLength    int
+	UsageVisible         bool
+	SyncVisible          bool
+	NoColor              bool
+	ReducedMotion        bool
+	ProfilesScrollOffset int
+	ProfilesVisibleRows  int
+	ProfilesHoveredIndex int
+	DetailScrollOffset   int
+	HelpScrollOffset     int
+	Focus                string
 }
 
 var tuiDiagnosticsLogger = func() *slog.Logger {
@@ -42,23 +49,43 @@ func (m Model) Diagnostics() TUIDiagnostics {
 		currentProfiles = len(m.profiles[provider])
 	}
 
+	profilesScrollOffset := 0
+	profilesVisibleRows := 0
+	profilesHoveredIndex := -1
+	if m.profilesPanel != nil {
+		profilesScrollOffset = m.profilesPanel.scrollOffset
+		profilesVisibleRows = m.profilesPanel.visibleRowCapacity()
+		profilesHoveredIndex = m.profilesPanel.hoverIndex
+	}
+
+	detailScrollOffset := 0
+	if m.detailPanel != nil {
+		detailScrollOffset = m.detailPanel.scrollOffset
+	}
+
 	return TUIDiagnostics{
-		Provider:            m.currentProvider(),
-		ProviderCount:       len(m.providers),
-		ActiveProviderIndex: m.activeProvider,
-		CurrentProfiles:     currentProfiles,
-		TotalProfiles:       totalProfiles,
-		SelectedIndex:       m.selected,
-		State:               viewStateName(m.state),
-		Width:               m.width,
-		Height:              m.height,
-		Layout:              diagnosticLayoutModeName(m.layoutMode()),
-		SearchActive:        m.state == stateSearch,
-		SearchQueryLength:   len(m.searchQuery),
-		UsageVisible:        m.usagePanel != nil && m.usagePanel.Visible(),
-		SyncVisible:         m.syncPanel != nil && m.syncPanel.Visible(),
-		NoColor:             m.theme.NoColor,
-		ReducedMotion:       m.theme.ReducedMotion,
+		Provider:             m.currentProvider(),
+		ProviderCount:        len(m.providers),
+		ActiveProviderIndex:  m.activeProvider,
+		CurrentProfiles:      currentProfiles,
+		TotalProfiles:        totalProfiles,
+		SelectedIndex:        m.selected,
+		State:                viewStateName(m.state),
+		Width:                m.width,
+		Height:               m.height,
+		Layout:               diagnosticLayoutModeName(m.layoutMode()),
+		SearchActive:         m.state == stateSearch,
+		SearchQueryLength:    len(m.searchQuery),
+		UsageVisible:         m.usagePanel != nil && m.usagePanel.Visible(),
+		SyncVisible:          m.syncPanel != nil && m.syncPanel.Visible(),
+		NoColor:              m.theme.NoColor,
+		ReducedMotion:        m.theme.ReducedMotion,
+		ProfilesScrollOffset: profilesScrollOffset,
+		ProfilesVisibleRows:  profilesVisibleRows,
+		ProfilesHoveredIndex: profilesHoveredIndex,
+		DetailScrollOffset:   detailScrollOffset,
+		HelpScrollOffset:     m.helpScrollOffset,
+		Focus:                diagnosticFocusName(m),
 	}
 }
 
@@ -66,7 +93,7 @@ func (m Model) Diagnostics() TUIDiagnostics {
 func (m Model) DiagnosticsString() string {
 	d := m.Diagnostics()
 	return fmt.Sprintf(
-		"tui_diagnostics provider=%s provider_count=%d active_provider_index=%d current_profiles=%d total_profiles=%d selected=%d state=%s width=%d height=%d layout=%s search_active=%t search_query_len=%d usage_visible=%t sync_visible=%t no_color=%t reduced_motion=%t",
+		"tui_diagnostics provider=%s provider_count=%d active_provider_index=%d current_profiles=%d total_profiles=%d selected=%d state=%s width=%d height=%d layout=%s search_active=%t search_query_len=%d usage_visible=%t sync_visible=%t no_color=%t reduced_motion=%t profiles_scroll_offset=%d profiles_visible_rows=%d profiles_hovered_index=%d detail_scroll_offset=%d help_scroll_offset=%d focus=%s",
 		d.Provider,
 		d.ProviderCount,
 		d.ActiveProviderIndex,
@@ -83,6 +110,12 @@ func (m Model) DiagnosticsString() string {
 		d.SyncVisible,
 		d.NoColor,
 		d.ReducedMotion,
+		d.ProfilesScrollOffset,
+		d.ProfilesVisibleRows,
+		d.ProfilesHoveredIndex,
+		d.DetailScrollOffset,
+		d.HelpScrollOffset,
+		d.Focus,
 	)
 }
 
@@ -118,6 +151,50 @@ func (m Model) logDebugDiagnostics(event string, msg any) {
 		slog.Bool("sync_visible", d.SyncVisible),
 		slog.Bool("no_color", d.NoColor),
 		slog.Bool("reduced_motion", d.ReducedMotion),
+		slog.Int("profiles_scroll_offset", d.ProfilesScrollOffset),
+		slog.Int("profiles_visible_rows", d.ProfilesVisibleRows),
+		slog.Int("profiles_hovered_index", d.ProfilesHoveredIndex),
+		slog.Int("detail_scroll_offset", d.DetailScrollOffset),
+		slog.Int("help_scroll_offset", d.HelpScrollOffset),
+		slog.String("focus", d.Focus),
+	)
+}
+
+func (m Model) logDebugRenderTiming(event string, duration time.Duration, renderedBytes int, renderedLines int) {
+	if !tuiDebugEnabled() {
+		return
+	}
+
+	d := m.Diagnostics()
+	logger := tuiDiagnosticsLogger()
+	if logger == nil {
+		return
+	}
+	logger.LogAttrs(
+		context.Background(),
+		slog.LevelDebug,
+		"tui render timing",
+		slog.String("event", event),
+		slog.Duration("render_duration", duration),
+		slog.Float64("render_duration_ms", float64(duration.Microseconds())/1000),
+		slog.Int("rendered_bytes", renderedBytes),
+		slog.Int("rendered_lines", renderedLines),
+		slog.String("provider", d.Provider),
+		slog.Int("provider_count", d.ProviderCount),
+		slog.Int("active_provider_index", d.ActiveProviderIndex),
+		slog.Int("current_profiles", d.CurrentProfiles),
+		slog.Int("total_profiles", d.TotalProfiles),
+		slog.Int("selected", d.SelectedIndex),
+		slog.String("state", d.State),
+		slog.Int("width", d.Width),
+		slog.Int("height", d.Height),
+		slog.String("layout", d.Layout),
+		slog.Int("profiles_scroll_offset", d.ProfilesScrollOffset),
+		slog.Int("profiles_visible_rows", d.ProfilesVisibleRows),
+		slog.Int("profiles_hovered_index", d.ProfilesHoveredIndex),
+		slog.Int("detail_scroll_offset", d.DetailScrollOffset),
+		slog.Int("help_scroll_offset", d.HelpScrollOffset),
+		slog.String("focus", d.Focus),
 	)
 }
 
@@ -171,4 +248,22 @@ func diagnosticLayoutModeName(mode layoutMode) string {
 	default:
 		return "unknown"
 	}
+}
+
+func diagnosticFocusName(m Model) string {
+	switch m.state {
+	case stateHelp:
+		return "help"
+	case stateSearch:
+		return "search"
+	case stateBackupDialog, stateConfirmOverwrite, stateExportConfirm, stateImportPath, stateImportConfirm, stateEditProfile, stateSyncAdd, stateSyncEdit, stateCommandPalette:
+		return "dialog"
+	}
+	if m.usagePanel != nil && m.usagePanel.Visible() {
+		return "usage"
+	}
+	if m.syncPanel != nil && m.syncPanel.Visible() {
+		return "sync"
+	}
+	return "profiles"
 }

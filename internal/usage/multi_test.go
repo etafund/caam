@@ -78,6 +78,7 @@ func TestFetchAllProfilesCancellationDuringSpacing(t *testing.T) {
 	defer server.Close()
 
 	ctx, cancelFn := context.WithCancel(context.Background())
+	defer cancelFn()
 	cancel = cancelFn
 	fetcher := NewMultiProfileFetcher(WithSameProviderPacing(250*time.Millisecond, 0))
 	fetcher.claudeFetcher.baseURL = server.URL
@@ -98,5 +99,37 @@ func TestFetchAllProfilesCancellationDuringSpacing(t *testing.T) {
 	}
 	if elapsed >= 150*time.Millisecond {
 		t.Fatalf("FetchAllProfiles took %s after cancellation, want under 150ms", elapsed)
+	}
+}
+
+func TestGetProfilesAboveThresholdExcludesUnavailableUsage(t *testing.T) {
+	var requestCount int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch atomic.AddInt64(&requestCount, 1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"five_hour":{"utilization":10,"resets_at":"2030-01-01T00:00:00Z"}}`))
+		case 2:
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+	}))
+	defer server.Close()
+
+	fetcher := NewMultiProfileFetcher(WithSameProviderPacing(0, 0))
+	fetcher.claudeFetcher.baseURL = server.URL
+
+	got := fetcher.GetProfilesAboveThreshold(context.Background(), "claude", map[string]string{
+		"available":    "tok-ok",
+		"rate-limited": "tok-rate",
+		"errored":      "tok-error",
+	}, 0.8)
+
+	if len(got) != 1 {
+		t.Fatalf("available profiles = %+v, want exactly one", got)
+	}
+	if got[0].ProfileName != "available" {
+		t.Fatalf("available profile = %q, want available", got[0].ProfileName)
 	}
 }

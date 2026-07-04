@@ -10,33 +10,46 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "deps:audit": "pnpm audit --audit-level critical",
+    "deps:audit": "pnpm audit --audit-level high",
     "deps:health": "node scripts/dependency-health.mjs",
     "deps:health:check": "node scripts/dependency-health.mjs --check",
     "security:check": "pnpm run deps:audit && pnpm run deps:health:check"
   },
   "dependencies": {
-    "next": "16.1.4",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
-    "lucide-react": "^0.513.0",
-    "framer-motion": "^12.18.0"
+    "framer-motion": "12.42.2",
+    "lucide-react": "1.23.0",
+    "next": "16.2.10",
+    "react": "19.2.7",
+    "react-dom": "19.2.7"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "^4.1.18",
-    "@types/node": "^20.19.30",
-    "@types/react": "^19.2.9",
-    "@types/react-dom": "^19.2.3",
-    "eslint": "^9.39.2",
-    "eslint-config-next": "16.1.4",
-    "tailwindcss": "^4.1.18",
-    "typescript": "^5.9.3",
-    "@playwright/test": "^1.52.1",
-    "vitest": "^3.2.6",
-    "@testing-library/react": "^16.3.0",
-    "@vitejs/plugin-react": "^4.5.4",
-    "jsdom": "^26.1.0",
-    "@testing-library/jest-dom": "^6.6.3"
+    "@playwright/test": "1.61.1",
+    "@tailwindcss/postcss": "4.3.2",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "26.1.0",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.3",
+    "eslint": "9.39.2",
+    "eslint-config-next": "16.2.10",
+    "jsdom": "29.1.1",
+    "tailwindcss": "4.3.2",
+    "typescript": "5.9.3",
+    "vite": "8.1.3",
+    "vitest": "4.1.9"
+  },
+  "pnpm": {
+    "overrides": {
+      "@babel/core": "7.29.7",
+      "brace-expansion": "2.0.3",
+      "flatted": "3.4.2",
+      "minimatch@^3.1.2": "3.1.5",
+      "minimatch@^9.0.0": "9.0.9",
+      "picomatch@^2.3.1": "2.3.2",
+      "picomatch@^4.0.0": "4.0.5",
+      "postcss": "8.5.16"
+    }
   },
   "engines": {
     "node": ">=22.0.0",

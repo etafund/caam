@@ -35,6 +35,7 @@ func init() {
 	renameCmd.Flags().Bool("delete-old", false, "delete the old profile after copying (destructive)")
 	renameCmd.Flags().Bool("migrate-aliases", true, "migrate aliases from old to new profile")
 	renameCmd.Flags().Bool("json", false, "output in JSON format")
+	renameCmd.Flags().BoolP("force", "f", false, "skip confirmation for --delete-old")
 	renameCmd.Flags().BoolP("yes", "y", false, "skip confirmation for --delete-old")
 	addPromptModeFlags(renameCmd)
 }
@@ -47,7 +48,9 @@ func runRename(cmd *cobra.Command, args []string) error {
 	deleteOld, _ := cmd.Flags().GetBool("delete-old")
 	migrateAliases, _ := cmd.Flags().GetBool("migrate-aliases")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
-	skipConfirm, _ := cmd.Flags().GetBool("yes")
+	yes, _ := cmd.Flags().GetBool("yes")
+	force, _ := cmd.Flags().GetBool("force")
+	skipConfirm := yes || force
 
 	// Validate tool
 	if _, ok := tools[tool]; !ok {
@@ -79,6 +82,15 @@ func runRename(cmd *cobra.Command, args []string) error {
 	}
 	if newExists {
 		return fmt.Errorf("destination profile %s/%s already exists; choose a different name or delete it with 'caam delete %s %s'", tool, newName, tool, newName)
+	}
+
+	deleteConfirmed := skipConfirm
+	if deleteOld && !skipConfirm {
+		confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Delete old profile %s/%s? This cannot be undone.", tool, oldName), false)
+		if err != nil {
+			return fmt.Errorf("confirm delete old profile: %w", err)
+		}
+		deleteConfirmed = confirmed
 	}
 
 	// Copy the profile
@@ -122,23 +134,17 @@ func runRename(cmd *cobra.Command, args []string) error {
 
 	// Delete old profile if requested (with confirmation)
 	if deleteOld {
-		if !skipConfirm {
-			confirmed, err := confirmPromptFromCommand(cmd.Context(), cmd, fmt.Sprintf("Delete old profile %s/%s? This cannot be undone.", tool, oldName), false)
-			if err != nil {
-				return fmt.Errorf("confirm delete old profile: %w", err)
-			}
-			if !confirmed {
-				if jsonOutput {
-					result["deleted"] = false
-					result["delete_skipped"] = "user declined"
-					data, _ := json.MarshalIndent(result, "", "  ")
-					fmt.Println(string(data))
-					return nil
-				}
-				fmt.Println("Skipped deletion. Old profile preserved.")
-				fmt.Printf("\nProfile copied: %s/%s -> %s/%s\n", tool, oldName, tool, newName)
+		if !deleteConfirmed {
+			if jsonOutput {
+				result["deleted"] = false
+				result["delete_skipped"] = "user declined"
+				data, _ := json.MarshalIndent(result, "", "  ")
+				fmt.Println(string(data))
 				return nil
 			}
+			fmt.Println("Skipped deletion. Old profile preserved.")
+			fmt.Printf("\nProfile copied: %s/%s -> %s/%s\n", tool, oldName, tool, newName)
+			return nil
 		}
 
 		if err := vault.Delete(tool, oldName); err != nil {

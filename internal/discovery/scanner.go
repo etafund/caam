@@ -38,9 +38,9 @@ type DiscoveredAuth struct {
 
 // ScanResult holds all discovered auth sessions.
 type ScanResult struct {
-	Found     []DiscoveredAuth      // Auth files that were found
-	NotFound  []Tool                // Tools with no auth files
-	ToolPaths map[Tool][]string     // All auth file paths checked per tool
+	Found     []DiscoveredAuth  // Auth files that were found
+	NotFound  []Tool            // Tools with no auth files
+	ToolPaths map[Tool][]string // All auth file paths checked per tool
 }
 
 // Scan checks all supported tools for existing auth files.

@@ -59,19 +59,19 @@ func (s PaneState) String() string {
 
 // PaneTracker tracks the state of a single pane.
 type PaneTracker struct {
-	PaneID        int
-	State         PaneState
-	LastCheck     time.Time
-	StateEntered  time.Time
-	OAuthURL      string
-	RequestID     string // ID for auth request
-	ReceivedCode  string // Code received from local agent
-	UsedAccount   string // Account used for auth
-	ErrorMessage  string
-	RetryCount    int
-	LastOutput    string // Cached output for duplicate detection
-	Cooldowns     map[string]time.Time // action -> cooldown expiry
-	mu            sync.RWMutex
+	PaneID       int
+	State        PaneState
+	LastCheck    time.Time
+	StateEntered time.Time
+	OAuthURL     string
+	RequestID    string // ID for auth request
+	ReceivedCode string // Code received from local agent
+	UsedAccount  string // Account used for auth
+	ErrorMessage string
+	RetryCount   int
+	LastOutput   string               // Cached output for duplicate detection
+	Cooldowns    map[string]time.Time // action -> cooldown expiry
+	mu           sync.RWMutex
 }
 
 // NewPaneTracker creates a tracker for a pane.

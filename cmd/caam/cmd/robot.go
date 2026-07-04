@@ -4,10 +4,12 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -139,6 +141,7 @@ type RobotCoordinator struct {
 }
 
 const robotDocsSchemaVersion = 1
+const robotCoordinatorPendingMaxBytes = 1 << 20
 
 type RobotDocEntry struct {
 	Command     string   `json:"command"`
@@ -205,6 +208,58 @@ type RobotActResult struct {
 	Message    string `json:"message"`
 }
 
+type robotActActionSpec struct {
+	Action      string
+	Usage       string
+	Description string
+}
+
+var robotActActionSpecs = []robotActActionSpec{
+	{Action: "activate", Usage: "activate <provider> <profile>", Description: "Activate a profile"},
+	{Action: "cooldown", Usage: "cooldown <provider> <profile> [duration]", Description: "Start cooldown"},
+	{Action: "uncooldown", Usage: "uncooldown <provider> <profile>", Description: "Clear cooldown"},
+	{Action: "backup", Usage: "backup <provider> [profile]", Description: "Backup current auth"},
+}
+
+func robotActActionNames() []string {
+	names := make([]string, 0, len(robotActActionSpecs))
+	for _, spec := range robotActActionSpecs {
+		names = append(names, spec.Action)
+	}
+	return names
+}
+
+func robotActSupportedActionsHelp() string {
+	var b strings.Builder
+	for _, spec := range robotActActionSpecs {
+		fmt.Fprintf(&b, "  %-42s - %s\n", spec.Usage, spec.Description)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func robotActValidActionsDetail() string {
+	return "valid actions: " + strings.Join(robotActActionNames(), ", ")
+}
+
+func robotActActionSuggestions() []string {
+	suggestions := make([]string, 0, len(robotActActionSpecs))
+	for _, spec := range robotActActionSpecs {
+		suggestions = append(suggestions, "caam robot act "+spec.Usage)
+	}
+	return suggestions
+}
+
+func robotActDocEntries() []RobotDocEntry {
+	entries := make([]RobotDocEntry, 0, len(robotActActionSpecs))
+	for _, spec := range robotActActionSpecs {
+		entries = append(entries, RobotDocEntry{
+			Command:     "caam robot act " + spec.Usage,
+			Description: spec.Description + " through robot JSON output.",
+		})
+	}
+	return entries
+}
+
 var robotCmd = &cobra.Command{
 	Use:   "robot [command]",
 	Short: "Agent-optimized commands (JSON output)",
@@ -259,11 +314,7 @@ var robotActCmd = &cobra.Command{
 	Long: `Execute an action and return the result.
 
 Supported actions:
-  activate <provider> <profile>  - Activate a profile
-  cooldown <provider> <profile> [duration]  - Start cooldown
-  uncooldown <provider> <profile>  - Clear cooldown
-  refresh <provider> <profile>  - Refresh token
-  backup <provider> <profile>   - Backup current auth
+` + robotActSupportedActionsHelp() + `
 
 All actions return structured results with success/failure status.`,
 	Args: cobra.MinimumNArgs(2),
@@ -616,18 +667,45 @@ func robotFormatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dd", days)
 }
 
+var robotCoordinatorConfigPath string
+
 func checkCoordinators() []RobotCoordinator {
-	// Check known coordinator endpoints
-	// This is a simplified version - in production, this would read from config
-	endpoints := []struct {
-		name string
-		url  string
-	}{
-		{"local", "http://localhost:7890"},
+	agentEndpoints, err := loadConfiguredCoordinatorEndpoints(robotCoordinatorConfigPath)
+	if err != nil {
+		return []RobotCoordinator{{
+			Name:    "config",
+			Healthy: false,
+			Error:   fmt.Sprintf("load coordinator config: %v", err),
+		}}
+	}
+	endpoints := make([]robotCoordinatorEndpoint, 0, len(agentEndpoints))
+	for _, endpoint := range agentEndpoints {
+		if endpoint == nil {
+			continue
+		}
+		endpoints = append(endpoints, robotCoordinatorEndpoint{
+			name:  endpoint.Name,
+			url:   endpoint.URL,
+			token: endpoint.Token,
+		})
 	}
 
-	var coords []RobotCoordinator
 	client := &http.Client{Timeout: 2 * time.Second}
+	return checkCoordinatorEndpoints(client, endpoints)
+}
+
+type robotCoordinatorEndpoint struct {
+	name  string
+	url   string
+	token string
+}
+
+func checkCoordinatorEndpoints(client *http.Client, endpoints []robotCoordinatorEndpoint) []RobotCoordinator {
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Second}
+	}
+
+	coords := make([]RobotCoordinator, 0, len(endpoints))
 
 	for _, ep := range endpoints {
 		coord := RobotCoordinator{
@@ -636,22 +714,23 @@ func checkCoordinators() []RobotCoordinator {
 		}
 
 		start := time.Now()
-		resp, err := client.Get(ep.url + "/status")
+		statusCode, err := coordinatorStatusCode(client, ep.url, ep.token)
 		coord.Latency = time.Since(start).Milliseconds()
 
 		if err != nil {
 			coord.Error = err.Error()
 			coord.Healthy = false
+		} else if statusCode != http.StatusOK {
+			coord.Error = fmt.Sprintf("status endpoint returned HTTP %d", statusCode)
+			coord.Healthy = false
 		} else {
-			resp.Body.Close()
-			coord.Healthy = resp.StatusCode == http.StatusOK
+			coord.Healthy = true
 
-			// Try to get pending count
-			if pendResp, err := client.Get(ep.url + "/auth/pending"); err == nil {
-				var pending []interface{}
-				json.NewDecoder(pendResp.Body).Decode(&pending)
-				pendResp.Body.Close()
-				coord.Pending = len(pending)
+			pending, err := coordinatorPendingCount(client, ep.url, ep.token)
+			if err != nil {
+				coord.Error = err.Error()
+			} else {
+				coord.Pending = pending
 			}
 		}
 
@@ -659,6 +738,52 @@ func checkCoordinators() []RobotCoordinator {
 	}
 
 	return coords
+}
+
+func coordinatorStatusCode(client *http.Client, baseURL string, token string) (int, error) {
+	req, err := coordinatorRequest(http.MethodGet, baseURL+"/status", token)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+func coordinatorPendingCount(client *http.Client, baseURL string, token string) (int, error) {
+	req, err := coordinatorRequest(http.MethodGet, baseURL+"/auth/pending", token)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("pending endpoint returned HTTP %d", resp.StatusCode)
+	}
+
+	var pending []interface{}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, robotCoordinatorPendingMaxBytes)).Decode(&pending); err != nil {
+		return 0, fmt.Errorf("decode pending response: %w", err)
+	}
+	return len(pending), nil
+}
+
+func coordinatorRequest(method, rawURL, token string) (*http.Request, error) {
+	req, err := http.NewRequest(method, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return req, nil
 }
 
 func runRobotNext(cmd *cobra.Command, args []string) error {
@@ -773,13 +898,11 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 			}
 		}
 
-		// LRU bonus (strategy-dependent)
+		// LRU adjustment (strategy-dependent)
 		if strategy == "lru" || strategy == "smart" {
-			// Could check last used time here
-			// For now, just slightly favor non-active profiles
-			if !pInfo.Active {
-				sp.score += 5
-			}
+			delta, reason := robotLRUScore(provider, profileName, db, now)
+			sp.score += delta
+			sp.reasons = append(sp.reasons, reason)
 		}
 
 		scored = append(scored, sp)
@@ -841,6 +964,34 @@ func runRobotNext(cmd *cobra.Command, args []string) error {
 	return robotOutput(cmd, output)
 }
 
+func robotLRUScore(provider, profile string, db *caamdb.DB, now time.Time) (float64, string) {
+	if db == nil {
+		return 0, "lru unavailable: local activity database unavailable; neutral"
+	}
+
+	last, err := db.LastActivation(provider, profile)
+	if err != nil {
+		return 0, fmt.Sprintf("lru unavailable: failed to read activation history: %v; neutral", err)
+	}
+	if last.IsZero() {
+		return 0, "lru unavailable: no local activation history; neutral"
+	}
+
+	age := now.Sub(last)
+	switch {
+	case age < 0:
+		return -25, "last activated in the future; lru penalty"
+	case age < 30*time.Minute:
+		return -25, fmt.Sprintf("last activated %s ago; lru penalty", robotFormatDuration(age))
+	case age < 2*time.Hour:
+		return -10, fmt.Sprintf("last activated %s ago; lru penalty", robotFormatDuration(age))
+	case age < 24*time.Hour:
+		return 10, fmt.Sprintf("last activated %s ago; lru bonus", robotFormatDuration(age))
+	default:
+		return 25, fmt.Sprintf("last activated %s ago; lru bonus", robotFormatDuration(age))
+	}
+}
+
 func runRobotAct(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 	action := strings.ToLower(args[0])
@@ -897,9 +1048,14 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 
 		duration := 4 * time.Hour // default
 		if len(args) >= 4 {
-			if d, err := time.ParseDuration(args[3]); err == nil {
-				duration = d
+			d, err := time.ParseDuration(args[3])
+			if err != nil || d <= 0 {
+				return robotError(cmd, "act", "INVALID_DURATION",
+					fmt.Sprintf("invalid cooldown duration: %s", args[3]),
+					"duration must be a positive Go duration such as 30m, 1h, or 90m",
+					[]string{"caam robot act cooldown <provider> <profile> 1h"})
 			}
+			duration = d
 		}
 
 		db, err := caamdb.Open()
@@ -980,13 +1136,8 @@ func runRobotAct(cmd *cobra.Command, args []string) error {
 	default:
 		return robotError(cmd, "act", "INVALID_ACTION",
 			fmt.Sprintf("unknown action: %s", action),
-			"valid actions: activate, cooldown, uncooldown, backup",
-			[]string{
-				"caam robot act activate <provider> <profile>",
-				"caam robot act cooldown <provider> <profile> [duration]",
-				"caam robot act uncooldown <provider> <profile>",
-				"caam robot act backup <provider> [profile]",
-			})
+			robotActValidActionsDetail(),
+			robotActActionSuggestions())
 	}
 
 	duration := time.Since(start)
@@ -1201,7 +1352,7 @@ func runRobotQuickStart(cmd *cobra.Command, args []string) error {
 caam robot status              # Full system overview
 caam robot status claude       # Single provider
 caam robot next claude         # Best profile recommendation
-caam robot limits claude       # Rate limits + burn rate
+caam robot limits claude       # Cached health signals
 caam robot precheck claude     # Session planner
 ` + "```" + `
 
@@ -1211,8 +1362,6 @@ caam robot act activate claude <profile>   # Switch profile
 caam robot act cooldown claude <profile> 1h  # Set cooldown
 caam robot act uncooldown claude <profile>   # Clear cooldown
 caam robot act backup claude [name]          # Backup current auth
-caam robot act delete claude <profile>       # Delete profile
-caam robot act refresh claude <profile>      # Refresh token
 ` + "```" + `
 
 ## Diagnostics
@@ -1295,11 +1444,12 @@ func runRobotDocs(cmd *cobra.Command, args []string) error {
 
 	if ndjson {
 		enc := json.NewEncoder(cmd.OutOrStdout())
+		timestamp := time.Now().UTC().Format(time.RFC3339)
 		for _, topicData := range data.Topics {
 			fragment := RobotOutput{
 				Success:   true,
 				Command:   "docs",
-				Timestamp: output.Timestamp,
+				Timestamp: timestamp,
 				Data: RobotDocsData{
 					Version:       data.Version,
 					SchemaVersion: data.SchemaVersion,
@@ -1353,7 +1503,7 @@ func getRobotDocs(topic string) (RobotDocsData, error) {
 		{
 			Topic:       "commands",
 			Description: "Core CAAM commands used by agents.",
-			Commands: []RobotDocEntry{
+			Commands: append([]RobotDocEntry{
 				{
 					Command:     "caam backup <tool> <profile>",
 					Description: "Store current auth files in the vault.",
@@ -1387,7 +1537,7 @@ func getRobotDocs(topic string) (RobotDocsData, error) {
 					Command:     "caam robot",
 					Description: "Machine-optimized command surface (always JSON).",
 				},
-			},
+			}, robotActDocEntries()...),
 		},
 		{
 			Topic:       "flags",
@@ -1474,11 +1624,11 @@ func getRobotDocs(topic string) (RobotDocsData, error) {
 
 var robotLimitsCmd = &cobra.Command{
 	Use:   "limits <provider>",
-	Short: "Fetch rate limits and burn rate",
-	Long: `Fetches real-time rate limit data from provider APIs.
+	Short: "Show cached local availability signals",
+	Long: `Shows cached local availability signals from CAAM health data and local cooldown records.
 
-Returns usage percentages, reset times, burn rates, and depletion forecasts.
-Useful for deciding when to switch profiles.`,
+This command is local-only. It returns availability scores and recommendations
+for deciding when to switch profiles from robot mode. No network calls are performed.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRobotLimits,
 }
@@ -1490,7 +1640,7 @@ var robotPrecheckCmd = &cobra.Command{
 - Recommended profile with score breakdown
 - Backup profiles in priority order
 - Profiles in cooldown
-- Usage forecasts and alerts
+- Cached health alerts
 - Quick action commands`,
 	Args: cobra.ExactArgs(1),
 	RunE: runRobotPrecheck,
@@ -1503,7 +1653,11 @@ var robotValidateCmd = &cobra.Command{
 
 Without arguments, validates all profiles.
 With provider, validates all profiles for that provider.
-With provider and profile, validates that specific profile.`,
+With provider and profile, validates that specific profile.
+
+Use --active to request active validation. Providers without safe active probes
+return status=active_unsupported and method=passive instead of claiming active
+validation was performed.`,
 	Args: cobra.MaximumNArgs(2),
 	RunE: runRobotValidate,
 }
@@ -1588,6 +1742,7 @@ func init() {
 	robotStatusCmd.Flags().String("provider", "", "filter to specific provider")
 	robotStatusCmd.Flags().Bool("compact", false, "minimal output")
 	robotStatusCmd.Flags().Bool("include-coordinators", false, "check coordinator status")
+	robotStatusCmd.Flags().StringVar(&robotCoordinatorConfigPath, "agent-config", "", "Path to auth-agent JSON config for coordinator checks")
 
 	// Next flags
 	robotNextCmd.Flags().String("strategy", "smart", "selection strategy: smart, lru, random")
@@ -1598,14 +1753,14 @@ func init() {
 	robotWatchCmd.Flags().String("provider", "", "filter to specific provider")
 
 	// Limits flags
-	robotLimitsCmd.Flags().Bool("forecast", false, "include depletion forecasts")
+	robotLimitsCmd.Flags().Bool("forecast", false, "accepted for CLI compatibility; output remains cached local health signals only")
 
 	// Precheck flags
-	robotPrecheckCmd.Flags().Duration("timeout", 30*time.Second, "API fetch timeout")
-	robotPrecheckCmd.Flags().Bool("no-fetch", false, "skip API calls (use cached data)")
+	robotPrecheckCmd.Flags().Duration("timeout", 30*time.Second, "accepted for CLI compatibility; robot precheck uses cached data")
+	robotPrecheckCmd.Flags().Bool("no-fetch", false, "accepted for CLI compatibility; robot precheck already uses cached data")
 
 	// Validate flags
-	robotValidateCmd.Flags().Bool("active", false, "perform active validation (API calls)")
+	robotValidateCmd.Flags().Bool("active", false, "request active validation; unsupported probes report status=active_unsupported")
 
 	// Doctor flags
 	robotDoctorCmd.Flags().Bool("fix", false, "attempt to fix issues")
@@ -1618,23 +1773,24 @@ func init() {
 	robotDocsCmd.Flags().Bool("ndjson", false, "emit newline-delimited JSON")
 }
 
-// RobotLimitsData contains rate limit information.
+// RobotLimitsData contains cached local availability signal information.
 type RobotLimitsData struct {
 	Provider string               `json:"provider"`
 	Profiles []RobotProfileLimits `json:"profiles"`
 }
 
-// RobotProfileLimits contains rate limits for a profile.
+// RobotProfileLimits contains cached local availability signals for a profile.
 type RobotProfileLimits struct {
-	Name           string `json:"name"`
-	AvailScore     int    `json:"availability_score"`
-	PrimaryPct     int    `json:"primary_percent,omitempty"`
-	SecondaryPct   int    `json:"secondary_percent,omitempty"`
-	ResetsIn       string `json:"resets_in,omitempty"`
-	BurnRate       string `json:"burn_rate,omitempty"`
-	DepletesIn     string `json:"depletes_in,omitempty"`
-	Error          string `json:"error,omitempty"`
-	Recommendation string `json:"recommendation,omitempty"`
+	Name           string         `json:"name"`
+	AvailScore     int            `json:"availability_score"`
+	PrimaryPct     int            `json:"primary_percent,omitempty"`
+	SecondaryPct   int            `json:"secondary_percent,omitempty"`
+	ResetsIn       string         `json:"resets_in,omitempty"`
+	BurnRate       string         `json:"burn_rate,omitempty"`
+	DepletesIn     string         `json:"depletes_in,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Recommendation string         `json:"recommendation,omitempty"`
+	Cooldown       *RobotCooldown `json:"cooldown,omitempty"`
 }
 
 func runRobotLimits(cmd *cobra.Command, args []string) error {
@@ -1648,7 +1804,7 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 			nil)
 	}
 
-	// For now, use health data as a proxy. Full implementation would call usage APIs.
+	// Use cached health data as the local availability signal.
 	profiles, err := vault.List(provider)
 	if err != nil {
 		return robotError(cmd, "limits", "VAULT_ERROR",
@@ -1669,6 +1825,18 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 		Profiles: make([]RobotProfileLimits, 0, len(profiles)),
 	}
 
+	db, err := caamdb.Open()
+	if err != nil {
+		return robotError(cmd, "limits", "DB_ERROR",
+			"failed to open cooldown database",
+			err.Error(),
+			nil)
+	}
+	defer func() {
+		_ = db.Close()
+	}()
+	now := time.Now()
+
 	for _, profileName := range profiles {
 		if strings.HasPrefix(profileName, "_") {
 			continue
@@ -1678,7 +1846,29 @@ func runRobotLimits(cmd *cobra.Command, args []string) error {
 			Name: profileName,
 		}
 
-		// Get health info for estimates
+		if ev, err := db.ActiveCooldown(provider, profileName, now); err != nil {
+			return robotError(cmd, "limits", "DB_ERROR",
+				fmt.Sprintf("failed to read cooldown for %s/%s", provider, profileName),
+				err.Error(),
+				nil)
+		} else if ev != nil {
+			remaining := ev.CooldownUntil.Sub(now)
+			if remaining > 0 {
+				limits.AvailScore = 0
+				limits.Recommendation = fmt.Sprintf("wait for cooldown (%s remaining)", robotFormatDuration(remaining))
+				limits.Cooldown = &RobotCooldown{
+					Active:       true,
+					Until:        ev.CooldownUntil.Format(time.RFC3339),
+					RemainingMs:  remaining.Milliseconds(),
+					RemainingStr: robotFormatDuration(remaining),
+					Reason:       ev.Notes,
+				}
+				data.Profiles = append(data.Profiles, limits)
+				continue
+			}
+		}
+
+		// Get cached health info for local availability.
 		ph, _ := getProfileHealthWithIdentity(provider, profileName)
 		status := health.CalculateStatus(ph)
 
@@ -1808,8 +1998,7 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 	}
 
 	now := time.Now()
-	var bestScore float64 = -9999
-	var bestProfile string
+	candidates := make([]RobotPrecheckProfile, 0, len(profiles))
 
 	for _, profileName := range profiles {
 		if strings.HasPrefix(profileName, "_") {
@@ -1863,25 +2052,18 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		}
 
 		data.Summary.Ready++
-
-		if rec.Score > bestScore {
-			bestScore = rec.Score
-			bestProfile = profileName
-			data.Recommended = &RobotPrecheckProfile{
-				Name:    rec.Name,
-				Score:   rec.Score,
-				Health:  rec.Health,
-				Reasons: rec.Reasons,
-			}
-		} else {
-			data.Backups = append(data.Backups, rec)
-		}
+		candidates = append(candidates, rec)
 	}
 
-	// Update recommended from backups if needed
-	if data.Recommended == nil && len(data.Backups) > 0 {
-		data.Recommended = &data.Backups[0]
-		data.Backups = data.Backups[1:]
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Score == candidates[j].Score {
+			return candidates[i].Name < candidates[j].Name
+		}
+		return candidates[i].Score > candidates[j].Score
+	})
+	if len(candidates) > 0 {
+		data.Recommended = &candidates[0]
+		data.Backups = append(data.Backups, candidates[1:]...)
 	}
 
 	if data.Recommended != nil {
@@ -1906,8 +2088,6 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	_ = bestProfile // Used above
-
 	duration := time.Since(start)
 	output := RobotOutput{
 		Success: true,
@@ -1924,103 +2104,104 @@ func runRobotPrecheck(cmd *cobra.Command, args []string) error {
 
 // RobotValidateData contains validation results.
 type RobotValidateData struct {
-	Method   string                `json:"method"`
-	Profiles []RobotValidateResult `json:"profiles"`
-	Summary  RobotValidateSummary  `json:"summary"`
+	Method          string                `json:"method"`
+	RequestedMethod string                `json:"requested_method"`
+	Status          string                `json:"status"`
+	Profiles        []RobotValidateResult `json:"profiles"`
+	Summary         RobotValidateSummary  `json:"summary"`
 }
 
 // RobotValidateResult is a single validation result.
 type RobotValidateResult struct {
-	Provider  string `json:"provider"`
-	Profile   string `json:"profile"`
-	Valid     bool   `json:"valid"`
-	ExpiresAt string `json:"expires_at,omitempty"`
-	ExpiresIn string `json:"expires_in,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Provider        string `json:"provider"`
+	Profile         string `json:"profile"`
+	Valid           bool   `json:"valid"`
+	Method          string `json:"method"`
+	RequestedMethod string `json:"requested_method"`
+	Status          string `json:"status"`
+	ExpiresAt       string `json:"expires_at,omitempty"`
+	ExpiresIn       string `json:"expires_in,omitempty"`
+	ErrorCode       string `json:"error_code,omitempty"`
+	Error           string `json:"error,omitempty"`
 }
 
 // RobotValidateSummary contains validation summary.
 type RobotValidateSummary struct {
-	Total   int `json:"total"`
-	Valid   int `json:"valid"`
-	Invalid int `json:"invalid"`
+	Total       int `json:"total"`
+	Valid       int `json:"valid"`
+	Invalid     int `json:"invalid"`
+	Unsupported int `json:"unsupported"`
 }
 
 func runRobotValidate(cmd *cobra.Command, args []string) error {
 	start := time.Now()
 
-	var providersToCheck []string
+	var providerFilter string
 	var profileFilter string
+	active, _ := cmd.Flags().GetBool("active")
 
 	if len(args) >= 1 {
 		provider := strings.ToLower(args[0])
 		if _, ok := tools[provider]; !ok {
 			return robotError(cmd, "validate", "INVALID_PROVIDER",
 				fmt.Sprintf("unknown provider: %s", provider),
-				"valid providers: codex, claude, gemini",
+				fmt.Sprintf("valid providers: %s", supportedToolsList()),
 				nil)
 		}
-		providersToCheck = []string{provider}
+		providerFilter = provider
 		if len(args) >= 2 {
 			profileFilter = args[1]
 		}
-	} else {
-		providersToCheck = []string{"codex", "claude", "gemini"}
 	}
 
+	validationResults := validateVaultProfiles(providerFilter, profileFilter, active)
+	if len(validationResults) == 0 {
+		if profileFilter != "" {
+			return robotError(cmd, "validate", "PROFILE_NOT_FOUND",
+				fmt.Sprintf("profile not found: %s/%s", providerFilter, profileFilter),
+				"run caam robot validate <provider> to list profiles for that provider",
+				[]string{fmt.Sprintf("caam robot validate %s", providerFilter)})
+		}
+		if providerFilter != "" {
+			return robotError(cmd, "validate", "NO_PROFILES",
+				fmt.Sprintf("no profiles found for %s", providerFilter),
+				"create or import a profile before validating credentials",
+				[]string{fmt.Sprintf("caam backup %s <profile>", providerFilter)})
+		}
+		return robotError(cmd, "validate", "NO_PROFILES",
+			"no profiles found",
+			"create or import at least one profile before validating credentials",
+			[]string{"caam backup <provider> <profile>"})
+	}
 	data := RobotValidateData{
-		Method:   "passive",
-		Profiles: make([]RobotValidateResult, 0),
+		Method:          validationMethodPassive,
+		RequestedMethod: requestedValidationMethod(active),
+		Status:          validationStatusValid,
+		Profiles:        make([]RobotValidateResult, 0, len(validationResults)),
 	}
 
-	for _, provider := range providersToCheck {
-		profiles, err := vault.List(provider)
-		if err != nil {
-			continue
-		}
-
-		for _, profileName := range profiles {
-			if strings.HasPrefix(profileName, "_") {
-				continue
-			}
-			if profileFilter != "" && profileName != profileFilter {
-				continue
-			}
-
-			result := RobotValidateResult{
-				Provider: provider,
-				Profile:  profileName,
-			}
-
-			// Get health info for token expiry
-			ph, _ := getProfileHealthWithIdentity(provider, profileName)
-			if !ph.TokenExpiresAt.IsZero() {
-				result.ExpiresAt = ph.TokenExpiresAt.Format(time.RFC3339)
-				remaining := time.Until(ph.TokenExpiresAt)
-				if remaining > 0 {
-					result.ExpiresIn = robotFormatDuration(remaining)
-					result.Valid = true
-					data.Summary.Valid++
-				} else {
-					result.ExpiresIn = "expired"
-					result.Valid = false
-					result.Error = "token expired"
-					data.Summary.Invalid++
-				}
-			} else {
-				// No expiry info - assume valid
-				result.Valid = true
+	for _, validation := range validationResults {
+		result := robotValidateResultFromValidation(validation)
+		switch validation.Status {
+		case validationStatusActiveUnsupported:
+			data.Summary.Unsupported++
+		case validationStatusInvalid:
+			data.Summary.Invalid++
+		default:
+			if validation.Valid {
 				data.Summary.Valid++
+			} else {
+				data.Summary.Invalid++
 			}
-
-			data.Summary.Total++
-			data.Profiles = append(data.Profiles, result)
 		}
+		data.Summary.Total++
+		data.Profiles = append(data.Profiles, result)
 	}
+	data.Status = robotValidationStatus(data.Summary)
 
 	duration := time.Since(start)
 	output := RobotOutput{
-		Success: data.Summary.Invalid == 0,
+		Success: data.Summary.Invalid == 0 && data.Summary.Unsupported == 0,
 		Command: "validate",
 		Data:    data,
 		Timing: &RobotTiming{
@@ -2029,7 +2210,39 @@ func runRobotValidate(cmd *cobra.Command, args []string) error {
 		},
 	}
 
-	return robotOutput(cmd, output)
+	if err := robotOutput(cmd, output); err != nil {
+		return err
+	}
+	if data.Summary.Invalid > 0 || data.Summary.Unsupported > 0 {
+		return fmt.Errorf("validation status %s: %d invalid, %d unsupported", data.Status, data.Summary.Invalid, data.Summary.Unsupported)
+	}
+	return nil
+}
+
+func robotValidateResultFromValidation(validation ValidationOutput) RobotValidateResult {
+	result := RobotValidateResult{
+		Provider:        validation.Provider,
+		Profile:         validation.Profile,
+		Valid:           validation.Valid,
+		Method:          validation.Method,
+		RequestedMethod: validation.RequestedMethod,
+		Status:          validation.Status,
+		ExpiresAt:       validation.ExpiresAt,
+		ErrorCode:       validation.ErrorCode,
+		Error:           validation.Error,
+	}
+	return result
+}
+
+func robotValidationStatus(summary RobotValidateSummary) string {
+	switch {
+	case summary.Invalid > 0:
+		return validationStatusInvalid
+	case summary.Unsupported > 0:
+		return validationStatusActiveUnsupported
+	default:
+		return validationStatusValid
+	}
 }
 
 func runRobotDoctor(cmd *cobra.Command, args []string) error {

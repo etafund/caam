@@ -456,19 +456,16 @@ func (p *Provider) ImportAuth(ctx context.Context, sourcePath string, prof *prof
 
 // ValidateToken validates that the agy authentication token is usable.
 // Passive validation checks the token file exists and is non-empty (it never
-// reads token bytes beyond confirming presence/size). Active validation falls
-// back to passive (no network probe is performed to avoid side effects/cost).
+// reads token bytes beyond confirming presence/size). Active validation is not
+// implemented because no safe probe exists; active requests return an explicit
+// unsupported result after passive validation passes.
 func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, passive bool) (*provider.ValidationResult, error) {
 	result := &provider.ValidationResult{
 		Provider:  p.ID(),
 		Profile:   prof.Name,
 		CheckedAt: time.Now(),
 	}
-	if passive {
-		result.Method = "passive"
-	} else {
-		result.Method = "active"
-	}
+	result.Method = "passive"
 
 	tokenPath := filepath.Join(prof.HomePath(), ".gemini", "antigravity-cli", "antigravity-oauth-token")
 	info, err := os.Stat(tokenPath)
@@ -484,6 +481,10 @@ func (p *Provider) ValidateToken(ctx context.Context, prof *profile.Profile, pas
 	}
 
 	result.Valid = true
+	if !passive {
+		result.Valid = false
+		result.Error = "ACTIVE_VALIDATION_UNSUPPORTED: safe active validation is not implemented for Antigravity; passive validation passed"
+	}
 	return result, nil
 }
 

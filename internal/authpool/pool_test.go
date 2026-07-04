@@ -762,9 +762,9 @@ func TestPooledProfile_IsExpiringSoon(t *testing.T) {
 
 func TestPooledProfile_IsInCooldown(t *testing.T) {
 	tests := []struct {
-		name    string
-		until   time.Time
-		want    bool
+		name  string
+		until time.Time
+		want  bool
 	}{
 		{"zero", time.Time{}, false},
 		{"future", time.Now().Add(time.Hour), true},

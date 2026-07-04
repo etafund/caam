@@ -71,9 +71,9 @@ func WithOnStateChange(fn func(profile *PooledProfile, oldStatus, newStatus Pool
 func NewAuthPool(opts ...PoolOption) *AuthPool {
 	p := &AuthPool{
 		profiles:         make(map[string]*PooledProfile),
-		refreshThreshold: 5 * time.Minute,   // Default: refresh 5 min before expiry
-		cooldownDuration: 5 * time.Minute,   // Default: 5 min cooldown
-		maxRetries:       3,                 // Default: 3 retries
+		refreshThreshold: 5 * time.Minute, // Default: refresh 5 min before expiry
+		cooldownDuration: 5 * time.Minute, // Default: 5 min cooldown
+		maxRetries:       3,               // Default: 3 retries
 	}
 
 	for _, opt := range opts {

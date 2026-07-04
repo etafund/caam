@@ -12,7 +12,7 @@ pnpm run security:check
 
 The gate runs:
 
-- `pnpm audit --audit-level critical`
+- `pnpm audit --audit-level high`
 - `node scripts/dependency-health.mjs --check`
 
 ## Supported Version Windows
@@ -21,12 +21,17 @@ The dashboard must stay on these supported direct dependency lines:
 
 | Package | Minimum | Supported major | Why |
 | --- | --- | --- | --- |
-| `next` | `16.1.4` | `16` | App Router and RSC server surface |
-| `react` | `19.2.3` | `19` | RSC/client rendering fixes |
-| `react-dom` | `19.2.3` | `19` | Must match React for RSC fixes |
-| `tailwindcss` | `4.1.18` | `4` | Dashboard styling toolchain |
-| `@tailwindcss/postcss` | `4.1.18` | `4` | Tailwind 4 PostCSS adapter |
-| `vitest` | `3.2.6` | `3` | Patches GHSA-5xrq-8626-4rwp in the optional UI server |
+| `next` | `16.2.10` | `16` | App Router and RSC server surface |
+| `react` | `19.2.7` | `19` | RSC/client rendering fixes |
+| `react-dom` | `19.2.7` | `19` | Must match React for RSC fixes |
+| `vite` | `8.1.3` | `8` | Dashboard test harness and dev-server security surface |
+| `@vitejs/plugin-react` | `6.0.3` | `6` | Must track the supported Vite toolchain |
+| `tailwindcss` | `4.3.2` | `4` | Dashboard styling toolchain |
+| `@tailwindcss/postcss` | `4.3.2` | `4` | Tailwind 4 PostCSS adapter |
+| `eslint` | `9.39.2` | `9` | Lint toolchain used by the dashboard gate |
+| `eslint-config-next` | `16.2.10` | `16` | Must match the supported Next runtime patch line |
+| `jsdom` | `29.1.1` | `29` | Browser-like unit-test runtime and WebSocket transitive surface |
+| `vitest` | `4.1.9` | `4` | Current Vite-compatible test runner line |
 
 Update `scripts/dependency-health.mjs` in the same commit whenever the minimum supported version changes.
 

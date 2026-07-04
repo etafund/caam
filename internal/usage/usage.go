@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,8 +16,6 @@ import (
 // ErrRateLimited marks transient provider throttling. Fetchers return errors
 // wrapping this sentinel for HTTP 429 responses.
 var ErrRateLimited = errors.New("rate limited")
-
-var http429TokenRE = regexp.MustCompile(`(^|[^[:alnum:]])429([^[:alnum:]]|$)`)
 
 // UsageWindow represents a rate limit window with utilization data.
 type UsageWindow struct {
@@ -134,11 +131,31 @@ func IsRateLimitedUsage(info *UsageInfo) bool {
 func IsRateLimitedMessage(message string) bool {
 	e := strings.ToLower(message)
 	return strings.Contains(e, "rate limited") ||
+		strings.Contains(e, "rate limit exceeded") ||
 		strings.Contains(e, "too many requests") ||
-		strings.Contains(e, "status 429") ||
-		strings.Contains(e, "http 429") ||
-		strings.Contains(e, "code 429") ||
-		http429TokenRE.MatchString(e)
+		containsLabeledHTTP429(e)
+}
+
+func containsLabeledHTTP429(message string) bool {
+	for _, label := range []string{"status", "http", "code"} {
+		for rest := message; ; {
+			idx := strings.Index(rest, label)
+			if idx < 0 {
+				break
+			}
+			after := rest[idx+len(label):]
+			after = strings.TrimLeft(after, " \t\r\n:=")
+			if strings.HasPrefix(after, "429") && (len(after) == 3 || !isASCIILetterOrDigit(after[3])) {
+				return true
+			}
+			rest = rest[idx+len(label):]
+		}
+	}
+	return false
+}
+
+func isASCIILetterOrDigit(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {

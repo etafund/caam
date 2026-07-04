@@ -856,13 +856,25 @@ func TestRateLimitedSentinelAndHelpers(t *testing.T) {
 	if !IsRateLimitedMessage("API error: status 429") {
 		t.Fatal("IsRateLimitedMessage did not recognize status 429")
 	}
+	if !IsRateLimitedMessage("API error: status: 429") {
+		t.Fatal("IsRateLimitedMessage did not recognize status: 429")
+	}
+	if !IsRateLimitedMessage("API error: code=429") {
+		t.Fatal("IsRateLimitedMessage did not recognize code=429")
+	}
 	if !IsRateLimitedUsage(&UsageInfo{RateLimited: true}) {
 		t.Fatal("IsRateLimitedUsage did not recognize RateLimited flag")
 	}
 	if !IsRateLimitedUsage(&UsageInfo{Error: "too many requests"}) {
 		t.Fatal("IsRateLimitedUsage did not recognize too many requests")
 	}
+	if !IsRateLimitedMessage("Error: rate limit exceeded") {
+		t.Fatal("IsRateLimitedMessage did not recognize rate limit exceeded")
+	}
 	if IsRateLimitedMessage("401 Unauthorized; request id abc429def") {
 		t.Fatal("IsRateLimitedMessage misclassified incidental 429 substring")
+	}
+	if IsRateLimitedMessage("request id req-429-xyz") {
+		t.Fatal("IsRateLimitedMessage misclassified request id containing 429")
 	}
 }

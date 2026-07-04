@@ -867,6 +867,132 @@ func TestVaultActiveProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("claude credentials match after access token rotation", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, ".credentials.json")
+		current := []byte(`{"claudeAiOauth":{"accessToken":"live-new","refreshToken":"stable-refresh","expiresAt":1783119600000}}`)
+		if err := os.WriteFile(authFile, current, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		profileDir := filepath.Join(vaultDir, "claude", "alice")
+		if err := os.MkdirAll(profileDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		vaultCopy := []byte(`{"claudeAiOauth":{"accessToken":"vault-old","refreshToken":"stable-refresh","expiresAt":1783112400000}}`)
+		if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), vaultCopy, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "claude",
+			Files: []AuthFileSpec{
+				{Tool: "claude", Path: authFile, Required: true},
+			},
+		}
+
+		profile, err := v.ActiveProfile(fileSet)
+		if err != nil {
+			t.Fatalf("ActiveProfile() error = %v", err)
+		}
+		if profile != "alice" {
+			t.Errorf("ActiveProfile() = %q, want %q", profile, "alice")
+		}
+	})
+
+	t.Run("prefers copied profile over source when both match", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, "auth.json")
+		content := []byte(`{"token": "same-account"}`)
+		if err := os.WriteFile(authFile, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		srcDir := v.ProfilePath("testtool", "auto-20260121-143022")
+		if err := os.MkdirAll(srcDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "auth.json"), content, 0600); err != nil {
+			t.Fatal(err)
+		}
+		meta := []byte(`{"tool":"testtool","profile":"auto-20260121-143022"}`)
+		if err := os.WriteFile(filepath.Join(srcDir, "meta.json"), meta, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := v.CopyProfile("testtool", "auto-20260121-143022", "work"); err != nil {
+			t.Fatalf("CopyProfile() error = %v", err)
+		}
+
+		fileSet := AuthFileSet{
+			Tool: "testtool",
+			Files: []AuthFileSpec{
+				{Tool: "testtool", Path: authFile, Required: true},
+			},
+		}
+
+		profile, err := v.ActiveProfile(fileSet)
+		if err != nil {
+			t.Fatalf("ActiveProfile() error = %v", err)
+		}
+		if profile != "work" {
+			t.Errorf("ActiveProfile() = %q, want %q", profile, "work")
+		}
+	})
+
+	t.Run("claude credentials match legacy vault without refresh token", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		vaultDir := filepath.Join(tmpDir, "vault")
+		authDir := filepath.Join(tmpDir, "auth")
+
+		if err := os.MkdirAll(authDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		authFile := filepath.Join(authDir, ".credentials.json")
+		current := []byte(`{"claudeAiOauth":{"accessToken":"same-access","refreshToken":"current-refresh","expiresAt":1783119600000}}`)
+		if err := os.WriteFile(authFile, current, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		profileDir := filepath.Join(vaultDir, "claude", "legacy")
+		if err := os.MkdirAll(profileDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		vaultCopy := []byte(`{"claudeAiOauth":{"accessToken":"same-access","expiresAt":1783112400000}}`)
+		if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), vaultCopy, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		v := NewVault(vaultDir)
+		fileSet := AuthFileSet{
+			Tool: "claude",
+			Files: []AuthFileSpec{
+				{Tool: "claude", Path: authFile, Required: true},
+			},
+		}
+
+		profile, err := v.ActiveProfile(fileSet)
+		if err != nil {
+			t.Fatalf("ActiveProfile() error = %v", err)
+		}
+		if profile != "legacy" {
+			t.Errorf("ActiveProfile() = %q, want %q", profile, "legacy")
+		}
+	})
+
 	t.Run("ignores optional file differences when required files present", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		vaultDir := filepath.Join(tmpDir, "vault")
@@ -1729,6 +1855,27 @@ func TestVaultCopyProfile(t *testing.T) {
 		}
 		if _, err := os.Stat(v.ProfilePath("testtool", "restored")); os.IsNotExist(err) {
 			t.Error("destination profile should exist")
+		}
+	})
+
+	t.Run("malformed meta.json fails copy", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		v := NewVault(tmpDir)
+
+		srcDir := v.ProfilePath("testtool", "source")
+		if err := os.MkdirAll(srcDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "auth.json"), []byte(`{}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(srcDir, "meta.json"), []byte(`{`), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		err := v.CopyProfile("testtool", "source", "dest")
+		if err == nil {
+			t.Fatal("CopyProfile() should fail for malformed copied meta.json")
 		}
 	})
 }

@@ -1153,8 +1153,8 @@ func probeVaultToken(tool, profileName string) *CheckResult {
 			}
 		}
 		return &CheckResult{
-			Name:   name,
-			Status: "fail",
+			Name:    name,
+			Status:  "fail",
 			Message: "access token rejected by API",
 			Details: fmt.Sprintf(
 				"The stored access token for %s/%s was rejected by the Codex API.\n"+

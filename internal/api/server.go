@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -17,6 +18,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const maxJSONRequestBodyBytes = 1 << 20
+
+const (
+	corsOriginLocalhostDashboard = "http://localhost:3000"
 )
 
 // Server is the local HTTP API server.
@@ -221,30 +228,10 @@ func (s *Server) broadcastEvents() {
 // corsMiddleware adds CORS headers for localhost.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-
-		// Only allow localhost origins
-		allowedOrigins := []string{
-			"http://localhost",
-			"http://127.0.0.1",
-			"http://localhost:3000",
-			"http://127.0.0.1:3000",
-		}
-
-		allowed := false
-		for _, ao := range allowedOrigins {
-			if origin == ao || (len(origin) > len(ao) && origin[:len(ao)+1] == ao+":") {
-				allowed = true
-				break
-			}
-		}
-
-		if allowed {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Max-Age", "86400")
-		}
+		w.Header().Set("Access-Control-Allow-Origin", corsOriginLocalhostDashboard)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
@@ -297,6 +284,38 @@ func (s *Server) jsonResponse(w http.ResponseWriter, data interface{}) {
 	}
 }
 
+func decodeJSONRequest(w http.ResponseWriter, r *http.Request, dst interface{}) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONRequestBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+
+	var extra struct{}
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain only one JSON object")
+		}
+		return err
+	}
+	return nil
+}
+
+func apiErrorStatus(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "unknown tool"),
+		strings.Contains(msg, "profile is required"):
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 // handleHealth returns server health status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, map[string]interface{}{
@@ -331,7 +350,7 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	tool := r.URL.Query().Get("tool")
 	profiles, err := s.handlers.GetProfiles(tool)
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.jsonError(w, apiErrorStatus(err), err.Error())
 		return
 	}
 
@@ -353,14 +372,18 @@ func (s *Server) handleProfileAction(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		profile, err := s.handlers.GetProfile(tool, name)
 		if err != nil {
-			s.jsonError(w, http.StatusNotFound, err.Error())
+			status := apiErrorStatus(err)
+			if status == http.StatusInternalServerError {
+				status = http.StatusNotFound
+			}
+			s.jsonError(w, status, err.Error())
 			return
 		}
 		s.jsonResponse(w, profile)
 
 	case http.MethodDelete:
 		if err := s.handlers.DeleteProfile(tool, name); err != nil {
-			s.jsonError(w, http.StatusInternalServerError, err.Error())
+			s.jsonError(w, apiErrorStatus(err), err.Error())
 			return
 		}
 		s.jsonResponse(w, map[string]string{"status": "deleted"})
@@ -394,7 +417,7 @@ func (s *Server) handleCoordinators(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	coordinators, err := s.handlers.GetCoordinators()
+	coordinators, err := s.handlers.GetCoordinators(r.Context())
 	if err != nil {
 		s.jsonError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -411,14 +434,14 @@ func (s *Server) handleActivate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req ActivateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONRequest(w, r, &req); err != nil {
 		s.jsonError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
 	result, err := s.handlers.Activate(req)
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.jsonError(w, apiErrorStatus(err), err.Error())
 		return
 	}
 
@@ -440,14 +463,14 @@ func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req BackupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONRequest(w, r, &req); err != nil {
 		s.jsonError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
 	result, err := s.handlers.Backup(req)
 	if err != nil {
-		s.jsonError(w, http.StatusInternalServerError, err.Error())
+		s.jsonError(w, apiErrorStatus(err), err.Error())
 		return
 	}
 

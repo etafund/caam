@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/profile"
@@ -297,6 +298,30 @@ func TestValidateToken(t *testing.T) {
 		res, _ := p.ValidateToken(context.Background(), prof, false)
 		if res.Valid {
 			t.Error("ValidateToken() should be invalid when token missing")
+		}
+	})
+
+	t.Run("active unsupported when passive token is present", func(t *testing.T) {
+		prof := &profile.Profile{Name: "test", Provider: "agy", BasePath: t.TempDir()}
+		p := New()
+		p.PrepareProfile(context.Background(), prof)
+		writeProfileToken(t, prof, fakeTokenJSON)
+
+		res, err := p.ValidateToken(context.Background(), prof, false)
+		if err != nil {
+			t.Fatalf("ValidateToken() error = %v", err)
+		}
+		if res.Method != "passive" {
+			t.Fatalf("Method = %q, want passive", res.Method)
+		}
+		if res.Valid {
+			t.Fatal("active validation should not be valid when the active probe is unsupported")
+		}
+		if !strings.HasPrefix(res.Error, "ACTIVE_VALIDATION_UNSUPPORTED:") {
+			t.Fatalf("Error = %q, want ACTIVE_VALIDATION_UNSUPPORTED prefix", res.Error)
+		}
+		if strings.Contains(res.Error, "SYNTHETIC-NOT-A-REAL-TOKEN") {
+			t.Fatalf("active unsupported error leaked token: %q", res.Error)
 		}
 	})
 }

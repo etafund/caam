@@ -67,10 +67,6 @@ func NewMultiProfileFetcher(opts ...FetcherOption) *MultiProfileFetcher {
 // FetchAllProfiles fetches usage for all profiles of a given provider.
 // profiles is a map of profile name to access token.
 func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider string, profiles map[string]string) []ProfileUsage {
-	if m == nil {
-		m = NewMultiProfileFetcher()
-	}
-
 	results := make([]ProfileUsage, 0, len(profiles))
 
 	names := make([]string, 0, len(profiles))
@@ -78,6 +74,23 @@ func (m *MultiProfileFetcher) FetchAllProfiles(ctx context.Context, provider str
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
+	if m == nil {
+		for _, name := range names {
+			results = append(results, ProfileUsage{
+				Provider:    provider,
+				ProfileName: name,
+				Usage: &UsageInfo{
+					Provider:    provider,
+					ProfileName: name,
+					FetchedAt:   time.Now(),
+					Error:       "usage fetcher unavailable",
+				},
+				AccessToken: profiles[name],
+			})
+		}
+		return results
+	}
 
 	for i, name := range names {
 		if i > 0 {
@@ -246,7 +259,7 @@ func (m *MultiProfileFetcher) GetProfilesAboveThreshold(ctx context.Context, pro
 	available := make([]ProfileUsage, 0)
 
 	for _, p := range results {
-		if p.Usage != nil && !p.Usage.IsNearLimit(threshold) {
+		if p.Usage != nil && !p.Usage.CachedInactive && p.Usage.Error == "" && !IsRateLimitedUsage(p.Usage) && !p.Usage.IsNearLimit(threshold) {
 			available = append(available, p)
 		}
 	}

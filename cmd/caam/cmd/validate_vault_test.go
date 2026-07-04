@@ -35,6 +35,10 @@ func writeClaudeVaultProfile(t *testing.T, name string, expiresIn time.Duration,
 // runValidateJSON invokes validate for the given tool and returns the parsed
 // results plus the error returned to the caller.
 func runValidateJSON(t *testing.T, tool string) ([]ValidationOutput, error) {
+	return runValidateJSONActive(t, tool, false)
+}
+
+func runValidateJSONActive(t *testing.T, tool string, active bool) ([]ValidationOutput, error) {
 	t.Helper()
 
 	// Capture stdout (outputJSON writes via fmt.Println to os.Stdout).
@@ -43,7 +47,11 @@ func runValidateJSON(t *testing.T, tool string) ([]ValidationOutput, error) {
 	os.Stdout = w
 
 	validateJSON = true
-	t.Cleanup(func() { validateJSON = false })
+	validateActive = active
+	t.Cleanup(func() {
+		validateJSON = false
+		validateActive = false
+	})
 
 	var args []string
 	if tool != "" {
@@ -117,6 +125,40 @@ func TestValidate_UsesVaultBackedProfiles(t *testing.T) {
 	}
 	if got["dead"].Valid {
 		t.Errorf("hard-expired profile without refresh token should be invalid: %+v", got["dead"])
+	}
+}
+
+func TestValidate_ActiveUnsupportedJSONIsMachineReadable(t *testing.T) {
+	tmp := t.TempDir()
+	oldVault := vault
+	vault = authfile.NewVault(filepath.Join(tmp, "vault"))
+	t.Cleanup(func() { vault = oldVault })
+
+	writeClaudeVaultProfile(t, "healthy", 48*time.Hour, true)
+
+	results, err := runValidateJSONActive(t, "claude", true)
+	if err == nil {
+		t.Fatal("active validation should return an error when probes are unsupported")
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one validation result, got %+v", results)
+	}
+
+	result := results[0]
+	if result.Method != validationMethodPassive {
+		t.Fatalf("Method = %q, want %q", result.Method, validationMethodPassive)
+	}
+	if result.RequestedMethod != validationMethodActive {
+		t.Fatalf("RequestedMethod = %q, want %q", result.RequestedMethod, validationMethodActive)
+	}
+	if result.Status != validationStatusActiveUnsupported {
+		t.Fatalf("Status = %q, want %q", result.Status, validationStatusActiveUnsupported)
+	}
+	if result.ErrorCode != validationErrorActiveUnsupported {
+		t.Fatalf("ErrorCode = %q, want %q", result.ErrorCode, validationErrorActiveUnsupported)
+	}
+	if !result.Valid {
+		t.Fatalf("passive validation should still be recorded as valid: %+v", result)
 	}
 }
 

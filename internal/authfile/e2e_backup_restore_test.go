@@ -337,8 +337,8 @@ func TestE2E_CrossProviderWorkflows(t *testing.T) {
 	}
 
 	h.Log.Info("Created auth files for multiple providers", map[string]interface{}{
-		"codex_path":        codexAuthPath,
-		"claude_path":       claudeAuthPath,
+		"codex_path":         codexAuthPath,
+		"claude_path":        claudeAuthPath,
 		"claude_config_path": claudeConfigAuthPath,
 	})
 

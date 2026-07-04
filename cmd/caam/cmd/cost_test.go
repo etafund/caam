@@ -353,15 +353,15 @@ func TestRenderTokenCostTable_Empty(t *testing.T) {
 func TestRenderTokenCostTable_WithData(t *testing.T) {
 	analyses := []TokenCostAnalysis{
 		{
-			Provider:          "claude",
-			Period:            "7d",
-			TotalTokens:       1000000,
-			InputTokens:       400000,
-			OutputTokens:      600000,
-			TotalAPICost:      15.50,
-			SubscriptionCost:  46.67,
-			Savings:           -31.17,
-			SavingsPercent:    -201.1,
+			Provider:         "claude",
+			Period:           "7d",
+			TotalTokens:      1000000,
+			InputTokens:      400000,
+			OutputTokens:     600000,
+			TotalAPICost:     15.50,
+			SubscriptionCost: 46.67,
+			Savings:          -31.17,
+			SavingsPercent:   -201.1,
 			ByModel: []TokenModelCost{
 				{Model: "claude-3-opus", TotalTokens: 1000000, Percent: 100, APICost: 15.50},
 			},

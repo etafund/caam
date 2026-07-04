@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"time"
 
@@ -25,15 +24,16 @@ By default, performs passive validation (no network calls):
   - Check token format/structure
   - Check expiry timestamps
 
-Use --active for active validation (makes minimal API calls):
-  - Verifies token is actually valid with the provider
-  - May incur minimal API costs
+Use --active to request active validation. Saved vault profiles currently do
+not have safe active probes; they report method=passive, requested_method=active,
+status=active_unsupported, and error_code=ACTIVE_VALIDATION_UNSUPPORTED instead
+of pretending an API call was made.
 
 Examples:
   caam validate                    # Validate all profiles (passive)
   caam validate claude             # Validate all Claude profiles
   caam validate claude work        # Validate specific profile
-  caam validate --active           # Active validation for all profiles
+  caam validate --active           # Request active validation, explicit fallback if unsupported
   caam validate claude work --json # JSON output`,
 	Args: cobra.MaximumNArgs(2),
 	RunE: runValidate,
@@ -46,21 +46,35 @@ var (
 )
 
 func init() {
-	validateCmd.Flags().BoolVar(&validateActive, "active", false, "Perform active validation (API calls)")
+	validateCmd.Flags().BoolVar(&validateActive, "active", false, "Request active validation; unsupported providers report status=active_unsupported")
 	validateCmd.Flags().BoolVar(&validateJSON, "json", false, "Output in JSON format")
 	validateCmd.Flags().BoolVar(&validateAll, "all", false, "Validate all profiles (default behavior)")
 	rootCmd.AddCommand(validateCmd)
 }
 
+const (
+	validationMethodPassive = "passive"
+	validationMethodActive  = "active"
+
+	validationStatusValid             = "valid"
+	validationStatusInvalid           = "invalid"
+	validationStatusActiveUnsupported = "active_unsupported"
+
+	validationErrorActiveUnsupported = "ACTIVE_VALIDATION_UNSUPPORTED"
+)
+
 // ValidationOutput represents the JSON output for validation results.
 type ValidationOutput struct {
-	Provider  string    `json:"provider"`
-	Profile   string    `json:"profile"`
-	Valid     bool      `json:"valid"`
-	Method    string    `json:"method"`
-	ExpiresAt string    `json:"expires_at,omitempty"`
-	Error     string    `json:"error,omitempty"`
-	CheckedAt time.Time `json:"checked_at"`
+	Provider        string    `json:"provider"`
+	Profile         string    `json:"profile"`
+	Valid           bool      `json:"valid"`
+	Method          string    `json:"method"`
+	RequestedMethod string    `json:"requested_method"`
+	Status          string    `json:"status"`
+	ExpiresAt       string    `json:"expires_at,omitempty"`
+	ErrorCode       string    `json:"error_code,omitempty"`
+	Error           string    `json:"error,omitempty"`
+	CheckedAt       time.Time `json:"checked_at"`
 }
 
 func runValidate(cmd *cobra.Command, args []string) error {
@@ -89,14 +103,19 @@ func runValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Active validation against saved vault profiles is not implemented; vault
-	// profiles are raw auth files, not isolated profile homes. Surface this on
-	// stderr (diagnostics) and proceed with passive validation rather than
-	// silently pretending to make API calls.
-	if validateActive {
-		fmt.Fprintln(os.Stderr, "note: --active is not supported for saved vault profiles; performing passive validation")
-	}
+	results := validateVaultProfiles(toolFilter, profileFilter, validateActive)
 
+	// Output results. Encode empty results as [] (not null) for agent parsing.
+	if validateJSON {
+		if err := outputJSON(results); err != nil {
+			return err
+		}
+		return validationResultsError(results)
+	}
+	return outputHuman(results)
+}
+
+func validateVaultProfiles(toolFilter, profileFilter string, active bool) []ValidationOutput {
 	results := []ValidationOutput{}
 
 	for _, tool := range supportedTools() {
@@ -117,15 +136,11 @@ func runValidate(cmd *cobra.Command, args []string) error {
 			if profileFilter != "" && profileName != profileFilter {
 				continue
 			}
-			results = append(results, validateVaultProfile(tool, profileName))
+			results = append(results, validateVaultProfile(tool, profileName, active))
 		}
 	}
 
-	// Output results. Encode empty results as [] (not null) for agent parsing.
-	if validateJSON {
-		return outputJSON(results)
-	}
-	return outputHuman(results)
+	return results
 }
 
 // validateVaultProfile passively validates a single saved vault profile. A
@@ -134,12 +149,14 @@ func runValidate(cmd *cobra.Command, args []string) error {
 // such profiles are refreshable, and reporting them as hard-expired is
 // misleading (issue #22). Only credentials with no refresh capability are
 // reported as expired/invalid.
-func validateVaultProfile(tool, profileName string) ValidationOutput {
+func validateVaultProfile(tool, profileName string, active bool) ValidationOutput {
 	out := ValidationOutput{
-		Provider:  tool,
-		Profile:   profileName,
-		Method:    "passive",
-		CheckedAt: time.Now(),
+		Provider:        tool,
+		Profile:         profileName,
+		Method:          validationMethodPassive,
+		RequestedMethod: requestedValidationMethod(active),
+		Status:          validationStatusValid,
+		CheckedAt:       time.Now(),
 	}
 
 	info, err := loadExpiryInfo(tool, profileName)
@@ -147,13 +164,16 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		switch {
 		case errors.Is(err, health.ErrNoAuthFile):
 			out.Valid = false
+			out.Status = validationStatusInvalid
 			out.Error = "no auth files found"
 		case errors.Is(err, health.ErrNoExpiry):
 			// Auth files exist but carry no parseable expiry/refresh metadata.
 			// Treat as valid-but-unknown: the credentials are present.
 			out.Valid = true
+			markActiveUnsupported(&out)
 		default:
 			out.Valid = false
+			out.Status = validationStatusInvalid
 			out.Error = err.Error()
 		}
 		return out
@@ -163,6 +183,7 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 	// presence of the vault profile dir is the validation signal for them.
 	if info == nil {
 		out.Valid = true
+		markActiveUnsupported(&out)
 		return out
 	}
 
@@ -176,6 +197,7 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		out.ExpiresAt = "refreshable"
 	case expired:
 		out.Valid = false
+		out.Status = validationStatusInvalid
 		out.Error = "token expired and no refresh token available"
 		out.ExpiresAt = "expired"
 	default:
@@ -185,7 +207,27 @@ func validateVaultProfile(tool, profileName string) ValidationOutput {
 		}
 	}
 
+	if out.Valid {
+		markActiveUnsupported(&out)
+	}
+
 	return out
+}
+
+func requestedValidationMethod(active bool) string {
+	if active {
+		return validationMethodActive
+	}
+	return validationMethodPassive
+}
+
+func markActiveUnsupported(out *ValidationOutput) {
+	if out.RequestedMethod != validationMethodActive || !out.Valid {
+		return
+	}
+	out.Status = validationStatusActiveUnsupported
+	out.ErrorCode = validationErrorActiveUnsupported
+	out.Error = "safe active validation is not implemented for saved vault profiles; passive validation completed"
 }
 
 func formatExpiryTime(t time.Time) string {
@@ -226,22 +268,30 @@ func outputHuman(results []ValidationOutput) error {
 
 	validCount := 0
 	invalidCount := 0
+	unsupportedCount := 0
 
 	for _, r := range results {
 		status := "✓"
 		statusColor := "\033[32m" // Green
-		if !r.Valid {
+		switch {
+		case r.Status == validationStatusActiveUnsupported:
+			status = "!"
+			statusColor = "\033[33m" // Yellow
+			unsupportedCount++
+		case !r.Valid:
 			status = "✗"
 			statusColor = "\033[31m" // Red
 			invalidCount++
-		} else {
+		default:
 			validCount++
 		}
 
 		// Print result line
 		fmt.Printf("%s%s\033[0m %s/%s", statusColor, status, r.Provider, r.Profile)
 
-		if r.Valid {
+		if r.Status == validationStatusActiveUnsupported {
+			fmt.Printf(" - active validation unsupported; passive result valid")
+		} else if r.Valid {
 			if r.ExpiresAt != "" {
 				fmt.Printf(" (expires %s)", r.ExpiresAt)
 			} else {
@@ -254,10 +304,37 @@ func outputHuman(results []ValidationOutput) error {
 	}
 
 	fmt.Println()
-	fmt.Printf("Summary: %d valid, %d invalid (method: %s)\n", validCount, invalidCount, results[0].Method)
-
-	if invalidCount > 0 {
-		return fmt.Errorf("%d invalid token(s) found", invalidCount)
+	if unsupportedCount > 0 {
+		fmt.Printf("Summary: %d valid, %d invalid, %d active unsupported (method: %s, requested: %s)\n",
+			validCount, invalidCount, unsupportedCount, results[0].Method, results[0].RequestedMethod)
+	} else {
+		fmt.Printf("Summary: %d valid, %d invalid (method: %s)\n", validCount, invalidCount, results[0].Method)
 	}
-	return nil
+
+	return validationResultsError(results)
+}
+
+func validationResultsError(results []ValidationOutput) error {
+	invalidCount := 0
+	unsupportedCount := 0
+	for _, result := range results {
+		if result.Status == validationStatusActiveUnsupported {
+			unsupportedCount++
+			continue
+		}
+		if !result.Valid {
+			invalidCount++
+		}
+	}
+
+	switch {
+	case invalidCount > 0 && unsupportedCount > 0:
+		return fmt.Errorf("%d invalid token(s), %d active validation probe(s) unsupported", invalidCount, unsupportedCount)
+	case invalidCount > 0:
+		return fmt.Errorf("%d invalid token(s) found", invalidCount)
+	case unsupportedCount > 0:
+		return fmt.Errorf("%d active validation probe(s) unsupported", unsupportedCount)
+	default:
+		return nil
+	}
 }

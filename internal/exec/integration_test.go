@@ -201,20 +201,20 @@ func TestIntegration_PredictionAlerts_TimeBasedAlerts(t *testing.T) {
 
 	predictions := []*prediction.Prediction{
 		{
-			Provider:         "claude",
-			Profile:          "alice",
-			CurrentPercent:   60,
-			TimeToDepletion:  15 * time.Minute, // Below rotation threshold
-			Confidence:       0.8,
-			Warning:          prediction.WarningNone,
+			Provider:        "claude",
+			Profile:         "alice",
+			CurrentPercent:  60,
+			TimeToDepletion: 15 * time.Minute, // Below rotation threshold
+			Confidence:      0.8,
+			Warning:         prediction.WarningNone,
 		},
 		{
-			Provider:         "claude",
-			Profile:          "bob",
-			CurrentPercent:   50,
-			TimeToDepletion:  2 * time.Hour, // Above rotation threshold
-			Confidence:       0.8,
-			Warning:          prediction.WarningNone,
+			Provider:        "claude",
+			Profile:         "bob",
+			CurrentPercent:  50,
+			TimeToDepletion: 2 * time.Hour, // Above rotation threshold
+			Confidence:      0.8,
+			Warning:         prediction.WarningNone,
 		},
 	}
 

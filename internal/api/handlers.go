@@ -1,7 +1,12 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
@@ -10,20 +15,43 @@ import (
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
 )
 
+const coordinatorProbeMaxBytes = 1 << 20
+
+type coordinatorHTTPClient interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
 // Handlers provides the business logic for API endpoints.
 type Handlers struct {
-	vault       *authfile.Vault
-	healthStore *health.Storage
-	db          *caamdb.DB
+	vault                *authfile.Vault
+	healthStore          *health.Storage
+	db                   *caamdb.DB
+	coordinatorEndpoints []CoordinatorEndpoint
+	coordinatorClient    coordinatorHTTPClient
 }
 
 // NewHandlers creates a new Handlers instance.
 func NewHandlers(vault *authfile.Vault, healthStore *health.Storage, db *caamdb.DB) *Handlers {
 	return &Handlers{
-		vault:       vault,
-		healthStore: healthStore,
-		db:          db,
+		vault:             vault,
+		healthStore:       healthStore,
+		db:                db,
+		coordinatorClient: &http.Client{Timeout: 2 * time.Second},
 	}
+}
+
+// SetCoordinatorEndpoints configures the coordinator endpoints that the API probes.
+func (h *Handlers) SetCoordinatorEndpoints(endpoints []CoordinatorEndpoint) {
+	h.coordinatorEndpoints = append([]CoordinatorEndpoint(nil), endpoints...)
+}
+
+// SetCoordinatorHTTPClient sets the HTTP client used to probe coordinator endpoints.
+func (h *Handlers) SetCoordinatorHTTPClient(client coordinatorHTTPClient) {
+	if client == nil {
+		h.coordinatorClient = &http.Client{Timeout: 2 * time.Second}
+		return
+	}
+	h.coordinatorClient = client
 }
 
 // Event represents a server-sent event.
@@ -84,7 +112,6 @@ type UsageResponse struct {
 type UsageEntry struct {
 	Tool       string `json:"tool"`
 	Profile    string `json:"profile"`
-	TotalCalls int    `json:"total_calls"`
 	ErrorCount int    `json:"error_count"`
 	LastUsed   string `json:"last_used,omitempty"`
 }
@@ -94,13 +121,23 @@ type CoordinatorsResponse struct {
 	Coordinators []CoordinatorStatus `json:"coordinators"`
 }
 
+// CoordinatorEndpoint is a configured remote auth-coordinator endpoint.
+type CoordinatorEndpoint struct {
+	ID       string
+	Endpoint string
+	Token    string
+}
+
 // CoordinatorStatus represents coordinator health.
 type CoordinatorStatus struct {
-	ID       string `json:"id"`
-	Endpoint string `json:"endpoint"`
-	Status   string `json:"status"`
-	Backend  string `json:"backend,omitempty"`
-	LastSeen string `json:"last_seen,omitempty"`
+	ID           string `json:"id"`
+	Endpoint     string `json:"endpoint"`
+	Status       string `json:"status"`
+	Backend      string `json:"backend,omitempty"`
+	LastSeen     string `json:"last_seen,omitempty"`
+	PaneCount    int    `json:"pane_count,omitempty"`
+	PendingAuths int    `json:"pending_auths,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // ActivateRequest is the request for POST /actions/activate.
@@ -330,7 +367,6 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 			entry := UsageEntry{
 				Tool:       t,
 				Profile:    name,
-				TotalCalls: 0, // Not tracked in ProfileHealth
 				ErrorCount: ph.ErrorCount1h,
 			}
 			if !ph.LastChecked.IsZero() {
@@ -343,12 +379,88 @@ func (h *Handlers) GetUsage(tool string) (*UsageResponse, error) {
 	return resp, nil
 }
 
-// GetCoordinators returns coordinator status.
-func (h *Handlers) GetCoordinators() (*CoordinatorsResponse, error) {
-	// For now, return empty - coordinator discovery could be added later
-	return &CoordinatorsResponse{
+// GetCoordinators returns live status for configured coordinator endpoints.
+func (h *Handlers) GetCoordinators(ctx context.Context) (*CoordinatorsResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	resp := &CoordinatorsResponse{
 		Coordinators: []CoordinatorStatus{},
-	}, nil
+	}
+	for _, endpoint := range h.coordinatorEndpoints {
+		resp.Coordinators = append(resp.Coordinators, h.probeCoordinator(ctx, endpoint))
+	}
+	return resp, nil
+}
+
+func (h *Handlers) probeCoordinator(ctx context.Context, endpoint CoordinatorEndpoint) CoordinatorStatus {
+	status := CoordinatorStatus{
+		ID:       endpoint.ID,
+		Endpoint: endpoint.Endpoint,
+		Status:   "unhealthy",
+	}
+	baseURL := strings.TrimRight(strings.TrimSpace(endpoint.Endpoint), "/")
+	if baseURL == "" {
+		status.Error = "coordinator endpoint URL is empty"
+		return status
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/status", nil)
+	if err != nil {
+		status.Error = fmt.Sprintf("create status request: %v", err)
+		return status
+	}
+	if token := strings.TrimSpace(endpoint.Token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	client := h.coordinatorClient
+	if client == nil {
+		client = &http.Client{Timeout: 2 * time.Second}
+	}
+	httpResp, err := client.Do(req)
+	if err != nil {
+		status.Error = err.Error()
+		return status
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode != http.StatusOK {
+		body, readErr := io.ReadAll(io.LimitReader(httpResp.Body, 4096))
+		if readErr != nil {
+			status.Error = fmt.Sprintf("HTTP %d; read error body: %v", httpResp.StatusCode, readErr)
+			return status
+		}
+		message := strings.TrimSpace(string(body))
+		if message == "" {
+			message = httpResp.Status
+		}
+		status.Error = fmt.Sprintf("HTTP %d: %s", httpResp.StatusCode, message)
+		return status
+	}
+
+	var body struct {
+		Running      bool   `json:"running"`
+		Backend      string `json:"backend"`
+		PaneCount    int    `json:"pane_count"`
+		PendingAuths int    `json:"pending_auths"`
+	}
+	if err := json.NewDecoder(io.LimitReader(httpResp.Body, coordinatorProbeMaxBytes)).Decode(&body); err != nil {
+		status.Error = fmt.Sprintf("decode status response: %v", err)
+		return status
+	}
+
+	status.Backend = body.Backend
+	status.PaneCount = body.PaneCount
+	status.PendingAuths = body.PendingAuths
+	status.LastSeen = time.Now().Format(time.RFC3339)
+	if body.Running {
+		status.Status = "healthy"
+	} else {
+		status.Status = "stopped"
+	}
+	return status
 }
 
 // Activate activates a profile.

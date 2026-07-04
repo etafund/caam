@@ -227,31 +227,49 @@ func TestCORSMiddleware(t *testing.T) {
 	tests := []struct {
 		name       string
 		origin     string
-		wantCORS   bool
+		wantOrigin string
 		wantStatus int
 	}{
 		{
 			name:       "localhost origin",
 			origin:     "http://localhost:3000",
-			wantCORS:   true,
+			wantOrigin: corsOriginLocalhostDashboard,
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:       "127.0.0.1 origin",
+			name:       "127.0.0.1 origin gets fixed dashboard origin",
 			origin:     "http://127.0.0.1:3000",
-			wantCORS:   true,
+			wantOrigin: corsOriginLocalhostDashboard,
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:       "external origin",
+			name:       "localhost arbitrary numeric port gets fixed dashboard origin",
+			origin:     "http://localhost:43129",
+			wantOrigin: corsOriginLocalhostDashboard,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "localhost invalid port suffix gets fixed dashboard origin",
+			origin:     "http://localhost:evil",
+			wantOrigin: corsOriginLocalhostDashboard,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "localhost path gets fixed dashboard origin",
+			origin:     "http://localhost:3000/path",
+			wantOrigin: corsOriginLocalhostDashboard,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "external origin gets fixed dashboard origin",
 			origin:     "http://example.com",
-			wantCORS:   false,
+			wantOrigin: corsOriginLocalhostDashboard,
 			wantStatus: http.StatusOK,
 		},
 		{
 			name:       "OPTIONS request",
 			origin:     "http://localhost:3000",
-			wantCORS:   true,
+			wantOrigin: corsOriginLocalhostDashboard,
 			wantStatus: http.StatusNoContent,
 		},
 	}
@@ -274,11 +292,8 @@ func TestCORSMiddleware(t *testing.T) {
 			}
 
 			corsHeader := w.Header().Get("Access-Control-Allow-Origin")
-			if tt.wantCORS && corsHeader == "" {
-				t.Error("expected CORS header, got none")
-			}
-			if !tt.wantCORS && corsHeader != "" {
-				t.Errorf("unexpected CORS header: %s", corsHeader)
+			if corsHeader != tt.wantOrigin {
+				t.Errorf("Access-Control-Allow-Origin = %q, want %q", corsHeader, tt.wantOrigin)
 			}
 		})
 	}
@@ -310,6 +325,181 @@ func TestEmitAfterStopDoesNotPanic(t *testing.T) {
 	}()
 
 	server.Emit(Event{Type: "test", Timestamp: time.Now()})
+}
+
+func TestHandleCoordinatorsWithoutConfiguredEndpointsReturnsEmptyList(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, NewHandlers(nil, nil, nil))
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/coordinators", nil)
+	w := httptest.NewRecorder()
+
+	server.handleCoordinators(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var body CoordinatorsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON body: %v; raw=%q", err, w.Body.String())
+	}
+	if len(body.Coordinators) != 0 {
+		t.Fatalf("coordinators = %+v, want empty configured list", body.Coordinators)
+	}
+}
+
+func TestProfileHandlersReturnBadRequestForUnknownTool(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, NewHandlers(nil, nil, nil))
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		method  string
+		path    string
+		handler func(http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:    "list",
+			method:  http.MethodGet,
+			path:    "/api/v1/profiles?tool=unknown",
+			handler: server.handleProfiles,
+		},
+		{
+			name:    "get",
+			method:  http.MethodGet,
+			path:    "/api/v1/profiles/unknown/work",
+			handler: server.handleProfileAction,
+		},
+		{
+			name:    "delete",
+			method:  http.MethodDelete,
+			path:    "/api/v1/profiles/unknown/work",
+			handler: server.handleProfileAction,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			w := httptest.NewRecorder()
+
+			tt.handler(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "unknown tool") {
+				t.Fatalf("body = %q, want unknown tool error", w.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleActivateRejectsTrailingJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, NewHandlers(nil, nil, nil))
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions/activate", strings.NewReader(`{"tool":"codex","profile":"work"} {}`))
+	w := httptest.NewRecorder()
+
+	server.handleActivate(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "only one JSON object") {
+		t.Fatalf("body = %q, want trailing JSON error", w.Body.String())
+	}
+}
+
+func TestHandleBackupRejectsOversizedJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, NewHandlers(nil, nil, nil))
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	body := `{"tool":"` + strings.Repeat("x", maxJSONRequestBodyBytes) + `","profile":"work"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/actions/backup", strings.NewReader(body))
+	w := httptest.NewRecorder()
+
+	server.handleBackup(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "request body too large") {
+		t.Fatalf("body = %q, want oversized body error", w.Body.String())
+	}
+}
+
+func TestActionHandlersReturnBadRequestForClientValidationErrors(t *testing.T) {
+	tmpDir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.TokenPath = filepath.Join(tmpDir, ".api_token")
+
+	server, err := NewServer(cfg, NewHandlers(nil, nil, nil))
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		handler func(http.ResponseWriter, *http.Request)
+		wantErr string
+	}{
+		{
+			name:    "activate unknown tool",
+			body:    `{"tool":"unknown","profile":"work"}`,
+			handler: server.handleActivate,
+			wantErr: "unknown tool",
+		},
+		{
+			name:    "backup missing profile",
+			body:    `{"tool":"codex"}`,
+			handler: server.handleBackup,
+			wantErr: "profile is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/actions", strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+
+			tt.handler(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), tt.wantErr) {
+				t.Fatalf("body = %q, want %q", w.Body.String(), tt.wantErr)
+			}
+		})
+	}
 }
 
 func TestEventBroadcast(t *testing.T) {

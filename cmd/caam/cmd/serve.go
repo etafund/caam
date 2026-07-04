@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/agent"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/api"
 	"github.com/spf13/cobra"
 )
@@ -59,10 +60,11 @@ Querying the API:
 }
 
 var (
-	servePort      int
-	serveVerbose   bool
-	serveShowToken bool
-	serveJSONLogs  bool
+	servePort            int
+	serveVerbose         bool
+	serveShowToken       bool
+	serveJSONLogs        bool
+	serveAgentConfigPath string
 )
 
 func init() {
@@ -72,6 +74,7 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveVerbose, "verbose", false, "Enable debug logging")
 	serveCmd.Flags().BoolVar(&serveShowToken, "show-token", false, "Print API token and exit")
 	serveCmd.Flags().BoolVar(&serveJSONLogs, "json", false, "Output logs in JSON format")
+	serveCmd.Flags().StringVar(&serveAgentConfigPath, "agent-config", "", "Path to auth-agent JSON config for coordinator status")
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
@@ -97,6 +100,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	handlers := api.NewHandlers(vault, healthStore, db)
+	coordinatorEndpoints, err := loadConfiguredCoordinatorEndpoints(serveAgentConfigPath)
+	if err != nil {
+		return fmt.Errorf("load coordinator endpoints: %w", err)
+	}
+	handlers.SetCoordinatorEndpoints(apiCoordinatorEndpoints(coordinatorEndpoints))
 
 	// Create server config
 	serverCfg := api.DefaultConfig()
@@ -164,4 +172,19 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	fmt.Println("Server stopped.")
 	return nil
+}
+
+func apiCoordinatorEndpoints(endpoints []*agent.CoordinatorEndpoint) []api.CoordinatorEndpoint {
+	converted := make([]api.CoordinatorEndpoint, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint == nil {
+			continue
+		}
+		converted = append(converted, api.CoordinatorEndpoint{
+			ID:       endpoint.Name,
+			Endpoint: endpoint.URL,
+			Token:    endpoint.Token,
+		})
+	}
+	return converted
 }

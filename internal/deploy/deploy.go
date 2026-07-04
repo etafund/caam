@@ -332,30 +332,30 @@ func (d *Deployer) findBinaryPath(ctx context.Context) string {
 
 // DeployConfig represents the generated configuration for a machine.
 type DeployConfig struct {
-	Type     string `json:"type"`      // "coordinator" or "agent"
+	Type     string `json:"type"` // "coordinator" or "agent"
 	Port     int    `json:"port"`
 	Settings any    `json:"settings"`
 }
 
 // CoordinatorConfig is the configuration for a coordinator daemon.
 type CoordinatorConfig struct {
-	Port          int    `json:"port"`
-	PollInterval  string `json:"poll_interval"`
-	AuthTimeout   string `json:"auth_timeout"`
-	StateTimeout  string `json:"state_timeout"`
-	ResumePrompt  string `json:"resume_prompt"`
-	OutputLines   int    `json:"output_lines"`
+	Port         int    `json:"port"`
+	PollInterval string `json:"poll_interval"`
+	AuthTimeout  string `json:"auth_timeout"`
+	StateTimeout string `json:"state_timeout"`
+	ResumePrompt string `json:"resume_prompt"`
+	OutputLines  int    `json:"output_lines"`
 }
 
 // DefaultCoordinatorConfig returns the default coordinator configuration.
 func DefaultCoordinatorConfig() CoordinatorConfig {
 	return CoordinatorConfig{
-		Port:          7890,
-		PollInterval:  "500ms",
-		AuthTimeout:   "60s",
-		StateTimeout:  "30s",
-		ResumePrompt:  "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
-		OutputLines:   100,
+		Port:         7890,
+		PollInterval: "500ms",
+		AuthTimeout:  "60s",
+		StateTimeout: "30s",
+		ResumePrompt: "proceed. Reread AGENTS.md so it's still fresh in your mind. Use ultrathink.\n",
+		OutputLines:  100,
 	}
 }
 

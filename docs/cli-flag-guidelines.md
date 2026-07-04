@@ -43,13 +43,14 @@ This document establishes consistent flag naming conventions for the caam CLI.
 | import | --force | OK |
 | add | --force | OK |
 | update | --force | OK |
+| rename --delete-old | --force, --yes | OK |
 | config reset | --force | OK |
 | profile delete | --force | OK |
 | sync remove | --force | OK |
 | bundle import | --force | OK |
-| setup distributed | --yes | **FIX: Change to --force** |
-| wezterm login-all | --yes | **FIX: Change to --force** |
-| wezterm recover | --yes | **FIX: Change to --force** |
+| setup distributed | --force, --yes | OK |
+| wezterm login-all | --force, --yes | OK |
+| wezterm recover | --force, --yes | OK |
 
 **Exception:** `--yes` is acceptable as an alias for `--force` where it reads more naturally, but `--force` should always work.
 
@@ -113,8 +114,7 @@ Both may coexist on the same command (opposite ends of verbosity spectrum).
 1. **watch.go**: Change `--providers` to `--provider`
 2. **bundle.go**: Change `--providers` to `--provider`
 3. **bundle_import.go**: Change `--providers` to `--provider`
-4. **setup.go**: Add `--force` as alias for `--yes`
-5. **wezterm.go**: Add `--force` as alias for `--yes`
+4. Keep destructive confirmation skips aligned on `--force`, with `--yes` only as an alias where it reads naturally.
 
 ### Low Priority (Code consistency)
 

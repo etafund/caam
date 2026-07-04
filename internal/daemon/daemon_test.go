@@ -892,11 +892,11 @@ func TestDaemon_InitAuthPool(t *testing.T) {
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
 	cfg := &Config{
-		CheckInterval:         50 * time.Millisecond,
-		RefreshThreshold:      1 * time.Minute,
+		CheckInterval:          50 * time.Millisecond,
+		RefreshThreshold:       1 * time.Minute,
 		MaxConcurrentRefreshes: 2,
-		Verbose:               true,
-		UseAuthPool:           true,
+		Verbose:                true,
+		UseAuthPool:            true,
 	}
 
 	d := New(v, hs, cfg)
@@ -917,11 +917,11 @@ func TestDaemon_InitAuthPool_DefaultConcurrency(t *testing.T) {
 	hs := health.NewStorage(filepath.Join(tmpDir, "health.json"))
 
 	cfg := &Config{
-		CheckInterval:         50 * time.Millisecond,
-		RefreshThreshold:      1 * time.Minute,
+		CheckInterval:          50 * time.Millisecond,
+		RefreshThreshold:       1 * time.Minute,
 		MaxConcurrentRefreshes: 0, // Should default to 3
-		Verbose:               true,
-		UseAuthPool:           true,
+		Verbose:                true,
+		UseAuthPool:            true,
 	}
 
 	d := New(v, hs, cfg)

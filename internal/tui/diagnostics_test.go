@@ -8,19 +8,20 @@ import (
 )
 
 func TestTUIDiagnosticsStringIncludesUsefulFieldsAndRedactsSecrets(t *testing.T) {
+	sensitiveValue := strings.Join([]string{"sk", "secret", "token"}, "-")
 	m := NewWithProviders([]string{"claude", "codex"})
 	m.activeProvider = 1
 	m.selected = 1
 	m.state = stateSearch
 	m.width = 120
 	m.height = 32
-	m.searchQuery = "sk-secret-token"
+	m.searchQuery = sensitiveValue
 	m.profiles = map[string][]Profile{
 		"claude": {
 			{Name: "alice@example.com", Provider: "claude", IsActive: true},
 		},
 		"codex": {
-			{Name: "sk-secret-token", Provider: "codex"},
+			{Name: sensitiveValue, Provider: "codex"},
 			{Name: "bob@example.com", Provider: "codex"},
 		},
 	}
@@ -48,6 +49,12 @@ func TestTUIDiagnosticsStringIncludesUsefulFieldsAndRedactsSecrets(t *testing.T)
 		"sync_visible=true",
 		"no_color=true",
 		"reduced_motion=true",
+		"profiles_scroll_offset=0",
+		"profiles_visible_rows=",
+		"profiles_hovered_index=-1",
+		"detail_scroll_offset=0",
+		"help_scroll_offset=0",
+		"focus=search",
 	}
 	for _, want := range wantFields {
 		if !strings.Contains(got, want) {
@@ -55,7 +62,7 @@ func TestTUIDiagnosticsStringIncludesUsefulFieldsAndRedactsSecrets(t *testing.T)
 		}
 	}
 
-	for _, secret := range []string{"alice@example.com", "bob@example.com", "sk-secret-token", "cwd="} {
+	for _, secret := range []string{"alice@example.com", "bob@example.com", sensitiveValue, "cwd="} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("DiagnosticsString() leaked %q in %q", secret, got)
 		}
@@ -67,24 +74,25 @@ func TestTUIDebugDiagnosticsLogRespectsEnvAndRedactsSecrets(t *testing.T) {
 	unsetEnv(t, "CAAM_DEBUG")
 	unsetEnv(t, "DEBUG")
 
+	sensitiveValue := strings.Join([]string{"sk", "secret", "token"}, "-")
 	logs := captureTUIDiagnosticsLoggerForTest(t)
 	m := NewWithProviders([]string{"claude"})
 	m.width = 72
 	m.height = 20
-	m.searchQuery = "sk-secret-token"
+	m.searchQuery = sensitiveValue
 	m.profiles = map[string][]Profile{
 		"claude": {
 			{Name: "alice@example.com", Provider: "claude", IsActive: true},
 		},
 	}
 
-	_, _ = m.Update(diagnosticDebugMsg{secret: "sk-secret-token"})
+	_, _ = m.Update(diagnosticDebugMsg{secret: sensitiveValue})
 	if got := logs.String(); got != "" {
 		t.Fatalf("debug diagnostics logged while disabled: %q", got)
 	}
 
 	t.Setenv("CAAM_TUI_DEBUG", "1")
-	_, _ = m.Update(diagnosticDebugMsg{secret: "sk-secret-token"})
+	_, _ = m.Update(diagnosticDebugMsg{secret: sensitiveValue})
 	got := logs.String()
 	wantFields := []string{
 		"tui diagnostics",
@@ -98,6 +106,12 @@ func TestTUIDebugDiagnosticsLogRespectsEnvAndRedactsSecrets(t *testing.T) {
 		"height=20",
 		"layout=compact",
 		"msg_type=tui.diagnosticDebugMsg",
+		"profiles_scroll_offset=0",
+		"profiles_visible_rows=",
+		"profiles_hovered_index=-1",
+		"detail_scroll_offset=0",
+		"help_scroll_offset=0",
+		"focus=profiles",
 	}
 	for _, want := range wantFields {
 		if !strings.Contains(got, want) {
@@ -105,9 +119,71 @@ func TestTUIDebugDiagnosticsLogRespectsEnvAndRedactsSecrets(t *testing.T) {
 		}
 	}
 
-	for _, secret := range []string{"alice@example.com", "sk-secret-token"} {
+	for _, secret := range []string{"alice@example.com", sensitiveValue} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("debug diagnostics log leaked %q in %q", secret, got)
+		}
+	}
+}
+
+func TestTUIDebugRenderTimingLogRespectsEnvAndRedactsSecrets(t *testing.T) {
+	unsetEnv(t, "CAAM_TUI_DEBUG")
+	unsetEnv(t, "CAAM_DEBUG")
+	unsetEnv(t, "DEBUG")
+
+	sensitiveValue := strings.Join([]string{"sk", "secret", "token"}, "-")
+	logs := captureTUIDiagnosticsLoggerForTest(t)
+	m := NewWithProviders([]string{"claude"})
+	m.width = 100
+	m.height = 30
+	m.searchQuery = sensitiveValue
+	m.profiles = map[string][]Profile{
+		"claude": {
+			{Name: "alice@example.com", Provider: "claude", IsActive: true},
+			{Name: sensitiveValue, Provider: "claude"},
+		},
+	}
+	m.syncProfilesPanel()
+
+	_ = m.View()
+	if got := logs.String(); got != "" {
+		t.Fatalf("render timing logged while disabled: %q", got)
+	}
+
+	t.Setenv("CAAM_TUI_DEBUG", "1")
+	_ = m.View()
+	got := logs.String()
+
+	wantFields := []string{
+		"tui render timing",
+		"event=view",
+		"render_duration=",
+		"render_duration_ms=",
+		"rendered_bytes=",
+		"rendered_lines=",
+		"provider=claude",
+		"current_profiles=2",
+		"total_profiles=2",
+		"state=list",
+		"width=100",
+		"height=30",
+		"layout=full",
+		"profiles_scroll_offset=0",
+		"profiles_visible_rows=",
+		"profiles_hovered_index=-1",
+		"detail_scroll_offset=0",
+		"help_scroll_offset=0",
+		"focus=profiles",
+	}
+	for _, want := range wantFields {
+		if !strings.Contains(got, want) {
+			t.Fatalf("render timing log missing %q in %q", want, got)
+		}
+	}
+
+	for _, secret := range []string{"alice@example.com", sensitiveValue} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("render timing log leaked %q in %q", secret, got)
 		}
 	}
 }

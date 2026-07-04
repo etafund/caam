@@ -67,7 +67,7 @@ func TestExpandPath(t *testing.T) {
 		input    string
 		contains string // Expected to contain this
 	}{
-		{"~/test", "test"},       // Should expand home
+		{"~/test", "test"}, // Should expand home
 		{"/absolute/path", "/absolute/path"},
 		{"relative/path", "relative/path"},
 	}

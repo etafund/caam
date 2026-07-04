@@ -237,8 +237,8 @@ func TestChallengeCodePage(t *testing.T) {
 			expected: "WXYZ-5678",
 		},
 		{
-			name: "Simple format",
-			html: `<div>Your code: MNOP-9012</div>`,
+			name:     "Simple format",
+			html:     `<div>Your code: MNOP-9012</div>`,
 			expected: "MNOP-9012",
 		},
 	}

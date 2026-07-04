@@ -1,9 +1,18 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authfile"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 func TestFormatDuration(t *testing.T) {
@@ -94,19 +103,99 @@ func TestGetUsageWithNilDeps(t *testing.T) {
 	}
 }
 
+func TestGetUsageOmitsUntrackedTotalCalls(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	if err := os.MkdirAll(filepath.Join(vaultDir, "codex", "work"), 0700); err != nil {
+		t.Fatalf("create profile dir: %v", err)
+	}
+
+	healthStore := health.NewStorage(filepath.Join(tmpDir, "health.json"))
+	lastChecked := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	if err := healthStore.UpdateProfile("codex", "work", &health.ProfileHealth{
+		ErrorCount1h: 2,
+		LastChecked:  lastChecked,
+	}); err != nil {
+		t.Fatalf("UpdateProfile: %v", err)
+	}
+
+	h := NewHandlers(authfile.NewVault(vaultDir), healthStore, nil)
+	usage, err := h.GetUsage("codex")
+	if err != nil {
+		t.Fatalf("GetUsage() error = %v", err)
+	}
+	if len(usage.Usage) != 1 {
+		t.Fatalf("GetUsage() entries = %d, want 1", len(usage.Usage))
+	}
+	entry := usage.Usage[0]
+	if entry.Tool != "codex" || entry.Profile != "work" {
+		t.Fatalf("usage entry = %s/%s, want codex/work", entry.Tool, entry.Profile)
+	}
+	if entry.ErrorCount != 2 {
+		t.Fatalf("ErrorCount = %d, want 2", entry.ErrorCount)
+	}
+	if entry.LastUsed != lastChecked.Format(time.RFC3339) {
+		t.Fatalf("LastUsed = %q, want %q", entry.LastUsed, lastChecked.Format(time.RFC3339))
+	}
+
+	body, err := json.Marshal(usage)
+	if err != nil {
+		t.Fatalf("Marshal usage: %v", err)
+	}
+	if strings.Contains(string(body), "total_calls") {
+		t.Fatalf("usage JSON contains untracked total_calls field: %s", body)
+	}
+}
+
 func TestGetCoordinators(t *testing.T) {
 	h := NewHandlers(nil, nil, nil)
 
-	// Should return empty coordinators list
-	coords, err := h.GetCoordinators()
+	coords, err := h.GetCoordinators(context.Background())
 	if err != nil {
 		t.Fatalf("GetCoordinators() error = %v", err)
 	}
-	if coords == nil {
-		t.Fatal("GetCoordinators() returned nil")
+	if len(coords.Coordinators) != 0 {
+		t.Fatalf("GetCoordinators() = %+v, want empty configured list", coords.Coordinators)
 	}
-	if coords.Coordinators == nil {
-		t.Error("GetCoordinators() coordinators list is nil")
+}
+
+func TestGetCoordinatorsQueriesConfiguredEndpoint(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/status" {
+			t.Fatalf("path = %s, want /status", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer token-1" {
+			t.Fatalf("Authorization = %q, want configured bearer token", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"running":true,"backend":"tmux","pane_count":3,"pending_auths":2}`))
+	}))
+	defer server.Close()
+
+	h := NewHandlers(nil, nil, nil)
+	h.SetCoordinatorHTTPClient(server.Client())
+	h.SetCoordinatorEndpoints([]CoordinatorEndpoint{{
+		ID:       "csd",
+		Endpoint: server.URL,
+		Token:    "token-1",
+	}})
+
+	coords, err := h.GetCoordinators(context.Background())
+	if err != nil {
+		t.Fatalf("GetCoordinators() error = %v", err)
+	}
+	if len(coords.Coordinators) != 1 {
+		t.Fatalf("coordinator count = %d, want 1", len(coords.Coordinators))
+	}
+	coord := coords.Coordinators[0]
+	if coord.ID != "csd" || coord.Endpoint != server.URL || coord.Status != "healthy" || coord.Backend != "tmux" {
+		t.Fatalf("coordinator = %+v, want healthy csd/tmux at test URL", coord)
+	}
+	if coord.PaneCount != 3 || coord.PendingAuths != 2 {
+		t.Fatalf("counts = pane:%d pending:%d, want 3/2", coord.PaneCount, coord.PendingAuths)
+	}
+	if coord.LastSeen == "" {
+		t.Fatal("LastSeen empty, want probe timestamp")
 	}
 }
 

@@ -470,14 +470,14 @@ Waiting for authentication...`,
 			desc:     "Full URL with multiple query params should be extracted completely",
 		},
 		{
-			name: "URL with complex query params",
-			output: `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
+			name:     "URL with complex query params",
+			output:   `Open this URL: https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef`,
 			expected: "https://claude.ai/oauth/authorize?code_challenge=xYz_ABC-123&state=abcdefghijklmnopqrstuvwxyz012345&nonce=1234567890abcdef",
 			desc:     "URL with special characters in query params",
 		},
 		{
-			name: "URL with URL-encoded values",
-			output: `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
+			name:     "URL with URL-encoded values",
+			output:   `Auth URL: https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email`,
 			expected: "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fauth%2Fcallback&scope=openid+profile+email",
 			desc:     "URL with percent-encoded values preserved",
 		},
@@ -753,11 +753,11 @@ func TestExtractOAuthURL_QueryParamPreservation(t *testing.T) {
 
 func TestDetectState_OAuthURLMetadata(t *testing.T) {
 	tests := []struct {
-		name        string
-		output      string
-		wantState   PaneState
-		wantURL     string
-		desc        string
+		name      string
+		output    string
+		wantState PaneState
+		wantURL   string
+		desc      string
 	}{
 		{
 			name:      "extracts URL to metadata",
@@ -1188,11 +1188,11 @@ func findSubstring(s, substr string) bool {
 
 func TestOAuthURLPattern_Regex(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantMatch  bool
-		wantFull   string
-		desc       string
+		name      string
+		input     string
+		wantMatch bool
+		wantFull  string
+		desc      string
 	}{
 		{
 			name:      "basic authorize URL",

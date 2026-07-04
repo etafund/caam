@@ -944,7 +944,6 @@ func TestFullVertexADCLifecycle(t *testing.T) {
 	}
 }
 
-
 // =============================================================================
 // DetectExistingAuth Tests
 // =============================================================================
@@ -1183,6 +1182,43 @@ func TestImportAuth(t *testing.T) {
 			t.Errorf("Copied to %s, want %s", copied[0], expected)
 		}
 	})
+}
+
+func TestValidateTokenActiveUnsupported(t *testing.T) {
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "active-unsupported",
+		Provider: "gemini",
+		AuthMode: string(provider.AuthModeAPIKey),
+		BasePath: tmpDir,
+	}
+	p := New()
+	if err := p.PrepareProfile(context.Background(), prof); err != nil {
+		t.Fatalf("PrepareProfile() error = %v", err)
+	}
+
+	token := "SYNTHETIC-GEMINI-TOKEN"
+	envPath := filepath.Join(prof.HomePath(), ".gemini", ".env")
+	if err := os.WriteFile(envPath, []byte("GEMINI_API_KEY="+token), 0600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	result, err := p.ValidateToken(context.Background(), prof, false)
+	if err != nil {
+		t.Fatalf("ValidateToken() error = %v", err)
+	}
+	if result.Method != "passive" {
+		t.Fatalf("Method = %q, want passive", result.Method)
+	}
+	if result.Valid {
+		t.Fatal("active validation should not be valid when the active probe is unsupported")
+	}
+	if !strings.HasPrefix(result.Error, "ACTIVE_VALIDATION_UNSUPPORTED:") {
+		t.Fatalf("Error = %q, want ACTIVE_VALIDATION_UNSUPPORTED prefix", result.Error)
+	}
+	if strings.Contains(result.Error, token) {
+		t.Fatalf("active unsupported error leaked token: %q", result.Error)
+	}
 }
 
 func writeJSON(t *testing.T, path string, data interface{}) {

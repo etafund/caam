@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/config"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -216,6 +217,144 @@ func TestMouseHoverHighlightsProfileWithoutChangingSelection(t *testing.T) {
 	}
 	if cleared.selected != beforeSelection || cleared.selectedProfileName != beforeName {
 		t.Fatalf("clearing hover changed selection: selected %d->%d name %q->%q", beforeSelection, cleared.selected, beforeName, cleared.selectedProfileName)
+	}
+}
+
+func TestMouseWheelRoutesToDetailViewportWithoutChangingSelection(t *testing.T) {
+	m := scrollableDetailViewportModel(true)
+
+	before := viewportMouseStateSnapshot(m)
+	if before.detailScroll != 0 {
+		t.Fatalf("initial detail scroll offset = %d, want 0", before.detailScroll)
+	}
+	if before.selected != 2 || before.selectedName != "profile-02" {
+		t.Fatalf("unexpected initial selection: %+v", before)
+	}
+
+	updated, _ := m.Update(detailWheelDownMsg(m))
+	scrolled := updated.(Model)
+	after := viewportMouseStateSnapshot(scrolled)
+	t.Logf("event=detail_wheel_down before=%s after=%s", before, after)
+
+	if after.selected != before.selected || after.selectedName != before.selectedName {
+		t.Fatalf("detail wheel changed selection: before=%+v after=%+v", before, after)
+	}
+	if after.profileScroll != before.profileScroll {
+		t.Fatalf("detail wheel changed profile scroll offset: before=%d after=%d", before.profileScroll, after.profileScroll)
+	}
+	if after.detailScroll <= before.detailScroll {
+		t.Fatalf("detail wheel did not scroll detail viewport: before=%d after=%d", before.detailScroll, after.detailScroll)
+	}
+	if after.focus != "profiles" {
+		t.Fatalf("unexpected focus after detail wheel: %q", after.focus)
+	}
+}
+
+func TestMouseDisabledIgnoresViewportMouseEvents(t *testing.T) {
+	m := scrollableDetailViewportModel(false)
+	before := viewportMouseStateSnapshot(m)
+
+	updated, _ := m.Update(detailWheelDownMsg(m))
+	afterDetailWheel := viewportMouseStateSnapshot(updated.(Model))
+	t.Logf("event=disabled_detail_wheel before=%s after=%s", before, afterDetailWheel)
+	if afterDetailWheel != before {
+		t.Fatalf("disabled detail wheel changed state: before=%+v after=%+v", before, afterDetailWheel)
+	}
+
+	updated, _ = m.Update(profileWheelDownMsg(m))
+	afterProfileWheel := viewportMouseStateSnapshot(updated.(Model))
+	t.Logf("event=disabled_profile_wheel before=%s after=%s", before, afterProfileWheel)
+	if afterProfileWheel != before {
+		t.Fatalf("disabled profile wheel changed state: before=%+v after=%+v", before, afterProfileWheel)
+	}
+
+	help := m
+	help.state = stateHelp
+	help.helpScrollOffset = 4
+	beforeHelp := viewportMouseStateSnapshot(help)
+	updated, _ = help.Update(tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		X:      10,
+		Y:      5,
+	})
+	afterHelp := viewportMouseStateSnapshot(updated.(Model))
+	t.Logf("event=disabled_help_wheel before=%s after=%s", beforeHelp, afterHelp)
+	if afterHelp != beforeHelp {
+		t.Fatalf("disabled help wheel changed state: before=%+v after=%+v", beforeHelp, afterHelp)
+	}
+}
+
+type viewportMouseState struct {
+	selected      int
+	selectedName  string
+	profileScroll int
+	detailScroll  int
+	helpScroll    int
+	focus         string
+}
+
+func (s viewportMouseState) String() string {
+	return fmt.Sprintf("selected=%d selected_name=%s profile_scroll=%d detail_scroll=%d help_scroll=%d focus=%s",
+		s.selected,
+		s.selectedName,
+		s.profileScroll,
+		s.detailScroll,
+		s.helpScroll,
+		s.focus,
+	)
+}
+
+func viewportMouseStateSnapshot(m Model) viewportMouseState {
+	d := m.Diagnostics()
+	return viewportMouseState{
+		selected:      d.SelectedIndex,
+		selectedName:  m.selectedProfileName,
+		profileScroll: d.ProfilesScrollOffset,
+		detailScroll:  d.DetailScrollOffset,
+		helpScroll:    d.HelpScrollOffset,
+		focus:         d.Focus,
+	}
+}
+
+func scrollableDetailViewportModel(mouse bool) Model {
+	cfg := config.DefaultSPMConfig()
+	cfg.TUI.Mouse = mouse
+
+	m := NewWithProvidersAndConfig([]string{"claude"}, cfg)
+	m.width = 140
+	m.height = 34
+	m.profiles = map[string][]Profile{"claude": profiles(12)}
+	m.vaultMeta = map[string]map[string]vaultProfileMeta{
+		"claude": {
+			"profile-02": {
+				Description: strings.Join(numberedLines("detail-note", 40), "\n"),
+			},
+		},
+	}
+	m.selected = 2
+	m.selectedProfileName = "profile-02"
+	m.syncProfilesPanel()
+	_ = m.View()
+	return m
+}
+
+func detailWheelDownMsg(m Model) tea.MouseMsg {
+	layout := m.fullLayoutSpec(max(0, m.height-4))
+	detailStart := layout.ProviderWidth + layout.Gap + layout.ProfilesWidth + layout.Gap
+	return tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		X:      detailStart + 1,
+		Y:      m.panelsTopY() + profilesPanelRowsStartY,
+	}
+}
+
+func profileWheelDownMsg(m Model) tea.MouseMsg {
+	layout := m.fullLayoutSpec(max(0, m.height-4))
+	profilesStart := layout.ProviderWidth + layout.Gap
+	return tea.MouseMsg{
+		Button: tea.MouseButtonWheelDown,
+		X:      profilesStart + 1,
+		Y:      m.panelsTopY() + profilesPanelRowsStartY,
 	}
 }
 

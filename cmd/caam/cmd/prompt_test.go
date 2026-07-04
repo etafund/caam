@@ -80,6 +80,82 @@ func TestConfirmPromptCIFailsClosedWithoutExplicitPlainMode(t *testing.T) {
 	}
 }
 
+func TestConfirmPromptNonInteractiveFailsClosedOutsideCI(t *testing.T) {
+	restore := stubPromptGlobals(t)
+	defer restore()
+
+	promptIsTerminal = func(int) bool { return true }
+	promptLookPath = func(string) (string, error) {
+		return "/usr/bin/gum", nil
+	}
+	promptRunGumConfirm = func(context.Context, string, string, bool, io.Reader, io.Writer, io.Writer) (bool, error) {
+		t.Fatal("gum should not run without interactive streams")
+		return false, nil
+	}
+
+	var errOut bytes.Buffer
+	ok, err := confirmPrompt(context.Background(), confirmPromptOptions{
+		Prompt:     "Proceed anyway?",
+		DefaultYes: true,
+		In:         strings.NewReader(""),
+		Out:        io.Discard,
+		Err:        &errOut,
+	})
+	if !errors.Is(err, errNonInteractivePrompt) {
+		t.Fatalf("confirmPrompt error = %v, want %v", err, errNonInteractivePrompt)
+	}
+	if ok {
+		t.Fatal("non-interactive prompt confirmed")
+	}
+	if got := errOut.String(); got != "" {
+		t.Fatalf("non-interactive fail-closed prompt wrote %q, want empty", got)
+	}
+}
+
+func TestConfirmPromptJSONModeFailsWithoutPrompt(t *testing.T) {
+	restore := stubPromptGlobals(t)
+	defer restore()
+
+	promptIsTerminal = func(int) bool { return true }
+	promptLookPath = func(string) (string, error) {
+		return "/usr/bin/gum", nil
+	}
+	promptRunGumConfirm = func(context.Context, string, string, bool, io.Reader, io.Writer, io.Writer) (bool, error) {
+		t.Fatal("gum should not run in JSON mode")
+		return false, nil
+	}
+
+	var errOut bytes.Buffer
+	var confirmed bool
+	cmd := &cobra.Command{
+		Use:           "test",
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var err error
+			confirmed, err = confirmPromptFromCommand(context.Background(), cmd, "Continue?", false)
+			return err
+		},
+	}
+	cmd.Flags().Bool("json", false, "")
+	addPromptModeFlags(cmd)
+	cmd.SetArgs([]string{"--json"})
+	cmd.SetIn(os.Stdin)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(&errOut)
+
+	err := cmd.Execute()
+	if !errors.Is(err, errNonInteractivePrompt) {
+		t.Fatalf("command error = %v, want %v", err, errNonInteractivePrompt)
+	}
+	if confirmed {
+		t.Fatal("JSON mode prompt confirmed")
+	}
+	if got := errOut.String(); got != "" {
+		t.Fatalf("JSON mode prompt wrote %q, want empty", got)
+	}
+}
+
 func TestConfirmPromptNoColorFallsBackEvenWhenGumExists(t *testing.T) {
 	restore := stubPromptGlobals(t)
 	defer restore()
@@ -111,6 +187,54 @@ func TestConfirmPromptNoColorFallsBackEvenWhenGumExists(t *testing.T) {
 	}
 	if got, want := errOut.String(), "Proceed anyway? [y/N]: "; got != want {
 		t.Fatalf("plain prompt = %q, want %q", got, want)
+	}
+}
+
+func TestConfirmPromptTUIDisabledEnvironmentsFallBackToPlain(t *testing.T) {
+	tests := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{name: "term dumb", key: "TERM", val: "dumb"},
+		{name: "caam no tui", key: "CAAM_NO_TUI", val: "1"},
+		{name: "generic no tui", key: "NO_TUI", val: "true"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			restore := stubPromptGlobals(t)
+			defer restore()
+			if err := os.Setenv(tc.key, tc.val); err != nil {
+				t.Fatal(err)
+			}
+
+			promptIsTerminal = func(int) bool { return true }
+			promptLookPath = func(string) (string, error) {
+				return "/usr/bin/gum", nil
+			}
+			promptRunGumConfirm = func(context.Context, string, string, bool, io.Reader, io.Writer, io.Writer) (bool, error) {
+				t.Fatal("gum should not run when TUI is disabled")
+				return false, nil
+			}
+
+			var errOut bytes.Buffer
+			ok, err := confirmPrompt(context.Background(), confirmPromptOptions{
+				Prompt: "Proceed anyway?",
+				In:     strings.NewReader("yes\n"),
+				Out:    io.Discard,
+				Err:    &errOut,
+			})
+			if err != nil {
+				t.Fatalf("confirmPrompt returned error: %v", err)
+			}
+			if !ok {
+				t.Fatal("confirmPrompt returned false, want true")
+			}
+			if got, want := errOut.String(), "Proceed anyway? [y/N]: "; got != want {
+				t.Fatalf("plain prompt = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
@@ -367,10 +491,22 @@ func stubPromptGlobals(t *testing.T) func() {
 	oldRunGumConfirm := promptRunGumConfirm
 	oldCI, hadCI := os.LookupEnv("CI")
 	oldNoColor, hadNoColor := os.LookupEnv("NO_COLOR")
+	oldTerm, hadTerm := os.LookupEnv("TERM")
+	oldCAAMNoTUI, hadCAAMNoTUI := os.LookupEnv("CAAM_NO_TUI")
+	oldNoTUI, hadNoTUI := os.LookupEnv("NO_TUI")
 	if err := os.Unsetenv("CI"); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Unsetenv("NO_COLOR"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("TERM"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("CAAM_NO_TUI"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Unsetenv("NO_TUI"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -380,6 +516,9 @@ func stubPromptGlobals(t *testing.T) func() {
 		promptRunGumConfirm = oldRunGumConfirm
 		restoreEnv("CI", oldCI, hadCI)
 		restoreEnv("NO_COLOR", oldNoColor, hadNoColor)
+		restoreEnv("TERM", oldTerm, hadTerm)
+		restoreEnv("CAAM_NO_TUI", oldCAAMNoTUI, hadCAAMNoTUI)
+		restoreEnv("NO_TUI", oldNoTUI, hadNoTUI)
 	}
 }
 

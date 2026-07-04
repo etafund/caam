@@ -41,35 +41,35 @@ type DetectedPath struct {
 type DetectedAgentStatus string
 
 const (
-	StatusReady       DetectedAgentStatus = "ready"        // Binary installed, auth present
-	StatusNeedsAuth   DetectedAgentStatus = "needs_auth"   // Binary installed, no auth
-	StatusNotFound    DetectedAgentStatus = "not_found"    // Binary not found in PATH
-	StatusUnavailable DetectedAgentStatus = "unavailable"  // Error checking status
+	StatusReady       DetectedAgentStatus = "ready"       // Binary installed, auth present
+	StatusNeedsAuth   DetectedAgentStatus = "needs_auth"  // Binary installed, no auth
+	StatusNotFound    DetectedAgentStatus = "not_found"   // Binary not found in PATH
+	StatusUnavailable DetectedAgentStatus = "unavailable" // Error checking status
 )
 
 // DetectReport contains the full detection results.
 type DetectReport struct {
-	Timestamp string           `json:"timestamp"`
-	Agents    []DetectedAgent  `json:"agents"`
-	Summary   DetectSummary    `json:"summary"`
+	Timestamp string          `json:"timestamp"`
+	Agents    []DetectedAgent `json:"agents"`
+	Summary   DetectSummary   `json:"summary"`
 }
 
 // DetectSummary summarizes the detection results.
 type DetectSummary struct {
-	TotalAgents   int `json:"total_agents"`
-	Installed     int `json:"installed"`
-	Ready         int `json:"ready"`
-	NeedAuth      int `json:"need_auth"`
-	NotFound      int `json:"not_found"`
+	TotalAgents int `json:"total_agents"`
+	Installed   int `json:"installed"`
+	Ready       int `json:"ready"`
+	NeedAuth    int `json:"need_auth"`
+	NotFound    int `json:"not_found"`
 }
 
 // AgentSpec defines how to detect a specific AI coding agent.
 type AgentSpec struct {
-	Name         string   // e.g., "claude", "codex", "gemini"
-	DisplayName  string   // e.g., "Claude Code (Anthropic)"
-	BinaryNames  []string // Binary names to search in PATH
-	VersionArgs  []string // Arguments to get version (e.g., ["--version"])
-	VersionRegex string   // Regex to extract version from output
+	Name         string            // e.g., "claude", "codex", "gemini"
+	DisplayName  string            // e.g., "Claude Code (Anthropic)"
+	BinaryNames  []string          // Binary names to search in PATH
+	VersionArgs  []string          // Arguments to get version (e.g., ["--version"])
+	VersionRegex string            // Regex to extract version from output
 	ConfigPaths  func() []PathSpec // Function to get config paths (uses home dir)
 	AuthPaths    func() []PathSpec // Function to get auth paths (uses home dir)
 }

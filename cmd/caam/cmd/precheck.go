@@ -56,28 +56,28 @@ func init() {
 
 // PrecheckResult contains the structured output for precheck.
 type PrecheckResult struct {
-	Provider    string                `json:"provider"`
-	Recommended *ProfileRecommendation `json:"recommended,omitempty"`
+	Provider    string                  `json:"provider"`
+	Recommended *ProfileRecommendation  `json:"recommended,omitempty"`
 	Backups     []ProfileRecommendation `json:"backups"`
-	InCooldown  []CooldownProfile      `json:"in_cooldown"`
-	Alerts      []PrecheckAlert        `json:"alerts"`
-	Summary     *UsageSummary          `json:"summary"`
-	Forecast    *RotationForecast      `json:"forecast,omitempty"`
-	Algorithm   string                 `json:"algorithm"`
-	FetchedAt   time.Time              `json:"fetched_at"`
+	InCooldown  []CooldownProfile       `json:"in_cooldown"`
+	Alerts      []PrecheckAlert         `json:"alerts"`
+	Summary     *UsageSummary           `json:"summary"`
+	Forecast    *RotationForecast       `json:"forecast,omitempty"`
+	Algorithm   string                  `json:"algorithm"`
+	FetchedAt   time.Time               `json:"fetched_at"`
 }
 
 // ProfileRecommendation represents a profile with its recommendation data.
 type ProfileRecommendation struct {
-	Name           string   `json:"name"`
-	Score          float64  `json:"score"`
-	UsagePercent   int      `json:"usage_percent"`
-	AvailScore     int      `json:"availability_score"`
-	HealthStatus   string   `json:"health_status"`
-	TokenExpiry    string   `json:"token_expiry,omitempty"`
-	TimeToDepletion string  `json:"time_to_depletion,omitempty"`
-	Reasons        []string `json:"reasons"`
-	PoolStatus     string   `json:"pool_status"`
+	Name            string   `json:"name"`
+	Score           float64  `json:"score"`
+	UsagePercent    int      `json:"usage_percent"`
+	AvailScore      int      `json:"availability_score"`
+	HealthStatus    string   `json:"health_status"`
+	TokenExpiry     string   `json:"token_expiry,omitempty"`
+	TimeToDepletion string   `json:"time_to_depletion,omitempty"`
+	Reasons         []string `json:"reasons"`
+	PoolStatus      string   `json:"pool_status"`
 }
 
 // CooldownProfile represents a profile in cooldown.
@@ -89,29 +89,29 @@ type CooldownProfile struct {
 
 // PrecheckAlert represents an alert for the precheck.
 type PrecheckAlert struct {
-	Type      string `json:"type"`
-	Profile   string `json:"profile,omitempty"`
-	Message   string `json:"message"`
-	Urgency   string `json:"urgency"`
-	Action    string `json:"action,omitempty"`
+	Type    string `json:"type"`
+	Profile string `json:"profile,omitempty"`
+	Message string `json:"message"`
+	Urgency string `json:"urgency"`
+	Action  string `json:"action,omitempty"`
 }
 
 // UsageSummary contains aggregate usage information.
 type UsageSummary struct {
-	TotalProfiles   int    `json:"total_profiles"`
-	ReadyProfiles   int    `json:"ready_profiles"`
-	CooldownCount   int    `json:"cooldown_count"`
-	AvgUsagePercent int    `json:"avg_usage_percent"`
-	HealthyCount    int    `json:"healthy_count"`
-	WarningCount    int    `json:"warning_count"`
-	CriticalCount   int    `json:"critical_count"`
+	TotalProfiles   int `json:"total_profiles"`
+	ReadyProfiles   int `json:"ready_profiles"`
+	CooldownCount   int `json:"cooldown_count"`
+	AvgUsagePercent int `json:"avg_usage_percent"`
+	HealthyCount    int `json:"healthy_count"`
+	WarningCount    int `json:"warning_count"`
+	CriticalCount   int `json:"critical_count"`
 }
 
 // RotationForecast contains rotation prediction data.
 type RotationForecast struct {
-	NextRotation     string `json:"next_rotation,omitempty"`
-	RecommendedWait  string `json:"recommended_wait,omitempty"`
-	ProfilesUntilReset int  `json:"profiles_until_reset"`
+	NextRotation       string `json:"next_rotation,omitempty"`
+	RecommendedWait    string `json:"recommended_wait,omitempty"`
+	ProfilesUntilReset int    `json:"profiles_until_reset"`
 }
 
 func runPrecheckCmd(cmd *cobra.Command, args []string) error {

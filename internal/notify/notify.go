@@ -40,10 +40,10 @@ type Alert struct {
 type Notifier interface {
 	// Notify delivers an alert.
 	Notify(alert *Alert) error
-	
+
 	// Name returns the name of the notifier (e.g., "terminal", "desktop").
 	Name() string
-	
+
 	// Available checks if the notifier can be used in the current environment.
 	Available() bool
 }

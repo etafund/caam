@@ -813,6 +813,43 @@ func TestImportAuth(t *testing.T) {
 	})
 }
 
+func TestValidateTokenActiveUnsupported(t *testing.T) {
+	tmpDir := t.TempDir()
+	prof := &profile.Profile{
+		Name:     "active-unsupported",
+		Provider: "codex",
+		AuthMode: string(provider.AuthModeOAuth),
+		BasePath: tmpDir,
+	}
+	p := New()
+	if err := p.PrepareProfile(context.Background(), prof); err != nil {
+		t.Fatalf("PrepareProfile() error = %v", err)
+	}
+
+	token := "SYNTHETIC-CODEX-TOKEN"
+	writeJSON(t, filepath.Join(prof.CodexHomePath(), "auth.json"), map[string]interface{}{
+		"access_token": token,
+		"expires_at":   time.Now().Add(time.Hour).Format(time.RFC3339),
+	})
+
+	result, err := p.ValidateToken(context.Background(), prof, false)
+	if err != nil {
+		t.Fatalf("ValidateToken() error = %v", err)
+	}
+	if result.Method != "passive" {
+		t.Fatalf("Method = %q, want passive", result.Method)
+	}
+	if result.Valid {
+		t.Fatal("active validation should not be valid when the active probe is unsupported")
+	}
+	if !strings.HasPrefix(result.Error, "ACTIVE_VALIDATION_UNSUPPORTED:") {
+		t.Fatalf("Error = %q, want ACTIVE_VALIDATION_UNSUPPORTED prefix", result.Error)
+	}
+	if strings.Contains(result.Error, token) {
+		t.Fatalf("active unsupported error leaked token: %q", result.Error)
+	}
+}
+
 func writeJSON(t *testing.T, path string, data interface{}) {
 	t.Helper()
 	b, err := json.Marshal(data)

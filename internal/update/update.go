@@ -25,6 +25,8 @@ const (
 	DefaultRepo = "coding_agent_account_manager"
 	// GitHubAPIBase is the base URL for GitHub API.
 	GitHubAPIBase = "https://api.github.com"
+
+	maxGitHubReleaseResponseBytes = 4 << 20
 )
 
 // Channel represents an update channel.
@@ -77,11 +79,11 @@ type UpdateResult struct {
 
 // CheckResult represents the result of a version check.
 type CheckResult struct {
-	CurrentVersion string
-	LatestVersion  string
+	CurrentVersion  string
+	LatestVersion   string
 	UpdateAvailable bool
-	Release        *Release
-	Channel        Channel
+	Release         *Release
+	Channel         Channel
 }
 
 // Config holds update configuration.
@@ -313,7 +315,7 @@ func (u *Updater) fetchLatestRelease(ctx context.Context) (*Release, error) {
 	}
 
 	var releases []Release
-	if err := json.NewDecoder(resp.Body).Decode(&releases); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxGitHubReleaseResponseBytes)).Decode(&releases); err != nil {
 		return nil, fmt.Errorf("decode releases: %w", err)
 	}
 
@@ -358,7 +360,7 @@ func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error
 	}
 
 	var release Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxGitHubReleaseResponseBytes)).Decode(&release); err != nil {
 		return nil, fmt.Errorf("decode release: %w", err)
 	}
 

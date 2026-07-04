@@ -268,9 +268,10 @@ func TestMonitorRefreshActiveClaudeUsesLiveCredential(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	token := "active-token"
-	writeClaudeCredential(t, vault, "alice", token, time.Now().Add(-time.Minute))
-	writeLiveClaudeCredential(t, home, token, time.Now().Add(time.Hour))
+	vaultToken := "old-access-token"
+	liveToken := "rotated-live-token"
+	writeClaudeCredential(t, vault, "alice", vaultToken, time.Now().Add(-time.Minute))
+	writeLiveClaudeCredential(t, home, liveToken, time.Now().Add(time.Hour))
 
 	fetcher := &scriptedFetcher{
 		responses: []map[string]*usage.UsageInfo{
@@ -301,7 +302,7 @@ func TestMonitorRefreshActiveClaudeUsesLiveCredential(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("fetch calls = %d, want 1", len(calls))
 	}
-	if got := calls[0].profiles["alice"]; got != token {
+	if got := calls[0].profiles["alice"]; got != liveToken {
 		t.Fatalf("fetch token = %q, want live token", got)
 	}
 	state := mon.GetState()
