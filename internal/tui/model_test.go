@@ -1722,6 +1722,43 @@ func TestRenderStatusBar(t *testing.T) {
 	}
 }
 
+func TestRenderStatusBarHealthSummary(t *testing.T) {
+	m := New()
+	m.width = 120
+	m.profiles = map[string][]Profile{
+		"claude": {
+			{Name: "healthy", Provider: "claude"},
+			{Name: "warning", Provider: "claude"},
+			{Name: "unknown", Provider: "claude"},
+		},
+	}
+	m.healthStorage = health.NewStorage(filepath.Join(t.TempDir(), "health.json"))
+	if err := m.healthStorage.UpdateProfile("claude", "healthy", &health.ProfileHealth{
+		TokenExpiresAt: time.Now().Add(2 * time.Hour),
+	}); err != nil {
+		t.Fatalf("UpdateProfile healthy: %v", err)
+	}
+	if err := m.healthStorage.UpdateProfile("claude", "warning", &health.ProfileHealth{
+		TokenExpiresAt: time.Now().Add(30 * time.Minute),
+	}); err != nil {
+		t.Fatalf("UpdateProfile warning: %v", err)
+	}
+
+	view := normalizeStatusSnapshot(m.renderStatusBar(layoutSpec{Mode: layoutFull}))
+	if !strings.Contains(view, "3 profiles: 1 healthy, 1 warning, 1 unknown") {
+		t.Fatalf("status bar missing health summary:\n%s", view)
+	}
+
+	m.statusMsg = "Activated claude/healthy"
+	view = normalizeStatusSnapshot(m.renderStatusBar(layoutSpec{Mode: layoutFull}))
+	if !strings.Contains(view, "Activated claude/healthy") {
+		t.Fatalf("status message should override health summary:\n%s", view)
+	}
+	if strings.Contains(view, "profiles:") {
+		t.Fatalf("health summary should be hidden while status message is active:\n%s", view)
+	}
+}
+
 func TestStatusBarSeveritySnapshots(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 

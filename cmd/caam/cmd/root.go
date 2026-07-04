@@ -757,7 +757,8 @@ Examples:
   caam status           # Show all tools
   caam status claude    # Show just Claude
   caam status --no-color  # Without colors
-  caam status --json      # Output as JSON`,
+  caam status --json      # Output as JSON
+  caam status --format=prompt  # Compact shell prompt string`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runStatus,
 }
@@ -765,11 +766,24 @@ Examples:
 func init() {
 	statusCmd.Flags().Bool("no-color", false, "disable colored output")
 	statusCmd.Flags().Bool("json", false, "output as JSON")
+	statusCmd.Flags().String("format", "table", "output format: table, json, prompt")
 }
 
 func runStatus(cmd *cobra.Command, args []string) error {
 	noColor, _ := cmd.Flags().GetBool("no-color")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
+	outputFormat, _ := cmd.Flags().GetString("format")
+	outputFormat = strings.ToLower(strings.TrimSpace(outputFormat))
+	if jsonOutput {
+		outputFormat = "json"
+	}
+	switch outputFormat {
+	case "", "table":
+		outputFormat = "table"
+	case "json", "prompt":
+	default:
+		return fmt.Errorf("unsupported status format: %s", outputFormat)
+	}
 	formatOpts := health.FormatOptions{NoColor: noColor || !isTerminal()}
 
 	toolsToCheck := []string{"codex", "claude", "gemini"}
@@ -784,8 +798,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	var output statusOutput
 	var warnings []string
 	var recommendations []string
+	var promptParts []string
 
-	if !jsonOutput {
+	if outputFormat == "table" {
 		fmt.Println("Active Profiles")
 		fmt.Println("───────────────────────────────────────────────────")
 		fmt.Printf("%-10s  %-20s  %-24s  %-10s  %s\n", "TOOL", "PROFILE", "EMAIL", "PLAN", "STATUS")
@@ -796,12 +811,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		hasAuth := authfile.HasAuthFiles(fileSet)
 
 		if !hasAuth {
-			if jsonOutput {
+			if outputFormat == "json" {
 				output.Tools = append(output.Tools, statusTool{
 					Tool:     tool,
 					LoggedIn: false,
 				})
-			} else {
+			} else if outputFormat == "table" {
 				fmt.Printf("%-10s  (not logged in)\n", tool)
 			}
 			continue
@@ -809,13 +824,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 
 		activeProfile, err := vault.ActiveProfile(fileSet)
 		if err != nil {
-			if jsonOutput {
+			if outputFormat == "json" {
 				output.Tools = append(output.Tools, statusTool{
 					Tool:     tool,
 					LoggedIn: true,
 					Error:    err.Error(),
 				})
-			} else {
+			} else if outputFormat == "table" {
 				fmt.Printf("%-10s  (error: %v)\n", tool, err)
 			}
 			continue
@@ -828,13 +843,13 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			// `ls` lists saved profiles for the tool is confusing (issue #20).
 			savedProfiles, _ := vault.List(tool)
 			savedCount := len(savedProfiles)
-			if jsonOutput {
+			if outputFormat == "json" {
 				output.Tools = append(output.Tools, statusTool{
 					Tool:          tool,
 					LoggedIn:      true,
 					SavedProfiles: savedCount,
 				})
-			} else {
+			} else if outputFormat == "table" {
 				if savedCount > 0 {
 					noun := "profiles"
 					if savedCount == 1 {
@@ -852,7 +867,9 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		ph, id := getProfileHealthWithIdentity(tool, activeProfile)
 		status := health.CalculateStatus(ph)
 
-		if jsonOutput {
+		if outputFormat == "prompt" {
+			promptParts = append(promptParts, formatStatusPromptPart(tool, activeProfile, status))
+		} else if outputFormat == "json" {
 			st := statusTool{
 				Tool:          tool,
 				LoggedIn:      true,
@@ -905,7 +922,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if jsonOutput {
+	if outputFormat == "prompt" {
+		fmt.Fprintln(cmd.OutOrStdout(), strings.Join(promptParts, " "))
+		return nil
+	}
+
+	if outputFormat == "json" {
 		output.Warnings = warnings
 		output.Recommendations = recommendations
 		return encodeJSONEnvelope(cmd.OutOrStdout(), jsonOutputFormatStatus, output)
@@ -934,6 +956,10 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func formatStatusPromptPart(tool, profileName string, status health.HealthStatus) string {
+	return fmt.Sprintf("%s:%s(%s)", tool, profileName, status.String())
 }
 
 // lsOutput is the JSON output structure for ls command.

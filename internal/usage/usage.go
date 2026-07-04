@@ -26,7 +26,7 @@ type UsageWindow struct {
 	UsedPercent int `json:"used_percent"`
 
 	// ResetsAt is when this window resets.
-	ResetsAt time.Time `json:"resets_at"`
+	ResetsAt time.Time `json:"resets_at,omitempty,omitzero"`
 
 	// WindowDuration is the window size (if known).
 	WindowDuration time.Duration `json:"window_duration,omitempty"`
@@ -91,7 +91,7 @@ type UsageInfo struct {
 
 	// EstimatedDepletion is when the rate limit is predicted to be hit
 	// at the current burn rate. Zero time if cannot predict.
-	EstimatedDepletion time.Time `json:"estimated_depletion,omitempty"`
+	EstimatedDepletion time.Time `json:"estimated_depletion,omitempty,omitzero"`
 
 	// DepletionConfidence is how confident the depletion prediction is (0-1).
 	// Based on burn rate data quality and sample size.

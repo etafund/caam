@@ -70,6 +70,49 @@ func TestJSONRendererValid(t *testing.T) {
 	}
 }
 
+func TestJSONRendererOmitsUnknownPoolStatus(t *testing.T) {
+	state := &MonitorState{
+		UpdatedAt: time.Date(2026, 7, 4, 1, 0, 0, 0, time.UTC),
+		Profiles: map[string]*ProfileState{
+			"claude/alice": {
+				Provider:    "claude",
+				ProfileName: "alice",
+				Health:      health.StatusHealthy,
+				PoolStatus:  authpool.PoolStatusUnknown,
+			},
+			"codex/bob": {
+				Provider:    "codex",
+				ProfileName: "bob",
+				Health:      health.StatusHealthy,
+				PoolStatus:  authpool.PoolStatusReady,
+			},
+		},
+	}
+
+	out := NewJSONRenderer(false).Render(state)
+	var payload struct {
+		Profiles []map[string]interface{} `json:"profiles"`
+	}
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("json unmarshal failed: %v; output=%s", err, out)
+	}
+	if len(payload.Profiles) != 2 {
+		t.Fatalf("profiles length = %d, want 2", len(payload.Profiles))
+	}
+
+	byName := make(map[string]map[string]interface{}, len(payload.Profiles))
+	for _, profile := range payload.Profiles {
+		name, _ := profile["profile_name"].(string)
+		byName[name] = profile
+	}
+	if _, ok := byName["alice"]["pool_status"]; ok {
+		t.Fatalf("unknown pool status should be omitted, got profile: %#v", byName["alice"])
+	}
+	if got := byName["bob"]["pool_status"]; got != "ready" {
+		t.Fatalf("ready pool status = %#v, want ready; profile=%#v", got, byName["bob"])
+	}
+}
+
 func TestJSONRendererModelWindowsPresentWhenSetAndOmittedWhenNil(t *testing.T) {
 	now := time.Date(2026, 7, 3, 20, 0, 0, 0, time.UTC)
 	state := &MonitorState{

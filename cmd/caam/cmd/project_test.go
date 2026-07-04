@@ -141,3 +141,63 @@ func TestActivate_UsesProjectAssociationWhenProfileOmitted(t *testing.T) {
 		t.Fatalf("auth.json = %q, want %q", string(gotAuth), wantAuth)
 	}
 }
+
+func TestProjectCheckQuietActivatesAssociation(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	oldCodexHome := os.Getenv("CODEX_HOME")
+	oldCaamHome := os.Getenv("CAAM_HOME")
+	t.Cleanup(func() {
+		_ = os.Setenv("CODEX_HOME", oldCodexHome)
+		_ = os.Setenv("CAAM_HOME", oldCaamHome)
+	})
+	codexHome := filepath.Join(tmpDir, "codex-home")
+	_ = os.Setenv("CODEX_HOME", codexHome)
+	_ = os.Setenv("CAAM_HOME", tmpDir)
+
+	oldVault := vault
+	vault = authfile.NewVault(filepath.Join(tmpDir, "vault"))
+	t.Cleanup(func() { vault = oldVault })
+	profileDir := vault.ProfilePath("codex", "work")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatalf("MkdirAll(profileDir): %v", err)
+	}
+	wantAuth := `{"access_token":"project-check-token"}`
+	if err := os.WriteFile(filepath.Join(profileDir, "auth.json"), []byte(wantAuth), 0600); err != nil {
+		t.Fatalf("WriteFile(auth.json): %v", err)
+	}
+
+	oldProjectStore := projectStore
+	projectStore = project.NewStore(filepath.Join(tmpDir, "projects.json"))
+	t.Cleanup(func() { projectStore = oldProjectStore })
+
+	cwd := filepath.Join(tmpDir, "repo")
+	if err := os.MkdirAll(cwd, 0700); err != nil {
+		t.Fatalf("MkdirAll(cwd): %v", err)
+	}
+	oldWD, _ := os.Getwd()
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatalf("Chdir(cwd): %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+
+	if err := projectStore.SetAssociation(cwd, "codex", "work"); err != nil {
+		t.Fatalf("SetAssociation: %v", err)
+	}
+
+	if err := projectCheckCmd.Flags().Set("quiet", "true"); err != nil {
+		t.Fatalf("set quiet flag: %v", err)
+	}
+	t.Cleanup(func() { _ = projectCheckCmd.Flags().Set("quiet", "false") })
+	if err := runProjectCheck(projectCheckCmd, nil); err != nil {
+		t.Fatalf("runProjectCheck: %v", err)
+	}
+
+	gotAuth, err := os.ReadFile(filepath.Join(codexHome, "auth.json"))
+	if err != nil {
+		t.Fatalf("ReadFile(auth.json): %v", err)
+	}
+	if string(gotAuth) != wantAuth {
+		t.Fatalf("auth.json = %q, want %q", string(gotAuth), wantAuth)
+	}
+}

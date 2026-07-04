@@ -4,13 +4,29 @@ package health
 
 import (
 	"os"
+
+	"golang.org/x/sys/windows"
 )
 
-// No-op for Windows to allow compilation without complex syscall logic
 func LockFile(f *os.File) error {
-	return nil
+	var overlapped windows.Overlapped
+	return windows.LockFileEx(
+		windows.Handle(f.Fd()),
+		windows.LOCKFILE_EXCLUSIVE_LOCK,
+		0,
+		^uint32(0),
+		^uint32(0),
+		&overlapped,
+	)
 }
 
 func UnlockFile(f *os.File) error {
-	return nil
+	var overlapped windows.Overlapped
+	return windows.UnlockFileEx(
+		windows.Handle(f.Fd()),
+		0,
+		^uint32(0),
+		^uint32(0),
+		&overlapped,
+	)
 }

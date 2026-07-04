@@ -2,8 +2,12 @@ package cmd
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
 func TestGenerateBashInit(t *testing.T) {
@@ -34,6 +38,18 @@ func TestGenerateBashInit(t *testing.T) {
 	}
 	if !strings.Contains(output, "complete -F _caam_completions caam") {
 		t.Error("Missing completion registration")
+	}
+	if !strings.Contains(output, "_caam_prompt()") {
+		t.Error("Missing prompt helper")
+	}
+	if !strings.Contains(output, "status --format=prompt") {
+		t.Error("Missing prompt status command")
+	}
+	if !strings.Contains(output, "_caam_project_check") {
+		t.Error("Missing project auto-activation helper")
+	}
+	if !strings.Contains(output, "project check --quiet") {
+		t.Error("Missing project check hook")
 	}
 }
 
@@ -92,6 +108,15 @@ func TestGenerateFishInit(t *testing.T) {
 	if !strings.Contains(output, "complete -c caam") {
 		t.Error("Missing fish completion")
 	}
+	if !strings.Contains(output, "function _caam_prompt") {
+		t.Error("Missing fish prompt helper")
+	}
+	if !strings.Contains(output, "status --format=prompt") {
+		t.Error("Missing fish prompt status command")
+	}
+	if !strings.Contains(output, "--on-variable PWD") {
+		t.Error("Missing fish directory-change hook")
+	}
 }
 
 func TestGenerateFishInit_NoWrap(t *testing.T) {
@@ -131,8 +156,8 @@ func TestShellInitCommand(t *testing.T) {
 	// Test that the command exists and can be executed
 	cmd := shellInitCmd
 
-	if cmd.Use != "init" {
-		t.Errorf("shellInitCmd.Use = %s, want 'init'", cmd.Use)
+	if cmd.Use != "init [bash|zsh|fish]" {
+		t.Errorf("shellInitCmd.Use = %s, want 'init [bash|zsh|fish]'", cmd.Use)
 	}
 
 	// Check flags exist
@@ -150,6 +175,12 @@ func TestShellInitCommand(t *testing.T) {
 	}
 	if cmd.Flags().Lookup("tools") == nil {
 		t.Error("Missing --tools flag")
+	}
+	if cmd.Flags().Lookup("install") == nil {
+		t.Error("Missing --install flag")
+	}
+	if cmd.Flags().Lookup("rc-file") == nil {
+		t.Error("Missing --rc-file flag")
 	}
 }
 
@@ -321,5 +352,52 @@ func TestGenerateFishInit_PathWithSpaces(t *testing.T) {
 	// Should use quoted path
 	if !strings.Contains(output, "'/path with spaces/caam'") {
 		t.Error("Path with spaces should be single-quoted in output")
+	}
+}
+
+func TestShellInitInstallLine(t *testing.T) {
+	if got := shellInitInstallLine("/path with spaces/caam", "bash"); got != `eval "$('/path with spaces/caam' shell init bash)"` {
+		t.Fatalf("bash install line = %q", got)
+	}
+	if got := shellInitInstallLine("/usr/local/bin/caam", "fish"); got != "/usr/local/bin/caam shell init fish | source" {
+		t.Fatalf("fish install line = %q", got)
+	}
+}
+
+func TestInstallShellInitLineIsIdempotent(t *testing.T) {
+	rcFile := filepath.Join(t.TempDir(), ".bashrc")
+	if err := os.WriteFile(rcFile, []byte("# existing"), 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	line := `eval "$(caam shell init bash)"`
+
+	changed, err := installShellInitLine(rcFile, line)
+	if err != nil {
+		t.Fatalf("installShellInitLine first: %v", err)
+	}
+	if !changed {
+		t.Fatal("first install should change rc file")
+	}
+	changed, err = installShellInitLine(rcFile, line)
+	if err != nil {
+		t.Fatalf("installShellInitLine second: %v", err)
+	}
+	if changed {
+		t.Fatal("second install should be idempotent")
+	}
+
+	data, err := os.ReadFile(rcFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if count := strings.Count(string(data), line); count != 1 {
+		t.Fatalf("install line count = %d, want 1\n%s", count, string(data))
+	}
+}
+
+func TestFormatStatusPromptPart(t *testing.T) {
+	got := formatStatusPromptPart("claude", "work", health.StatusWarning)
+	if got != "claude:work(warning)" {
+		t.Fatalf("formatStatusPromptPart() = %q", got)
 	}
 }

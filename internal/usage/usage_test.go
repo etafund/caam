@@ -2,12 +2,14 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -89,6 +91,143 @@ func TestUsageInfo_AvailabilityScore(t *testing.T) {
 				t.Errorf("AvailabilityScore() = %d, expected %d", score, tc.expected)
 			}
 		})
+	}
+}
+
+func TestUsageWindowJSONOmitsZeroReset(t *testing.T) {
+	info := &UsageInfo{
+		Provider: "codex",
+		ModelWindows: map[string]*UsageWindow{
+			"spark/5h": {
+				Utilization:    0.22,
+				UsedPercent:    22,
+				WindowDuration: 5 * time.Hour,
+				Label:          "GPT-5.3-Codex-Spark",
+			},
+		},
+		FetchedAt: time.Date(2030, 1, 1, 12, 0, 0, 0, time.UTC),
+	}
+
+	data, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	out := string(data)
+	if strings.Contains(out, "resets_at") {
+		t.Fatalf("zero reset time should be omitted from JSON, got %s", out)
+	}
+	if strings.Contains(out, "0001-01-01") {
+		t.Fatalf("zero time placeholder leaked into JSON: %s", out)
+	}
+}
+
+func TestUsageInfoModelWindowParsingRunsOnDefaultPlatforms(t *testing.T) {
+	t.Run("codex additional rate limits", func(t *testing.T) {
+		payload := `{
+			"plan_type": "pro",
+			"rate_limit": {
+				"primary_window": {"used_percent": 11, "limit_window_seconds": 18000, "reset_at": 1893470400},
+				"secondary_window": {"used_percent": 33, "limit_window_seconds": 604800, "reset_at": 1893974400}
+			},
+			"additional_rate_limits": [
+				{
+					"limit_name": "GPT-5.3-Codex-Spark",
+					"metered_feature": "codex_bengalfox",
+					"rate_limit": {
+						"primary_window": {"used_percent": 22, "limit_window_seconds": 18000, "reset_at": 1893474000},
+						"secondary_window": {"used_percent": 41, "limit_window_seconds": 604800, "reset_at": 1893970800}
+					}
+				}
+			]
+		}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != CodexUsagePath {
+				t.Fatalf("unexpected path: %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, payload)
+		}))
+		defer server.Close()
+
+		fetcher := NewCodexFetcher()
+		fetcher.baseURL = server.URL
+
+		info, err := fetcher.Fetch(context.Background(), "offline-token")
+		if err != nil {
+			t.Fatalf("Fetch() error = %v", err)
+		}
+		fiveHour := info.ModelWindows["codex_bengalfox/5h"]
+		weekly := info.ModelWindows["codex_bengalfox/weekly"]
+		if fiveHour == nil || weekly == nil {
+			t.Fatalf("missing Codex model windows: %#v", info.ModelWindows)
+		}
+		if fiveHour.UsedPercent != 22 || fiveHour.Utilization != 0.22 || fiveHour.WindowDuration != 5*time.Hour {
+			t.Fatalf("5h window = %#v, want 22%%/0.22/5h", fiveHour)
+		}
+		if weekly.UsedPercent != 41 || weekly.Utilization != 0.41 || weekly.WindowDuration != 7*24*time.Hour {
+			t.Fatalf("weekly window = %#v, want 41%%/0.41/168h", weekly)
+		}
+		if got := info.FindModelWindow("spark", "weekly"); got != weekly {
+			t.Fatalf("FindModelWindow(spark, weekly) = %#v, want weekly", got)
+		}
+	})
+
+	t.Run("claude per model windows", func(t *testing.T) {
+		payload := `{
+			"five_hour": {"utilization": 25, "resets_at": "2030-01-01T05:00:00Z"},
+			"seven_day": {"utilization": 0.4, "resets_at": "2030-01-07T00:00:00Z"},
+			"seven_day_opus": {"utilization": 66, "resets_at": "2030-01-07T01:00:00Z"},
+			"seven_day_sonnet": {"utilization": 12, "resets_at": "2030-01-07T02:00:00Z"},
+			"plan": "max"
+		}`
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, payload)
+		}))
+		defer server.Close()
+
+		fetcher := NewClaudeFetcher()
+		fetcher.baseURL = server.URL
+
+		info, err := fetcher.Fetch(context.Background(), "offline-token")
+		if err != nil {
+			t.Fatalf("Fetch() error = %v", err)
+		}
+		opus := info.ModelWindows["seven_day_opus"]
+		sonnet := info.ModelWindows["seven_day_sonnet"]
+		if opus == nil || sonnet == nil {
+			t.Fatalf("missing Claude model windows: %#v", info.ModelWindows)
+		}
+		if opus.UsedPercent != 66 || opus.Utilization != 0.66 || opus.WindowDuration != 7*24*time.Hour {
+			t.Fatalf("opus window = %#v, want 66%%/0.66/168h", opus)
+		}
+		if sonnet.UsedPercent != 12 || sonnet.Utilization != 0.12 || sonnet.WindowDuration != 7*24*time.Hour {
+			t.Fatalf("sonnet window = %#v, want 12%%/0.12/168h", sonnet)
+		}
+		if info.TertiaryWindow != opus {
+			t.Fatalf("TertiaryWindow = %#v, want seven_day_opus %#v", info.TertiaryWindow, opus)
+		}
+	})
+}
+
+func TestUsageInfoFindModelWindowCrossPlatform(t *testing.T) {
+	fiveHour := &UsageWindow{UsedPercent: 22, Label: "GPT-5.3-Codex-Spark"}
+	weekly := &UsageWindow{UsedPercent: 41, Label: "GPT-5.3-Codex-Spark"}
+	opus := &UsageWindow{UsedPercent: 66}
+	info := &UsageInfo{ModelWindows: map[string]*UsageWindow{
+		"codex_bengalfox/5h":     fiveHour,
+		"codex_bengalfox/weekly": weekly,
+		"seven_day_opus":         opus,
+	}}
+
+	if got := info.FindModelWindow("SPARK", "5H"); got != fiveHour {
+		t.Fatalf("FindModelWindow(SPARK, 5H) = %#v, want five-hour", got)
+	}
+	if got := info.FindModelWindow("spark", "weekly"); got != weekly {
+		t.Fatalf("FindModelWindow(spark, weekly) = %#v, want weekly", got)
+	}
+	if got := info.FindModelWindow("opus", "seven_day"); got != opus {
+		t.Fatalf("FindModelWindow(opus, seven_day) = %#v, want opus", got)
 	}
 }
 

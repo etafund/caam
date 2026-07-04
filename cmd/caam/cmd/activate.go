@@ -84,6 +84,35 @@ func init() {
 	activateCmd.Flags().Bool("auto", false, "auto-select profile using rotation algorithm")
 	activateCmd.Flags().Bool("json", false, "output as JSON")
 	activateCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon so the switched auth takes effect (it respawns on next use)")
+	activateCmd.ValidArgsFunction = completeActivateArgs
+}
+
+func completeActivateArgs(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	switch len(args) {
+	case 0:
+		return supportedTools(), cobra.ShellCompDirectiveNoFileComp
+	case 1:
+		tool := strings.ToLower(args[0])
+		if _, ok := tools[tool]; !ok {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		if vault == nil {
+			vault = authfile.NewVault(authfile.DefaultVaultPath())
+		}
+		profiles, err := vault.List(tool)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		completions := make([]string, 0, len(profiles))
+		for _, profileName := range profiles {
+			ph := getProfileHealth(tool, profileName)
+			status := health.CalculateStatus(ph).String()
+			completions = append(completions, fmt.Sprintf("%s\t%s", profileName, status))
+		}
+		return completions, cobra.ShellCompDirectiveNoFileComp
+	default:
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
 }
 
 func runActivate(cmd *cobra.Command, args []string) error {

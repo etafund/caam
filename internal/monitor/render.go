@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/authpool"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 )
 
@@ -60,7 +61,7 @@ type jsonProfile struct {
 	UsagePercent  float64     `json:"usage_percent,omitempty"`
 	Usage         interface{} `json:"usage,omitempty"`
 	Health        string      `json:"health"`
-	PoolStatus    string      `json:"pool_status"`
+	PoolStatus    string      `json:"pool_status,omitempty"`
 	InCooldown    bool        `json:"in_cooldown"`
 	CooldownUntil *time.Time  `json:"cooldown_until,omitempty"`
 	Alert         *Alert      `json:"alert,omitempty"`
@@ -135,7 +136,7 @@ func encodeJSONState(state *MonitorState, pretty bool) string {
 			UsagePercent:  percent,
 			Usage:         p.Usage,
 			Health:        p.Health.String(),
-			PoolStatus:    p.PoolStatus.String(),
+			PoolStatus:    poolStatusJSON(p.PoolStatus),
 			InCooldown:    p.InCooldown,
 			CooldownUntil: p.CooldownUntil,
 			Alert:         p.Alert,
@@ -149,6 +150,13 @@ func encodeJSONState(state *MonitorState, pretty bool) string {
 		data, _ = json.Marshal(js)
 	}
 	return string(data)
+}
+
+func poolStatusJSON(status authpool.PoolStatus) string {
+	if status == authpool.PoolStatusUnknown {
+		return ""
+	}
+	return status.String()
 }
 
 // healthEmoji returns a short status indicator for a health status.

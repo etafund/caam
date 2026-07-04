@@ -3338,7 +3338,10 @@ func (m Model) statusCenterText() string {
 	if m.activityMessage != "" {
 		return m.activityMessage
 	}
-	return m.statusMsg
+	if m.statusMsg != "" {
+		return m.statusMsg
+	}
+	return m.healthSummaryText()
 }
 
 // statusMessageSeverity returns the severity for the current center message.
@@ -3346,7 +3349,87 @@ func (m Model) statusMessageSeverity() StatusSeverity {
 	if len(m.toasts) > 0 {
 		return m.toasts[len(m.toasts)-1].Severity
 	}
-	return statusSeverityFromMessage(m.statusMsg)
+	if m.activityMessage != "" {
+		return StatusInfo
+	}
+	if m.statusMsg != "" {
+		return statusSeverityFromMessage(m.statusMsg)
+	}
+	return m.healthSummarySeverity()
+}
+
+func (m Model) healthSummaryText() string {
+	total, healthy, warning, critical, unknown := m.healthSummaryCounts()
+	if total == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, 4)
+	if healthy > 0 {
+		parts = append(parts, fmt.Sprintf("%d healthy", healthy))
+	}
+	if warning > 0 {
+		parts = append(parts, fmt.Sprintf("%d warning", warning))
+	}
+	if critical > 0 {
+		parts = append(parts, fmt.Sprintf("%d critical", critical))
+	}
+	if unknown > 0 {
+		parts = append(parts, fmt.Sprintf("%d unknown", unknown))
+	}
+
+	profileLabel := "profiles"
+	if total == 1 {
+		profileLabel = "profile"
+	}
+	return fmt.Sprintf("%d %s: %s", total, profileLabel, strings.Join(parts, ", "))
+}
+
+func (m Model) healthSummarySeverity() StatusSeverity {
+	_, _, warning, critical, _ := m.healthSummaryCounts()
+	switch {
+	case critical > 0:
+		return StatusError
+	case warning > 0:
+		return StatusWarning
+	default:
+		return StatusInfo
+	}
+}
+
+func (m Model) healthSummaryCounts() (total, healthy, warning, critical, unknown int) {
+	if len(m.profiles) == 0 {
+		return 0, 0, 0, 0, 0
+	}
+
+	healthByProfile := map[string]*health.ProfileHealth{}
+	if m.healthStorage != nil {
+		if profiles, err := m.healthStorage.ListProfiles(); err == nil {
+			healthByProfile = profiles
+		}
+	}
+
+	for provider, profiles := range m.profiles {
+		for _, p := range profiles {
+			total++
+			status := health.StatusUnknown
+			if h := healthByProfile[provider+"/"+p.Name]; h != nil {
+				status = health.CalculateStatus(h)
+			}
+			switch status {
+			case health.StatusHealthy:
+				healthy++
+			case health.StatusWarning:
+				warning++
+			case health.StatusCritical:
+				critical++
+			default:
+				unknown++
+			}
+		}
+	}
+
+	return total, healthy, warning, critical, unknown
 }
 
 // statusCenterMessage returns the rendered center message for the status bar.

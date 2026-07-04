@@ -2,13 +2,22 @@
 
 package signals
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+)
 
 func SendHUP(pid int) error {
 	return fmt.Errorf("SIGHUP not supported on Windows (pid=%d)", pid)
 }
 
-// SendTerm is unsupported on Windows; daemon reload must be done manually.
 func SendTerm(pid int) error {
-	return fmt.Errorf("SIGTERM not supported on Windows (pid=%d)", pid)
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
+	}
+	if err := p.Kill(); err != nil {
+		return fmt.Errorf("terminate process %d: %w", pid, err)
+	}
+	return nil
 }
