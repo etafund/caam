@@ -234,6 +234,9 @@ func clearedEnvVars() []string {
 // so an arbitrary --base path can't inject shell into --print-env output.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// ShellQuote single-quotes s for POSIX sh.
+func ShellQuote(s string) string { return shellQuote(s) }
+
 // SpawnEnv applies the shallow env transform to env IN PLACE: delete every cleared
 // var, set HOME + SHALLOW_PROFILE, then the provider sets. Used by the exec path.
 // (Delete-then-set is correct: codex's ProviderEnvSet re-adds CODEX_HOME.)
@@ -248,6 +251,40 @@ func (l Layout) SpawnEnv(home, name string, env map[string]string) {
 			env[kv.Key] = kv.Value
 		}
 	}
+}
+
+// SpawnEnv returns the environment transform for a provider without mutating an
+// inherited env map. It shares the same cleared-var policy as Layout.SpawnEnv
+// and adds the Claude Agent View guard used by shallow-spawn.
+func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet bool) (map[string]string, []string) {
+	set := map[string]string{
+		"HOME":            home,
+		"SHALLOW_PROFILE": name,
+	}
+
+	normalized, err := NormalizeProvider(provider)
+	if err == nil {
+		if layout, lerr := LayoutForProvider(normalized); lerr == nil && layout.ProviderEnvSet != nil {
+			for _, kv := range layout.ProviderEnvSet(home) {
+				set[kv.Key] = kv.Value
+			}
+		}
+		if normalized == ProviderClaude && !allowAgentView && !disableAgentViewSet {
+			set["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
+		}
+	}
+
+	setKeys := make(map[string]bool, len(set))
+	for k := range set {
+		setKeys[k] = true
+	}
+	var scrub []string
+	for _, k := range clearedEnvVars() {
+		if !setKeys[k] {
+			scrub = append(scrub, k)
+		}
+	}
+	return set, scrub
 }
 
 // SpawnEnvLines renders the spawn env as POSIX-shell statements for --print-env:

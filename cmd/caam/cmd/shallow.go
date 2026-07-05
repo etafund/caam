@@ -1128,6 +1128,7 @@ func init() {
 	shallowSpawnCmd.Flags().Bool("print-env", false, "print eval-able export/unset statements and exit (no exec)")
 	shallowSpawnCmd.Flags().Bool("json", false, "output as JSON (errors and --print-env)")
 	shallowSpawnCmd.Flags().Bool("reload-daemon", false, "for codex: SIGTERM a running codex app-server/mcp-server daemon for this shallow profile so the switched auth takes effect (it respawns on next use)")
+	shallowSpawnCmd.Flags().Bool("allow-agent-view", false, "for claude: keep Claude Code's Agent View / background supervisor enabled instead of injecting CLAUDE_CODE_DISABLE_AGENT_VIEW=1 (opts back into Agent View, accepting that its cross-session supervisor daemon can bypass per-identity auth isolation — see issue #49)")
 }
 
 // shallowSpawnPrintEnvOutput is the --print-env --json shape: the env transform
@@ -1213,20 +1214,18 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return emit(err)
 	}
 
+	// Agent View policy (#49): disable Claude Code's cross-session background
+	// supervisor for shallow claude sessions unless the user opted back in with
+	// --allow-agent-view or has already exported CLAUDE_CODE_DISABLE_AGENT_VIEW
+	// themselves (an explicit user choice we never override).
+	allowAgentView, _ := cmd.Flags().GetBool("allow-agent-view")
+	_, disableAgentViewSet := os.LookupEnv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
+	set, scrub := shallow.SpawnEnv(provider, prof.Path, name, allowAgentView, disableAgentViewSet)
+
 	if printEnv {
 		if jsonOut {
-			// Render the env transform as data: `set` mirrors SpawnEnv's writes
-			// (HOME/SHALLOW_PROFILE + provider sets), `unset` is parsed from the
-			// SpawnEnvLines `unset KEY` lines (single source of truth for the
-			// cleared-but-not-reset vars).
-			set := map[string]string{}
-			layout.SpawnEnv(prof.Path, name, set)
-			var unset []string
-			for _, line := range layout.SpawnEnvLines(prof.Path, name) {
-				if k, ok := strings.CutPrefix(line, "unset "); ok {
-					unset = append(unset, k)
-				}
-			}
+			unset := append([]string(nil), scrub...)
+			sort.Strings(unset)
 			out := shallowSpawnPrintEnvOutput{
 				Success:        true,
 				Home:           prof.Path,
@@ -1238,12 +1237,20 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			enc.SetIndent("", "  ")
 			return enc.Encode(out)
 		}
-		// SpawnEnvLines is the single source of truth shared with the exec path:
-		// export KEY='value' for HOME/SHALLOW_PROFILE/provider-sets, then
-		// `unset KEY` for every cleared var not re-set — so a shell wrapper built
-		// from --print-env reproduces the exec path's isolation.
-		for _, line := range layout.SpawnEnvLines(prof.Path, name) {
-			fmt.Fprintln(cmd.OutOrStdout(), line)
+		// Render the same set/unset transform used by the exec path, so a shell
+		// wrapper built from --print-env reproduces the child environment.
+		setKeys := make([]string, 0, len(set))
+		for k := range set {
+			setKeys = append(setKeys, k)
+		}
+		sort.Strings(setKeys)
+		for _, k := range setKeys {
+			fmt.Fprintln(cmd.OutOrStdout(), "export "+k+"="+shallow.ShellQuote(set[k]))
+		}
+		unset := append([]string(nil), scrub...)
+		sort.Strings(unset)
+		for _, k := range unset {
+			fmt.Fprintln(cmd.OutOrStdout(), "unset "+k)
 		}
 		return nil
 	}
@@ -1265,7 +1272,12 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 			envMap[e[:idx]] = e[idx+1:]
 		}
 	}
-	layout.SpawnEnv(prof.Path, name, envMap)
+	for _, k := range scrub {
+		delete(envMap, k)
+	}
+	for k, v := range set {
+		envMap[k] = v
+	}
 	envSlice := make([]string, 0, len(envMap))
 	for k, v := range envMap {
 		envSlice = append(envSlice, k+"="+v)

@@ -164,6 +164,7 @@ func newShallowTestRoot() *cobra.Command {
 	spawn.Flags().Bool("print-env", false, "")
 	spawn.Flags().Bool("json", false, "")
 	spawn.Flags().Bool("reload-daemon", false, "")
+	spawn.Flags().Bool("allow-agent-view", false, "")
 
 	root.AddCommand(parent)
 	root.AddCommand(spawn)
@@ -463,6 +464,103 @@ func TestShallowSpawnExecsCorrectHome(t *testing.T) {
 	if sawClaudeCfg {
 		t.Fatalf("CLAUDE_CONFIG_DIR should be stripped, got %v", got.env)
 	}
+}
+
+// TestShallowSpawnAgentViewFlag proves the end-to-end wiring of the claude
+// Agent View disable policy (#49) through the real command tree: the injected
+// CLAUDE_CODE_DISABLE_AGENT_VIEW=1 appears in the exec env of a default claude
+// shallow session, is suppressed by --allow-agent-view, and a pre-existing user
+// value is preserved rather than overridden.
+func TestShallowSpawnAgentViewFlag(t *testing.T) {
+	const key = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
+
+	hasEnv := func(env []string, want string) bool {
+		for _, e := range env {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	}
+	hasKey := func(env []string, k string) bool {
+		for _, e := range env {
+			if strings.HasPrefix(e, k+"=") {
+				return true
+			}
+		}
+		return false
+	}
+	unsetForSubtest := func(t *testing.T) {
+		t.Helper()
+		old, hadOld := os.LookupEnv(key)
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if hadOld {
+				_ = os.Setenv(key, old)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		})
+	}
+
+	t.Run("default injects disable flag", func(t *testing.T) {
+		unsetForSubtest(t)
+		_, _ = shallowEnv(t)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		origExec := spawnExec
+		spawnExec = func(_ string, _ []string, e []string) error { got = e; return nil }
+		t.Cleanup(func() { spawnExec = origExec })
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "alice", "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		if !hasEnv(got, key+"=1") {
+			t.Fatalf("default claude session must inject %s=1; got %v", key, got)
+		}
+	})
+
+	t.Run("--allow-agent-view suppresses injection", func(t *testing.T) {
+		unsetForSubtest(t)
+		_, _ = shallowEnv(t)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+		var env []string
+		origExec := spawnExec
+		spawnExec = func(_ string, _ []string, e []string) error { env = e; return nil }
+		t.Cleanup(func() { spawnExec = origExec })
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "bob", "--allow-agent-view", "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		if hasKey(env, key) {
+			t.Fatalf("--allow-agent-view must NOT inject %s; got %v", key, env)
+		}
+	})
+
+	t.Run("preserves pre-existing user value", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "carol", "--json"); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv(key, "0")
+		var env []string
+		origExec := spawnExec
+		spawnExec = func(_ string, _ []string, e []string) error { env = e; return nil }
+		t.Cleanup(func() { spawnExec = origExec })
+		if _, _, err := runCmdCaptured(t, "shallow-spawn", "carol", "--", "sh", "-c", "true"); err != nil {
+			t.Fatalf("spawn: %v", err)
+		}
+		if !hasEnv(env, key+"=0") {
+			t.Fatalf("user %s=0 must be preserved; got %v", key, env)
+		}
+		if hasEnv(env, key+"=1") {
+			t.Fatalf("must not override user %s to 1; got %v", key, env)
+		}
+	})
 }
 
 // TestShallowSpawnUnknownProfile must produce a clear error.
