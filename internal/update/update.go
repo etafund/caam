@@ -133,6 +133,8 @@ type Updater struct {
 	config Config
 }
 
+var atomicReplaceBinary = AtomicReplace
+
 // New creates a new Updater with the given configuration.
 func New(config Config) *Updater {
 	if config.Owner == "" {
@@ -273,7 +275,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	result.BackupPath = backupPath
 
 	// Atomic replace
-	if err := AtomicReplace(binaryPath, exePath); err != nil {
+	if err := atomicReplaceBinary(binaryPath, exePath); err != nil {
 		// Attempt rollback
 		if rbErr := copyFile(backupPath, exePath); rbErr != nil {
 			return nil, fmt.Errorf("replace failed (%v) and rollback failed (%v)", err, rbErr)

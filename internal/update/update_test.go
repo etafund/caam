@@ -1,8 +1,15 @@
 package update
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
@@ -207,7 +215,7 @@ func TestUpdateForceBypassesNoUpdateEarlyReturn(t *testing.T) {
 
 func TestUpdateTargetVersionSkipsLatestPrecheck(t *testing.T) {
 	var latestCalls int
-	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	client := testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		switch req.URL.Path {
 		case "/repos/test/repo/releases":
 			latestCalls++
@@ -217,7 +225,7 @@ func TestUpdateTargetVersionSkipsLatestPrecheck(t *testing.T) {
 		default:
 			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
 		}
-	})}
+	}))
 
 	u := New(Config{
 		Owner:         "test",
@@ -232,6 +240,84 @@ func TestUpdateTargetVersionSkipsLatestPrecheck(t *testing.T) {
 	}
 	if latestCalls != 0 {
 		t.Fatalf("latest release endpoint calls = %d, want 0", latestCalls)
+	}
+}
+
+func TestUpdateRollbackRestoresBackupWhenReplaceFails(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("PATH", filepath.Join(tmpDir, "empty-path"))
+	if err := os.MkdirAll(os.Getenv("PATH"), 0700); err != nil {
+		t.Fatalf("mkdir empty PATH dir: %v", err)
+	}
+
+	exePath := filepath.Join(tmpDir, "caam")
+	original := []byte("original binary")
+	if err := os.WriteFile(exePath, original, 0755); err != nil {
+		t.Fatalf("write exe: %v", err)
+	}
+
+	assetName := releaseAssetName("1.2.3")
+	archiveBytes := releaseArchive(t, []byte("new binary"))
+	archiveHash := sha256.Sum256(archiveBytes)
+	checksums := fmt.Sprintf("%x  %s\n", archiveHash, assetName)
+
+	release := Release{
+		TagName: "v1.2.3",
+		HTMLURL: "https://example.com/v1.2.3",
+		Assets: []Asset{
+			{Name: assetName, BrowserDownloadURL: "https://downloads.example/binary", Size: int64(len(archiveBytes))},
+			{Name: checksumsAssetName, BrowserDownloadURL: "https://downloads.example/checksums"},
+			{Name: signatureAssetName, BrowserDownloadURL: "https://downloads.example/signature"},
+		},
+	}
+	client := testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://api.github.com/repos/test/repo/releases/tags/v1.2.3":
+			body, err := json.Marshal(release)
+			if err != nil {
+				return nil, err
+			}
+			return bytesHTTPResponse(http.StatusOK, body), nil
+		case "https://downloads.example/binary":
+			return bytesHTTPResponse(http.StatusOK, archiveBytes), nil
+		case "https://downloads.example/checksums":
+			return bytesHTTPResponse(http.StatusOK, []byte(checksums)), nil
+		case "https://downloads.example/signature":
+			return bytesHTTPResponse(http.StatusOK, []byte("signature")), nil
+		default:
+			return bytesHTTPResponse(http.StatusNotFound, []byte("not found")), nil
+		}
+	}))
+
+	originalReplace := atomicReplaceBinary
+	atomicReplaceBinary = func(src, dst string) error {
+		if err := os.WriteFile(dst, []byte("corrupted during replace"), 0755); err != nil {
+			return err
+		}
+		return errors.New("injected replace failure")
+	}
+	t.Cleanup(func() { atomicReplaceBinary = originalReplace })
+
+	u := New(Config{
+		Owner:         "test",
+		Repo:          "repo",
+		TargetVersion: "1.2.3",
+		HTTPClient:    client,
+		ExePath:       exePath,
+		BackupDir:     tmpDir,
+	})
+
+	_, err := u.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("Update error = %v, want rolled back replace failure", err)
+	}
+
+	restored, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read exe after rollback: %v", err)
+	}
+	if !bytes.Equal(restored, original) {
+		t.Fatalf("exe after rollback = %q, want original %q", restored, original)
 	}
 }
 
@@ -253,17 +339,65 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func jsonHTTPResponse(statusCode int, body string) *http.Response {
-	return &http.Response{
-		StatusCode: statusCode,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body:       io.NopCloser(strings.NewReader(body)),
+func testHTTPClient(transport http.RoundTripper) *http.Client {
+	return &http.Client{
+		Transport: transport,
+		Timeout:   5 * time.Second,
 	}
+}
+
+func jsonHTTPResponse(statusCode int, body string) *http.Response {
+	return bytesHTTPResponse(statusCode, []byte(body))
+}
+
+func bytesHTTPResponse(statusCode int, body []byte) *http.Response {
+	return &http.Response{
+		StatusCode:    statusCode,
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		Body:          io.NopCloser(bytes.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+}
+
+func releaseArchive(t *testing.T, binary []byte) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	if runtime.GOOS == "windows" {
+		zw := zip.NewWriter(&buf)
+		w, err := zw.Create("caam.exe")
+		if err != nil {
+			t.Fatalf("create zip entry: %v", err)
+		}
+		if _, err := w.Write(binary); err != nil {
+			t.Fatalf("write zip entry: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close zip: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	if err := tw.WriteHeader(&tar.Header{Name: "caam", Mode: 0755, Size: int64(len(binary))}); err != nil {
+		t.Fatalf("write tar header: %v", err)
+	}
+	if _, err := tw.Write(binary); err != nil {
+		t.Fatalf("write tar entry: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("close gzip: %v", err)
+	}
+	return buf.Bytes()
 }
 
 func releaseListClient(t *testing.T, releases []Release) *http.Client {
 	t.Helper()
-	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	return testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path != "/repos/test/test/releases" {
 			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
 		}
@@ -272,7 +406,7 @@ func releaseListClient(t *testing.T, releases []Release) *http.Client {
 			return nil, err
 		}
 		return jsonHTTPResponse(http.StatusOK, string(body)), nil
-	})}
+	}))
 }
 
 func TestDefaultConfig(t *testing.T) {
