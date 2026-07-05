@@ -3,11 +3,15 @@ package update
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/version"
 )
 
 func TestCompareVersions(t *testing.T) {
@@ -44,16 +48,231 @@ func TestCompareVersions(t *testing.T) {
 
 func TestBinaryAssetName(t *testing.T) {
 	u := New(DefaultConfig())
-	name := u.binaryAssetName()
+	name, err := u.binaryAssetName(&Release{TagName: "v1.2.3"})
+	if err != nil {
+		t.Fatalf("binaryAssetName() error = %v", err)
+	}
 
 	// Should contain OS and arch
 	if name == "" {
 		t.Error("binaryAssetName() returned empty string")
 	}
-	// Should be a pattern with wildcard
-	if name[0:5] != "caam_" {
-		t.Errorf("expected name to start with 'caam_', got %q", name)
+	expected := releaseAssetName("1.2.3")
+	if name != expected {
+		t.Errorf("binaryAssetName() = %q, want %q", name, expected)
 	}
+}
+
+func TestSelectReleaseAssetsMatchesReleaseBinaryAsset(t *testing.T) {
+	u := New(DefaultConfig())
+	binaryName := releaseAssetName("1.2.3")
+	release := &Release{TagName: "v1.2.3", Assets: []Asset{
+		{Name: binaryName, BrowserDownloadURL: "https://example.com/binary", Size: 123},
+		{Name: "SHA256SUMS", BrowserDownloadURL: "https://example.com/checksums"},
+		{Name: "SHA256SUMS.sig", BrowserDownloadURL: "https://example.com/signature"},
+	}}
+
+	assets, err := u.selectReleaseAssets(release)
+	if err != nil {
+		t.Fatalf("selectReleaseAssets error: %v", err)
+	}
+	if assets.Binary.Name != binaryName {
+		t.Fatalf("binary asset = %q, want %q", assets.Binary.Name, binaryName)
+	}
+	if !assetNameMatches(assets.Checksums.Name, checksumsAssetName) {
+		t.Fatalf("checksums asset = %q, want %s", assets.Checksums.Name, checksumsAssetName)
+	}
+	if !assetNameMatches(assets.Signature.Name, signatureAssetName) {
+		t.Fatalf("signature asset = %q, want %s", assets.Signature.Name, signatureAssetName)
+	}
+}
+
+func TestSelectReleaseAssetsRejectsAmbiguousBinaryMatches(t *testing.T) {
+	u := New(DefaultConfig())
+	release := &Release{TagName: "v1.2.3", Assets: []Asset{
+		{Name: releaseAssetName("1.2.3")},
+		{Name: releaseAssetName("1.2.3")},
+		{Name: "SHA256SUMS"},
+		{Name: "SHA256SUMS.sig"},
+	}}
+
+	_, err := u.selectReleaseAssets(release)
+	if err == nil || !strings.Contains(err.Error(), "multiple binary assets match") {
+		t.Fatalf("selectReleaseAssets error = %v, want multiple binary assets match", err)
+	}
+}
+
+func TestSelectReleaseAssetsRejectsWrongVersionBinaryMatch(t *testing.T) {
+	u := New(DefaultConfig())
+	release := &Release{TagName: "v1.2.3", Assets: []Asset{
+		{Name: releaseAssetName("9.9.9")},
+		{Name: "SHA256SUMS"},
+		{Name: "SHA256SUMS.sig"},
+	}}
+
+	_, err := u.selectReleaseAssets(release)
+	wantName := releaseAssetName("1.2.3")
+	if err == nil || !strings.Contains(err.Error(), wantName) {
+		t.Fatalf("selectReleaseAssets error = %v, want missing expected asset %q", err, wantName)
+	}
+}
+
+func TestSelectReleaseAssetsRequiresCompanionAssets(t *testing.T) {
+	u := New(DefaultConfig())
+	binary := Asset{Name: releaseAssetName("1.2.3")}
+	checksums := Asset{Name: "SHA256SUMS"}
+	signature := Asset{Name: "SHA256SUMS.sig"}
+
+	tests := []struct {
+		name    string
+		assets  []Asset
+		wantErr string
+	}{
+		{
+			name:    "missing binary",
+			assets:  []Asset{checksums, signature},
+			wantErr: "binary asset not found",
+		},
+		{
+			name:    "missing checksums",
+			assets:  []Asset{binary, signature},
+			wantErr: "checksums asset not found",
+		},
+		{
+			name:    "missing signature",
+			assets:  []Asset{binary, checksums},
+			wantErr: "signature asset not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := u.selectReleaseAssets(&Release{TagName: "v1.2.3", Assets: tt.assets})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("selectReleaseAssets error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyChecksumWithSelectedAssetUsesConcreteName(t *testing.T) {
+	tmpDir := t.TempDir()
+	archivePath := filepath.Join(tmpDir, "archive")
+	content := []byte("selected binary archive")
+	if err := os.WriteFile(archivePath, content, 0644); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	selectedHash, err := calculateSHA256(archivePath)
+	if err != nil {
+		t.Fatalf("calculate selected hash: %v", err)
+	}
+
+	selectedName := releaseAssetName("1.2.3")
+	otherName := releaseAssetName("9.9.9")
+	checksumsPath := filepath.Join(tmpDir, "SHA256SUMS")
+	checksums := strings.Repeat("0", 64) + "  " + otherName + "\n" +
+		selectedHash + "  " + selectedName + "\n"
+	if err := os.WriteFile(checksumsPath, []byte(checksums), 0644); err != nil {
+		t.Fatalf("write checksums: %v", err)
+	}
+
+	if err := VerifyChecksum(archivePath, checksumsPath, selectedName); err != nil {
+		t.Fatalf("VerifyChecksum with concrete selected asset error: %v", err)
+	}
+	wildcardAssetName := "caam_*_" + runtime.GOOS + "_" + runtime.GOARCH + "." + releaseAssetExt()
+	if err := VerifyChecksum(archivePath, checksumsPath, wildcardAssetName); err == nil {
+		t.Fatal("VerifyChecksum with wildcard pattern unexpectedly passed; regression setup is invalid")
+	}
+}
+
+func TestUpdateForceBypassesNoUpdateEarlyReturn(t *testing.T) {
+	currentVersion := strings.TrimPrefix(version.Short(), "v")
+	client := releaseListClient(t, []Release{{
+		TagName: "v" + currentVersion,
+		HTMLURL: "https://example.com/current",
+	}})
+
+	u := New(Config{
+		Owner:      "test",
+		Repo:       "test",
+		HTTPClient: client,
+		Force:      true,
+	})
+
+	_, err := u.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "binary asset not found") {
+		t.Fatalf("Update error = %v, want asset-selection error after force bypasses no-update return", err)
+	}
+}
+
+func TestUpdateTargetVersionSkipsLatestPrecheck(t *testing.T) {
+	var latestCalls int
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/repos/test/repo/releases":
+			latestCalls++
+			return jsonHTTPResponse(http.StatusInternalServerError, `{"message":"latest should not be called"}`), nil
+		case "/repos/test/repo/releases/tags/v1.2.3":
+			return jsonHTTPResponse(http.StatusOK, `{"tag_name":"v1.2.3","html_url":"https://example.com/v1.2.3","assets":[]}`), nil
+		default:
+			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+		}
+	})}
+
+	u := New(Config{
+		Owner:         "test",
+		Repo:          "repo",
+		TargetVersion: "1.2.3",
+		HTTPClient:    client,
+	})
+
+	_, err := u.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "binary asset not found") {
+		t.Fatalf("Update error = %v, want binary asset not found", err)
+	}
+	if latestCalls != 0 {
+		t.Fatalf("latest release endpoint calls = %d, want 0", latestCalls)
+	}
+}
+
+func releaseAssetName(version string) string {
+	return "caam_" + version + "_" + runtime.GOOS + "_" + runtime.GOARCH + "." + releaseAssetExt()
+}
+
+func releaseAssetExt() string {
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	return ext
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func jsonHTTPResponse(statusCode int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: statusCode,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func releaseListClient(t *testing.T, releases []Release) *http.Client {
+	t.Helper()
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/repos/test/test/releases" {
+			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+		}
+		body, err := json.Marshal(releases)
+		if err != nil {
+			return nil, err
+		}
+		return jsonHTTPResponse(http.StatusOK, string(body)), nil
+	})}
 }
 
 func TestDefaultConfig(t *testing.T) {
@@ -101,34 +320,21 @@ func TestFetchLatestRelease(t *testing.T) {
 		{TagName: "v0.9.0", Prerelease: false, Draft: false},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/repos/test/test/releases" {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(releases)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-
-	// Create updater with test server
 	cfg := Config{
 		Owner:      "test",
 		Repo:       "test",
 		Channel:    ChannelStable,
-		HTTPClient: server.Client(),
+		HTTPClient: releaseListClient(t, releases),
 	}
-	// Override the API base URL by setting it on the server path
 	u := New(cfg)
 
 	ctx := context.Background()
 	release, err := u.fetchLatestRelease(ctx)
-	// This will fail because we're not replacing GitHubAPIBase
-	// but it tests the structure
-	if err == nil {
-		if release.TagName != "v1.0.0" {
-			t.Errorf("TagName = %q, want %q", release.TagName, "v1.0.0")
-		}
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("TagName = %q, want %q", release.TagName, "v1.0.0")
 	}
 }
 
@@ -138,20 +344,19 @@ func TestFetchLatestRelease_FiltersDrafts(t *testing.T) {
 		{TagName: "v1.0.0", Draft: false, Prerelease: false},
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(releases)
-	}))
-	defer server.Close()
+	u := New(Config{
+		Owner:      "test",
+		Repo:       "test",
+		Channel:    ChannelStable,
+		HTTPClient: releaseListClient(t, releases),
+	})
 
-	// Verify draft filtering logic exists
-	for _, r := range releases {
-		if !r.Draft && !r.Prerelease {
-			if r.TagName != "v1.0.0" {
-				t.Errorf("First non-draft release should be v1.0.0, got %s", r.TagName)
-			}
-			break
-		}
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("TagName = %q, want v1.0.0", release.TagName)
 	}
 }
 
@@ -161,17 +366,19 @@ func TestFetchLatestRelease_FiltersPrereleases(t *testing.T) {
 		{TagName: "v1.0.0", Prerelease: false},
 	}
 
-	// For stable channel, prereleases should be skipped
-	cfg := Config{Channel: ChannelStable}
+	u := New(Config{
+		Owner:      "test",
+		Repo:       "test",
+		Channel:    ChannelStable,
+		HTTPClient: releaseListClient(t, releases),
+	})
 
-	// Verify prerelease filtering logic
-	for _, r := range releases {
-		if !r.Draft && (cfg.Channel != ChannelStable || !r.Prerelease) {
-			if r.TagName != "v1.0.0" {
-				t.Errorf("First stable release should be v1.0.0, got %s", r.TagName)
-			}
-			break
-		}
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v1.0.0" {
+		t.Errorf("TagName = %q, want v1.0.0", release.TagName)
 	}
 }
 

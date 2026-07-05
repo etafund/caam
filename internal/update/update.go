@@ -27,6 +27,8 @@ const (
 	GitHubAPIBase = "https://api.github.com"
 
 	maxGitHubReleaseResponseBytes = 4 << 20
+	checksumsAssetName            = "SHA256SUMS"
+	signatureAssetName            = "SHA256SUMS.sig"
 )
 
 // Channel represents an update channel.
@@ -57,6 +59,12 @@ type Asset struct {
 	BrowserDownloadURL string `json:"browser_download_url"`
 	Size               int64  `json:"size"`
 	ContentType        string `json:"content_type"`
+}
+
+type releaseAssets struct {
+	Binary    *Asset
+	Checksums *Asset
+	Signature *Asset
 }
 
 // ReleaseManifest is the release metadata embedded in releases.
@@ -96,6 +104,8 @@ type Config struct {
 	Channel Channel
 	// TargetVersion pins to a specific version (optional).
 	TargetVersion string
+	// Force reinstalls the resolved release even when it is not newer.
+	Force bool
 	// HTTPClient is the HTTP client to use.
 	HTTPClient *http.Client
 	// ExePath is the path to the executable to update.
@@ -159,58 +169,39 @@ func (u *Updater) Check(ctx context.Context) (*CheckResult, error) {
 
 // Update performs the update if a newer version is available.
 func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
-	// Check for updates
-	check, err := u.Check(ctx)
-	if err != nil {
-		return nil, err
-	}
-
+	currentVersion := version.Short()
 	result := &UpdateResult{
-		FromVersion: check.CurrentVersion,
-		ToVersion:   check.LatestVersion,
-		ReleaseURL:  check.Release.HTMLURL,
+		FromVersion: currentVersion,
 	}
 
-	if !check.UpdateAvailable && u.config.TargetVersion == "" {
-		return result, nil
-	}
-
-	// If target version specified, fetch that specific release
-	release := check.Release
+	var release *Release
+	var err error
 	if u.config.TargetVersion != "" {
 		release, err = u.fetchRelease(ctx, u.config.TargetVersion)
 		if err != nil {
 			return nil, fmt.Errorf("fetch target release: %w", err)
 		}
 		result.ToVersion = strings.TrimPrefix(release.TagName, "v")
+		result.ReleaseURL = release.HTMLURL
+	} else {
+		check, err := u.Check(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		result.ToVersion = check.LatestVersion
+		result.ReleaseURL = check.Release.HTMLURL
+
+		if !check.UpdateAvailable && !u.config.Force {
+			return result, nil
+		}
+		release = check.Release
 	}
 
 	// Find the appropriate binary asset
-	assetName := u.binaryAssetName()
-	var binaryAsset *Asset
-	var checksumsAsset *Asset
-	var signatureAsset *Asset
-
-	for i := range release.Assets {
-		asset := &release.Assets[i]
-		switch asset.Name {
-		case assetName:
-			binaryAsset = asset
-		case "SHA256SUMS":
-			checksumsAsset = asset
-		case "SHA256SUMS.sig":
-			signatureAsset = asset
-		}
-	}
-
-	if binaryAsset == nil {
-		return nil, fmt.Errorf("binary asset not found: %s", assetName)
-	}
-	if checksumsAsset == nil {
-		return nil, fmt.Errorf("checksums asset not found: SHA256SUMS")
-	}
-	if signatureAsset == nil {
-		return nil, fmt.Errorf("signature asset not found: SHA256SUMS.sig")
+	assets, err := u.selectReleaseAssets(release)
+	if err != nil {
+		return nil, err
 	}
 
 	// Download and verify
@@ -236,12 +227,12 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	// Download checksums and signature
 	checksumsPath := filepath.Join(tmpDir, "SHA256SUMS")
 	signaturePath := filepath.Join(tmpDir, "SHA256SUMS.sig")
-	archivePath := filepath.Join(tmpDir, assetName)
+	archivePath := filepath.Join(tmpDir, assets.Binary.Name)
 
-	if err := u.downloadFile(ctx, checksumsAsset.BrowserDownloadURL, checksumsPath); err != nil {
+	if err := u.downloadFile(ctx, assets.Checksums.BrowserDownloadURL, checksumsPath); err != nil {
 		return nil, fmt.Errorf("download checksums: %w", err)
 	}
-	if err := u.downloadFile(ctx, signatureAsset.BrowserDownloadURL, signaturePath); err != nil {
+	if err := u.downloadFile(ctx, assets.Signature.BrowserDownloadURL, signaturePath); err != nil {
 		return nil, fmt.Errorf("download signature: %w", err)
 	}
 
@@ -251,13 +242,13 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	}
 
 	// Download binary archive
-	if err := u.downloadFile(ctx, binaryAsset.BrowserDownloadURL, archivePath); err != nil {
+	if err := u.downloadFile(ctx, assets.Binary.BrowserDownloadURL, archivePath); err != nil {
 		return nil, fmt.Errorf("download binary: %w", err)
 	}
-	result.DownloadSize = binaryAsset.Size
+	result.DownloadSize = assets.Binary.Size
 
 	// Verify checksum
-	if err := VerifyChecksum(archivePath, checksumsPath, assetName); err != nil {
+	if err := VerifyChecksum(archivePath, checksumsPath, assets.Binary.Name); err != nil {
 		return nil, fmt.Errorf("verify checksum: %w", err)
 	}
 
@@ -275,7 +266,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	if backupDir == "" {
 		backupDir = filepath.Dir(exePath)
 	}
-	backupPath := filepath.Join(backupDir, fmt.Sprintf("caam.%s.backup", check.CurrentVersion))
+	backupPath := filepath.Join(backupDir, fmt.Sprintf("caam.%s.backup", currentVersion))
 	if err := copyFile(exePath, backupPath); err != nil {
 		return nil, fmt.Errorf("backup current binary: %w", err)
 	}
@@ -292,6 +283,45 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 
 	result.Updated = true
 	return result, nil
+}
+
+func (u *Updater) selectReleaseAssets(release *Release) (*releaseAssets, error) {
+	binaryAssetName, err := u.binaryAssetName(release)
+	if err != nil {
+		return nil, err
+	}
+
+	var selected releaseAssets
+	for i := range release.Assets {
+		asset := &release.Assets[i]
+		switch {
+		case assetNameMatches(asset.Name, binaryAssetName):
+			if selected.Binary != nil {
+				return nil, fmt.Errorf("multiple binary assets match %s", binaryAssetName)
+			}
+			selected.Binary = asset
+		case assetNameMatches(asset.Name, checksumsAssetName):
+			selected.Checksums = asset
+		case assetNameMatches(asset.Name, signatureAssetName):
+			selected.Signature = asset
+		}
+	}
+
+	if selected.Binary == nil {
+		return nil, fmt.Errorf("binary asset not found: %s", binaryAssetName)
+	}
+	if selected.Checksums == nil {
+		return nil, fmt.Errorf("checksums asset not found: %s", checksumsAssetName)
+	}
+	if selected.Signature == nil {
+		return nil, fmt.Errorf("signature asset not found: %s", signatureAssetName)
+	}
+
+	return &selected, nil
+}
+
+func assetNameMatches(name, expected string) bool {
+	return strings.Compare(name, expected) == 0
 }
 
 // fetchLatestRelease fetches the latest release based on channel.
@@ -367,8 +397,13 @@ func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error
 	return &release, nil
 }
 
-// binaryAssetName returns the expected asset name for the current platform.
-func (u *Updater) binaryAssetName() string {
+// binaryAssetName returns the exact expected asset name for the release and current platform.
+func (u *Updater) binaryAssetName(release *Release) (string, error) {
+	releaseVersion := strings.TrimPrefix(strings.TrimSpace(release.TagName), "v")
+	if releaseVersion == "" {
+		return "", fmt.Errorf("release tag is empty")
+	}
+
 	osName := runtime.GOOS
 	archName := runtime.GOARCH
 
@@ -378,8 +413,7 @@ func (u *Updater) binaryAssetName() string {
 	}
 
 	// Match goreleaser naming: caam_VERSION_OS_ARCH.ext
-	// Since we fetch the release, we'll use a pattern that doesn't include version
-	return fmt.Sprintf("caam_*_%s_%s.%s", osName, archName, ext)
+	return fmt.Sprintf("caam_%s_%s_%s.%s", releaseVersion, osName, archName, ext), nil
 }
 
 // downloadFile downloads a URL to a local file.

@@ -180,7 +180,8 @@ Run 'caam' without arguments to launch the interactive TUI.`,
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
 		if globalDB != nil {
-			globalDB.Close()
+			_ = globalDB.Close()
+			globalDB = nil
 		}
 	},
 }

@@ -12,8 +12,7 @@ import (
 )
 
 func TestUsage_EmptyDatabase_Table(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("CAAM_HOME", tmpDir)
+	setupUsageCommandTest(t)
 
 	out, err := executeCommand("usage", "--days", "7")
 	if err != nil {
@@ -25,8 +24,7 @@ func TestUsage_EmptyDatabase_Table(t *testing.T) {
 }
 
 func TestUsage_Summary_JSON(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("CAAM_HOME", tmpDir)
+	setupUsageCommandTest(t)
 
 	dbPath := caamdb.DefaultPath()
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0700); err != nil {
@@ -86,8 +84,7 @@ func TestUsage_Summary_JSON(t *testing.T) {
 }
 
 func TestUsage_Detailed_JSON(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("CAAM_HOME", tmpDir)
+	setupUsageCommandTest(t)
 
 	db, err := caamdb.Open()
 	if err != nil {
@@ -113,5 +110,33 @@ func TestUsage_Detailed_JSON(t *testing.T) {
 	}
 	if rows[0].DurationSeconds != int64((2 * time.Hour).Seconds()) {
 		t.Fatalf("DurationSeconds = %d, want %d", rows[0].DurationSeconds, int64((2 * time.Hour).Seconds()))
+	}
+}
+
+func setupUsageCommandTest(t *testing.T) {
+	t.Helper()
+
+	root := t.TempDir()
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "xdg-config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "xdg-data"))
+	t.Setenv("CAAM_HOME", filepath.Join(root, "caam-home"))
+
+	resetUsageCommandFlags(t)
+}
+
+func resetUsageCommandFlags(t *testing.T) {
+	t.Helper()
+
+	flags := usageCmd.Flags()
+	for _, name := range []string{"profile", "detailed", "days", "since", "format"} {
+		flag := flags.Lookup(name)
+		if flag == nil {
+			t.Fatalf("usage flag %q not found", name)
+		}
+		if err := flag.Value.Set(flag.DefValue); err != nil {
+			t.Fatalf("reset usage flag %q: %v", name, err)
+		}
+		flag.Changed = false
 	}
 }

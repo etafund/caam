@@ -3,6 +3,7 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/health"
 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/identity"
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/update"
 	"github.com/spf13/cobra"
 )
 
@@ -32,6 +34,25 @@ func captureOutput(t *testing.T, cmd *cobra.Command, args []string) (stdout, std
 // createTestCmd creates a fresh root command for testing.
 func createTestCmd() *cobra.Command {
 	return rootCmd
+}
+
+type fakeUpdateInstaller struct {
+	checkCalls   int
+	updateCalls  int
+	checkResult  *update.CheckResult
+	updateResult *update.UpdateResult
+	checkErr     error
+	updateErr    error
+}
+
+func (f *fakeUpdateInstaller) Check(context.Context) (*update.CheckResult, error) {
+	f.checkCalls++
+	return f.checkResult, f.checkErr
+}
+
+func (f *fakeUpdateInstaller) Update(context.Context) (*update.UpdateResult, error) {
+	f.updateCalls++
+	return f.updateResult, f.updateErr
 }
 
 // TestRootCommand tests the root command exists and has correct metadata.
@@ -106,6 +127,43 @@ func TestSubcommandRegistration(t *testing.T) {
 		if !cmdMap[expected] {
 			t.Errorf("Expected subcommand %q to be registered", expected)
 		}
+	}
+}
+
+func TestRunUpdateInstallTargetVersionSkipsLatestCheck(t *testing.T) {
+	updater := &fakeUpdateInstaller{
+		updateResult: &update.UpdateResult{
+			Updated:     true,
+			FromVersion: "0.1.0",
+			ToVersion:   "1.2.3",
+			ReleaseURL:  "https://example.com/v1.2.3",
+			BackupPath:  "/tmp/caam.backup",
+		},
+	}
+
+	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "1.2.3")
+	if err != nil {
+		t.Fatalf("runUpdateInstall error: %v", err)
+	}
+	if updater.checkCalls != 0 {
+		t.Fatalf("Check calls = %d, want 0", updater.checkCalls)
+	}
+	if updater.updateCalls != 1 {
+		t.Fatalf("Update calls = %d, want 1", updater.updateCalls)
+	}
+}
+
+func TestRunUpdateRejectsCheckWithVersion(t *testing.T) {
+	cmd := &cobra.Command{}
+	cmd.Flags().Bool("check", true, "")
+	cmd.Flags().String("channel", "stable", "")
+	cmd.Flags().String("version", "1.2.3", "")
+	cmd.Flags().Bool("json", false, "")
+	cmd.Flags().Bool("force", false, "")
+
+	err := runUpdate(cmd, nil)
+	if err == nil || !strings.Contains(err.Error(), "--check cannot be combined with --version") {
+		t.Fatalf("runUpdate error = %v, want --check/--version rejection", err)
 	}
 }
 
