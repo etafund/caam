@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 )
@@ -72,9 +71,6 @@ func TestAuthRequestLeakOnTimeout(t *testing.T) {
 	coord.mu.RUnlock()
 
 	if leaked {
-		os.WriteFile("leak_test_result.txt", []byte("FAIL: Request leaked"), 0644)
 		t.Errorf("AuthRequest leaked! It remains in coordinator.requests after tracker reset")
-	} else {
-		os.WriteFile("leak_test_result.txt", []byte("PASS: Request cleaned up"), 0644)
 	}
 }

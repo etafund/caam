@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -159,7 +161,7 @@ func (a *APIServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		PaneCount:      len(trackers),
 		PendingAuths:   len(pending),
 		Panes:          panes,
-		PendingDetails: pending,
+		PendingDetails: redactAuthRequestURLs(pending),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -176,6 +178,7 @@ func (a *APIServer) handleGetPending(w http.ResponseWriter, r *http.Request) {
 // CompleteRequest is the request body for /auth/complete.
 type CompleteRequest struct {
 	RequestID string `json:"request_id"`
+	ID        string `json:"id,omitempty"`
 	Code      string `json:"code"`
 	Account   string `json:"account"`
 	Error     string `json:"error,omitempty"`
@@ -183,23 +186,56 @@ type CompleteRequest struct {
 
 func (a *APIServer) handleComplete(w http.ResponseWriter, r *http.Request) {
 	var req CompleteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	body := http.MaxBytesReader(w, r.Body, 1<<20)
+	defer body.Close()
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
 
+	req.RequestID = strings.TrimSpace(req.RequestID)
+	if req.RequestID == "" {
+		req.RequestID = strings.TrimSpace(req.ID)
+	}
+	req.Code = strings.TrimSpace(req.Code)
+	req.Account = strings.TrimSpace(req.Account)
+	req.Error = strings.TrimSpace(req.Error)
 	if req.RequestID == "" {
 		http.Error(w, "request_id required", http.StatusBadRequest)
 		return
 	}
+	if req.Code == "" && req.Error == "" {
+		http.Error(w, "code or error required", http.StatusBadRequest)
+		return
+	}
 
-	resp := AuthResponse(req)
+	resp := AuthResponse{
+		RequestID: req.RequestID,
+		Code:      req.Code,
+		Account:   req.Account,
+		Error:     req.Error,
+	}
 
 	if err := a.coordinator.ReceiveAuthResponse(resp); err != nil {
 		a.logger.Error("failed to process auth response",
 			"request_id", req.RequestID,
 			"error", err)
-		http.Error(w, err.Error(), http.StatusNotFound)
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrUnknownAuthRequest), errors.Is(err, ErrAuthRequestNoTracker):
+			status = http.StatusNotFound
+		case errors.Is(err, ErrAuthRequestNotPending), errors.Is(err, ErrAuthRequestWrongState):
+			status = http.StatusConflict
+		case errors.Is(err, ErrAuthResponseNeedsOutcome):
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -220,4 +256,21 @@ func (a *APIServer) handleListPanes(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(panes)
+}
+
+func redactAuthRequestURLs(requests []*AuthRequest) []*AuthRequest {
+	redacted := make([]*AuthRequest, 0, len(requests))
+	for _, req := range requests {
+		if req == nil {
+			continue
+		}
+		copied := *req
+		copied.URL = RedactURL(copied.URL)
+		if req.Pane != nil {
+			pane := *req.Pane
+			copied.Pane = &pane
+		}
+		redacted = append(redacted, &copied)
+	}
+	return redacted
 }

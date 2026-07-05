@@ -2,9 +2,12 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -119,11 +122,46 @@ func DefaultConfig() Config {
 
 // AuthRequest represents a pending authentication request.
 type AuthRequest struct {
-	ID        string    `json:"id"`
-	PaneID    int       `json:"pane_id"`
-	URL       string    `json:"url"`
-	CreatedAt time.Time `json:"created_at"`
-	Status    string    `json:"status"` // pending, processing, completed, failed
+	ID        string           `json:"id"`
+	PaneID    int              `json:"pane_id"`
+	URL       string           `json:"url"`
+	CreatedAt time.Time        `json:"created_at"`
+	Status    string           `json:"status"` // pending, processing, completed, failed
+	Pane      *AuthRequestPane `json:"pane,omitempty"`
+}
+
+// AuthRequestPane is stable pane metadata included with pending auth requests.
+type AuthRequestPane struct {
+	PaneID      int    `json:"pane_id"`
+	WindowID    int    `json:"window_id,omitempty"`
+	TabID       int    `json:"tab_id,omitempty"`
+	WorkspaceID string `json:"workspace,omitempty"`
+	Domain      string `json:"domain,omitempty"`
+	Title       string `json:"title,omitempty"`
+	CWD         string `json:"cwd,omitempty"`
+}
+
+// MarshalJSON includes both the legacy "id" field and the newer
+// "request_id" alias so older and newer auth agents can consume the same API.
+func (r AuthRequest) MarshalJSON() ([]byte, error) {
+	type authRequestJSON struct {
+		ID        string           `json:"id"`
+		RequestID string           `json:"request_id"`
+		PaneID    int              `json:"pane_id"`
+		URL       string           `json:"url"`
+		CreatedAt time.Time        `json:"created_at"`
+		Status    string           `json:"status"`
+		Pane      *AuthRequestPane `json:"pane,omitempty"`
+	}
+	return json.Marshal(authRequestJSON{
+		ID:        r.ID,
+		RequestID: r.ID,
+		PaneID:    r.PaneID,
+		URL:       r.URL,
+		CreatedAt: r.CreatedAt,
+		Status:    r.Status,
+		Pane:      r.Pane,
+	})
 }
 
 // AuthResponse contains the result from the local agent.
@@ -133,6 +171,14 @@ type AuthResponse struct {
 	Account   string `json:"account"`
 	Error     string `json:"error,omitempty"`
 }
+
+var (
+	ErrUnknownAuthRequest       = errors.New("unknown request")
+	ErrAuthRequestNotPending    = errors.New("auth request not pending")
+	ErrAuthRequestNoTracker     = errors.New("no tracker for request")
+	ErrAuthRequestWrongState    = errors.New("auth request not accepting responses")
+	ErrAuthResponseNeedsOutcome = errors.New("auth response requires code or error")
+)
 
 // Coordinator manages pane monitoring and auth recovery.
 type Coordinator struct {
@@ -260,9 +306,11 @@ func (c *Coordinator) Start(ctx context.Context) error {
 	// Recreate channels for this run (in case of restart after Stop)
 	c.stopCh = make(chan struct{})
 	c.doneCh = make(chan struct{})
+	stopCh := c.stopCh
+	doneCh := c.doneCh
 	c.mu.Unlock()
 
-	go c.monitorLoop(ctx)
+	go c.monitorLoop(ctx, stopCh, doneCh)
 	return nil
 }
 
@@ -292,8 +340,8 @@ func (c *Coordinator) Stop() error {
 }
 
 // monitorLoop is the main polling loop.
-func (c *Coordinator) monitorLoop(ctx context.Context) {
-	defer close(c.doneCh)
+func (c *Coordinator) monitorLoop(ctx context.Context, stopCh <-chan struct{}, doneCh chan<- struct{}) {
+	defer close(doneCh)
 
 	ticker := time.NewTicker(c.config.PollInterval)
 	defer ticker.Stop()
@@ -302,7 +350,7 @@ func (c *Coordinator) monitorLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-c.stopCh:
+		case <-stopCh:
 			return
 		case <-ticker.C:
 			c.pollPanes(ctx)
@@ -337,6 +385,10 @@ func (c *Coordinator) pollPanes(ctx context.Context) {
 	for paneID := range c.trackers {
 		if !seenPanes[paneID] {
 			c.logger.Debug("pane disappeared, removing tracker", "pane_id", paneID)
+			requestID := c.trackers[paneID].GetRequestID()
+			if requestID != "" {
+				delete(c.requests, requestID)
+			}
 			delete(c.trackers, paneID)
 		}
 	}
@@ -387,7 +439,7 @@ func (c *Coordinator) processPaneState(ctx context.Context, pane Pane) {
 		c.handleAwaitingMethodSelectState(ctx, tracker, output)
 
 	case StateAwaitingURL:
-		c.handleAwaitingURLState(ctx, tracker, output)
+		c.handleAwaitingURLState(ctx, tracker, pane, output)
 
 	case StateAuthPending:
 		c.handleAuthPendingState(ctx, tracker, output)
@@ -636,7 +688,7 @@ func (c *Coordinator) handleAwaitingMethodSelectState(ctx context.Context, track
 	}
 }
 
-func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneTracker, output string) {
+func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneTracker, pane Pane, output string) {
 	// Extract URL if not already have it
 	oauthURL := tracker.GetOAuthURL()
 	if oauthURL == "" {
@@ -655,14 +707,15 @@ func (c *Coordinator) handleAwaitingURLState(ctx context.Context, tracker *PaneT
 			URL:       oauthURL,
 			CreatedAt: time.Now(),
 			Status:    "pending",
+			Pane:      authRequestPane(pane),
 		}
+
+		tracker.SetRequestID(req.ID)
+		tracker.SetState(StateAuthPending)
 
 		c.mu.Lock()
 		c.requests[req.ID] = req
 		c.mu.Unlock()
-
-		tracker.SetRequestID(req.ID)
-		tracker.SetState(StateAuthPending)
 
 		c.logger.Info("auth request created",
 			"pane_id", tracker.PaneID,
@@ -751,6 +804,7 @@ func (c *Coordinator) handleCodeReceivedState(ctx context.Context, tracker *Pane
 			"action", "inject_failed")
 		tracker.SetErrorMessage(err.Error())
 		tracker.SetState(StateFailed)
+		c.cleanupRequest(tracker.GetRequestID())
 		return
 	}
 
@@ -785,6 +839,7 @@ func (c *Coordinator) handleAwaitingConfirmState(ctx context.Context, tracker *P
 			"request_id", tracker.GetRequestID(),
 			"action", "transition_to_failed")
 		tracker.SetState(StateFailed)
+		c.cleanupRequest(tracker.GetRequestID())
 
 		if c.OnAuthFailed != nil {
 			c.OnAuthFailed(tracker.PaneID, fmt.Errorf("login failed"))
@@ -871,8 +926,31 @@ func (c *Coordinator) handleResumingState(ctx context.Context, tracker *PaneTrac
 	tracker.Reset()
 }
 
+func authRequestPane(pane Pane) *AuthRequestPane {
+	return &AuthRequestPane{
+		PaneID:      pane.PaneID,
+		WindowID:    pane.WindowID,
+		TabID:       pane.TabID,
+		WorkspaceID: pane.WorkspaceID,
+		Domain:      pane.Domain,
+		Title:       pane.Title,
+		CWD:         pane.CWD,
+	}
+}
+
 // ReceiveAuthResponse processes a response from the local agent.
 func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
+	resp.RequestID = strings.TrimSpace(resp.RequestID)
+	resp.Code = strings.TrimSpace(resp.Code)
+	resp.Error = strings.TrimSpace(resp.Error)
+
+	if resp.RequestID == "" {
+		return fmt.Errorf("%w: request_id required", ErrUnknownAuthRequest)
+	}
+	if resp.Code == "" && resp.Error == "" {
+		return ErrAuthResponseNeedsOutcome
+	}
+
 	c.mu.Lock()
 	req, ok := c.requests[resp.RequestID]
 	if !ok {
@@ -881,13 +959,19 @@ func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
 			"request_id", resp.RequestID,
 			"reason", "request_not_found",
 			"action", "response_rejected")
-		return fmt.Errorf("unknown request: %s", resp.RequestID)
+		return fmt.Errorf("%w: %s", ErrUnknownAuthRequest, resp.RequestID)
 	}
-	req.Status = "processing"
-	c.mu.Unlock()
+	if req.Status != "pending" {
+		status := req.Status
+		c.mu.Unlock()
+		c.logger.Warn("non-pending auth response rejected",
+			"request_id", resp.RequestID,
+			"status", status,
+			"action", "response_rejected")
+		return fmt.Errorf("%w: %s is %s", ErrAuthRequestNotPending, resp.RequestID, status)
+	}
 
 	// Find tracker for this request
-	c.mu.RLock()
 	var tracker *PaneTracker
 	for _, t := range c.trackers {
 		if t.GetRequestID() == resp.RequestID {
@@ -895,15 +979,26 @@ func (c *Coordinator) ReceiveAuthResponse(resp AuthResponse) error {
 			break
 		}
 	}
-	c.mu.RUnlock()
-
 	if tracker == nil {
+		c.mu.Unlock()
 		c.logger.Warn("orphaned auth response",
 			"request_id", resp.RequestID,
 			"reason", "tracker_not_found",
 			"action", "response_rejected")
-		return fmt.Errorf("no tracker for request: %s", resp.RequestID)
+		return fmt.Errorf("%w: %s", ErrAuthRequestNoTracker, resp.RequestID)
 	}
+	if tracker.GetState() != StateAuthPending {
+		state := tracker.GetState()
+		c.mu.Unlock()
+		c.logger.Warn("auth response rejected for tracker state",
+			"pane_id", tracker.PaneID,
+			"request_id", resp.RequestID,
+			"state", state.String(),
+			"action", "response_rejected")
+		return fmt.Errorf("%w: %s is %s", ErrAuthRequestWrongState, resp.RequestID, state.String())
+	}
+	req.Status = "processing"
+	c.mu.Unlock()
 
 	if resp.Error != "" {
 		c.logger.Error("auth response error received",
@@ -948,9 +1043,20 @@ func (c *Coordinator) GetPendingRequests() []*AuthRequest {
 	var pending []*AuthRequest
 	for _, req := range c.requests {
 		if req.Status == "pending" {
-			pending = append(pending, req)
+			copied := *req
+			if req.Pane != nil {
+				pane := *req.Pane
+				copied.Pane = &pane
+			}
+			pending = append(pending, &copied)
 		}
 	}
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].CreatedAt.Equal(pending[j].CreatedAt) {
+			return pending[i].ID < pending[j].ID
+		}
+		return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+	})
 	return pending
 }
 

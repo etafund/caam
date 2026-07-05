@@ -3,6 +3,7 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -181,6 +182,33 @@ func TestCoordinatorStartStop(t *testing.T) {
 	coord.Stop()
 }
 
+func TestMonitorLoopUsesRunLocalChannels(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.PollInterval = time.Hour
+	cfg.PaneClient = &fakePaneClient{panes: []Pane{}}
+	coord := New(cfg)
+
+	oldStop := make(chan struct{})
+	oldDone := make(chan struct{})
+	newDone := make(chan struct{})
+	coord.doneCh = newDone
+
+	go coord.monitorLoop(context.Background(), oldStop, oldDone)
+	close(oldStop)
+
+	select {
+	case <-oldDone:
+	case <-time.After(time.Second):
+		t.Fatal("old monitor loop did not close its run-local done channel")
+	}
+
+	select {
+	case <-newDone:
+		t.Fatal("old monitor loop closed coordinator's current done channel")
+	default:
+	}
+}
+
 // TestCoordinatorGetStatus tests GetStatus functionality.
 func TestCoordinatorGetStatus(t *testing.T) {
 	cfg := DefaultConfig()
@@ -236,6 +264,82 @@ func TestCoordinatorGetPendingRequests(t *testing.T) {
 	}
 }
 
+func TestCoordinatorGetPendingRequestsSortedAndCopied(t *testing.T) {
+	cfg := DefaultConfig()
+	coord := New(cfg)
+
+	coord.requests["req-b"] = &AuthRequest{
+		ID:        "req-b",
+		Status:    "pending",
+		CreatedAt: time.Unix(20, 0),
+		Pane:      &AuthRequestPane{PaneID: 2, Title: "pane-b"},
+	}
+	coord.requests["req-a"] = &AuthRequest{
+		ID:        "req-a",
+		Status:    "pending",
+		CreatedAt: time.Unix(10, 0),
+		Pane:      &AuthRequestPane{PaneID: 1, Title: "pane-a"},
+	}
+
+	pending := coord.GetPendingRequests()
+	if len(pending) != 2 {
+		t.Fatalf("expected 2 pending requests, got %d", len(pending))
+	}
+	if pending[0].ID != "req-a" || pending[1].ID != "req-b" {
+		t.Fatalf("pending requests not sorted by creation time: %s, %s", pending[0].ID, pending[1].ID)
+	}
+
+	pending[0].Status = "processing"
+	pending[0].Pane.Title = "mutated"
+	if coord.requests["req-a"].Status != "pending" {
+		t.Fatalf("mutating pending copy changed stored request status")
+	}
+	if coord.requests["req-a"].Pane.Title != "pane-a" {
+		t.Fatalf("mutating pending copy changed stored pane metadata")
+	}
+}
+
+func TestAuthRequestMarshalIncludesRequestIDAndPaneMetadata(t *testing.T) {
+	req := AuthRequest{
+		ID:        "req-123",
+		PaneID:    7,
+		URL:       "https://claude.ai/oauth/authorize?code_challenge=secret",
+		CreatedAt: time.Unix(100, 0).UTC(),
+		Status:    "pending",
+		Pane: &AuthRequestPane{
+			PaneID:   7,
+			WindowID: 2,
+			TabID:    3,
+			Domain:   "ssh:work",
+			Title:    "claude-code",
+			CWD:      "/repo",
+		},
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal auth request: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal auth request JSON: %v", err)
+	}
+	if got["id"] != "req-123" {
+		t.Fatalf("id = %v, want req-123", got["id"])
+	}
+	if got["request_id"] != "req-123" {
+		t.Fatalf("request_id = %v, want req-123", got["request_id"])
+	}
+	pane, ok := got["pane"].(map[string]any)
+	if !ok {
+		t.Fatalf("pane metadata missing from JSON: %v", got["pane"])
+	}
+	if pane["title"] != "claude-code" || pane["domain"] != "ssh:work" || pane["cwd"] != "/repo" {
+		t.Fatalf("unexpected pane metadata: %#v", pane)
+	}
+}
+
 // TestCoordinatorReceiveAuthResponseUnknown tests error handling for unknown request.
 func TestCoordinatorReceiveAuthResponseUnknown(t *testing.T) {
 	cfg := DefaultConfig()
@@ -252,6 +356,74 @@ func TestCoordinatorReceiveAuthResponseUnknown(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unknown request") {
 		t.Errorf("expected 'unknown request' error, got: %v", err)
+	}
+}
+
+func TestCoordinatorReceiveAuthResponseRejectsEmptyOutcome(t *testing.T) {
+	cfg := DefaultConfig()
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: "pending", PaneID: 1}
+
+	err := coord.ReceiveAuthResponse(AuthResponse{RequestID: "req-1"})
+	if !errors.Is(err, ErrAuthResponseNeedsOutcome) {
+		t.Fatalf("error = %v, want ErrAuthResponseNeedsOutcome", err)
+	}
+	if tracker.GetReceivedCode() != "" {
+		t.Fatalf("tracker received code after rejected response: %q", tracker.GetReceivedCode())
+	}
+	if coord.requests["req-1"].Status != "pending" {
+		t.Fatalf("request status = %q, want pending", coord.requests["req-1"].Status)
+	}
+}
+
+func TestCoordinatorReceiveAuthResponseRejectsNonPendingRequest(t *testing.T) {
+	cfg := DefaultConfig()
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: "processing", PaneID: 1}
+
+	err := coord.ReceiveAuthResponse(AuthResponse{
+		RequestID: "req-1",
+		Code:      "CODE-123",
+		Account:   "test@example.com",
+	})
+	if !errors.Is(err, ErrAuthRequestNotPending) {
+		t.Fatalf("error = %v, want ErrAuthRequestNotPending", err)
+	}
+	if tracker.GetReceivedCode() != "" {
+		t.Fatalf("tracker received code after rejected response: %q", tracker.GetReceivedCode())
+	}
+}
+
+func TestCoordinatorReceiveAuthResponseRejectsWrongTrackerState(t *testing.T) {
+	cfg := DefaultConfig()
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAwaitingConfirm)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", Status: "pending", PaneID: 1}
+
+	err := coord.ReceiveAuthResponse(AuthResponse{
+		RequestID: "req-1",
+		Code:      "CODE-123",
+		Account:   "test@example.com",
+	})
+	if !errors.Is(err, ErrAuthRequestWrongState) {
+		t.Fatalf("error = %v, want ErrAuthRequestWrongState", err)
+	}
+	if coord.requests["req-1"].Status != "pending" {
+		t.Fatalf("request status = %q, want pending", coord.requests["req-1"].Status)
 	}
 }
 
@@ -355,7 +527,12 @@ func TestAPIStatusEndpoint(t *testing.T) {
 	tracker.SetState(StateAuthPending)
 	tracker.SetRequestID("req-1")
 	coord.trackers[1] = tracker
-	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: "pending"}
+	coord.requests["req-1"] = &AuthRequest{
+		ID:     "req-1",
+		PaneID: 1,
+		URL:    "https://claude.ai/oauth/authorize?code_challenge=secret",
+		Status: "pending",
+	}
 
 	api := NewAPIServer(coord, 0, nil)
 
@@ -387,6 +564,12 @@ func TestAPIStatusEndpoint(t *testing.T) {
 	}
 	if resp.Panes[0].State != "AUTH_PENDING" {
 		t.Errorf("expected AUTH_PENDING state, got %q", resp.Panes[0].State)
+	}
+	if len(resp.PendingDetails) != 1 {
+		t.Fatalf("expected 1 pending detail, got %d", len(resp.PendingDetails))
+	}
+	if strings.Contains(resp.PendingDetails[0].URL, "secret") {
+		t.Fatalf("status pending detail leaked unredacted OAuth URL: %q", resp.PendingDetails[0].URL)
 	}
 }
 
@@ -425,6 +608,7 @@ func TestAPIGetPendingEndpoint(t *testing.T) {
 		PaneID: 1,
 		URL:    "https://claude.ai/oauth/authorize?code_challenge=abc",
 		Status: "pending",
+		Pane:   &AuthRequestPane{PaneID: 1, Domain: "ssh:work", Title: "claude-code"},
 	}
 	coord.requests["req-2"] = &AuthRequest{
 		ID:     "req-2",
@@ -453,6 +637,17 @@ func TestAPIGetPendingEndpoint(t *testing.T) {
 	}
 	if pending[0].ID != "req-1" {
 		t.Errorf("expected req-1, got %q", pending[0].ID)
+	}
+	if pending[0].Pane == nil || pending[0].Pane.Domain != "ssh:work" || pending[0].Pane.Title != "claude-code" {
+		t.Fatalf("pending pane metadata = %#v, want domain/title", pending[0].Pane)
+	}
+
+	var raw []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("failed to unmarshal pending raw response: %v", err)
+	}
+	if raw[0]["request_id"] != "req-1" {
+		t.Fatalf("request_id alias = %v, want req-1", raw[0]["request_id"])
 	}
 }
 
@@ -490,6 +685,35 @@ func TestAPICompleteEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPIAuthSubmitRouteAliasWithToken(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AuthToken = "secret-token"
+	coord := New(cfg)
+	coord.paneClient = &fakePaneClient{}
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: "pending"}
+
+	api := NewAPIServer(coord, 0, nil)
+
+	body := strings.NewReader(`{"id":"req-1","code":"ABC123","account":"test@example.com"}`)
+	req := httptest.NewRequest("POST", "/auth/submit", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer secret-token")
+	w := httptest.NewRecorder()
+
+	api.server.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if tracker.GetReceivedCode() != "ABC123" {
+		t.Fatalf("expected code ABC123, got %q", tracker.GetReceivedCode())
+	}
+}
+
 // TestAPICompleteEndpointBadRequest tests error handling for invalid requests.
 func TestAPICompleteEndpointBadRequest(t *testing.T) {
 	cfg := DefaultConfig()
@@ -513,6 +737,16 @@ func TestAPICompleteEndpointBadRequest(t *testing.T) {
 			wantCode: http.StatusBadRequest,
 		},
 		{
+			name:     "missing code and error",
+			body:     `{"request_id":"req-1"}`,
+			wantCode: http.StatusBadRequest,
+		},
+		{
+			name:     "unknown field",
+			body:     `{"request_id":"req-1","code":"ABC123","unexpected":"field"}`,
+			wantCode: http.StatusBadRequest,
+		},
+		{
 			name:     "unknown request_id",
 			body:     `{"request_id":"unknown","code":"ABC123"}`,
 			wantCode: http.StatusNotFound,
@@ -531,6 +765,32 @@ func TestAPICompleteEndpointBadRequest(t *testing.T) {
 				t.Errorf("expected status %d, got %d", tt.wantCode, w.Code)
 			}
 		})
+	}
+}
+
+func TestAPICompleteEndpointConflictForDuplicateSubmission(t *testing.T) {
+	cfg := DefaultConfig()
+	coord := New(cfg)
+
+	tracker := NewPaneTracker(1)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-1")
+	coord.trackers[1] = tracker
+	coord.requests["req-1"] = &AuthRequest{ID: "req-1", PaneID: 1, Status: "processing"}
+
+	api := NewAPIServer(coord, 0, nil)
+
+	body := strings.NewReader(`{"request_id":"req-1","code":"ABC123","account":"test@example.com"}`)
+	req := httptest.NewRequest("POST", "/auth/complete", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	api.handleComplete(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d: %s", w.Code, w.Body.String())
+	}
+	if tracker.GetReceivedCode() != "" {
+		t.Fatalf("tracker received code after duplicate submission: %q", tracker.GetReceivedCode())
 	}
 }
 
@@ -633,6 +893,9 @@ func TestE2ERateLimitToAuthComplete(t *testing.T) {
 	}
 
 	requestID := pending[0].ID
+	if pending[0].Pane == nil || pending[0].Pane.Title != "claude-code" {
+		t.Fatalf("pending request pane metadata = %#v, want title claude-code", pending[0].Pane)
+	}
 
 	// Phase 4: Auth response received
 	err := coord.ReceiveAuthResponse(AuthResponse{
@@ -773,6 +1036,22 @@ func TestE2EPaneDisappears(t *testing.T) {
 	}
 	if _, exists := coord.trackers[2]; exists {
 		t.Error("expected tracker 2 to be removed")
+	}
+
+	// A pending request tied to a disappeared pane must not outlive its tracker.
+	tracker := NewPaneTracker(2)
+	tracker.SetState(StateAuthPending)
+	tracker.SetRequestID("req-2")
+	coord.trackers[2] = tracker
+	coord.requests["req-2"] = &AuthRequest{ID: "req-2", PaneID: 2, Status: "pending"}
+
+	coord.pollPanes(ctx)
+
+	if _, exists := coord.trackers[2]; exists {
+		t.Error("expected recreated tracker 2 to be removed")
+	}
+	if _, exists := coord.requests["req-2"]; exists {
+		t.Error("expected pending request for disappeared pane to be removed")
 	}
 }
 
