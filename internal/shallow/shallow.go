@@ -709,8 +709,12 @@ func createCodexManagedFiles(m *Manager, home string, opts CreateOptions) error 
 	codexDir := filepath.Join(home, ".codex")
 	realConfigPath := filepath.Join(m.realHome, ".codex", "config.toml")
 	if data, err := os.ReadFile(realConfigPath); err == nil {
+		sanitized, err := sanitizeCodexConfigForShallowProfile(data)
+		if err != nil {
+			return fmt.Errorf("sanitize real codex config: %w", err)
+		}
 		cfgOut := filepath.Join(codexDir, "config.toml")
-		if err := writeFileAtomic(cfgOut, sanitizeCodexConfigForShallowProfile(data), 0o600); err != nil {
+		if err := writeFileAtomic(cfgOut, sanitized, 0o600); err != nil {
 			return fmt.Errorf("write sanitized codex config: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
@@ -722,12 +726,9 @@ func createCodexManagedFiles(m *Manager, home string, opts CreateOptions) error 
 			return fmt.Errorf("write managed codex config fallback: %w", err)
 		}
 	}
-	// Write a FRESH minimal config.toml (just the file credential store) — do NOT
-	// copy the real ~/.codex/config.toml. A copied config can carry PATH-bearing keys
-	// that escape isolation: `log_dir`/`sqlite_home` pointing back at the real
-	// ~/.codex, or a custom `[model_providers.*] env_key` that authenticates via an
-	// inherited env var instead of the shallow auth.json. EnsureFileCredentialStore
-	// with no existing config writes exactly `cli_auth_credentials_store = "file"`.
+	// Enforce file credential storage after seeding only the safe subset of the
+	// real config. We preserve MCP sections, but not model-provider auth aliases
+	// or path-bearing top-level keys such as log_dir/sqlite_home.
 	if err := codexprovider.EnsureFileCredentialStore(codexDir); err != nil {
 		return fmt.Errorf("configure codex credential store: %w", err)
 	}
@@ -738,10 +739,11 @@ func createCodexManagedFiles(m *Manager, home string, opts CreateOptions) error 
 // plus optional existing cli_auth_credentials_store overrides. This preserves MCP
 // integrations (like MCP Agent Mail) while avoiding copying path-bearing or env
 // auth aliases that could re-point this shallow profile at external state.
-func sanitizeCodexConfigForShallowProfile(raw []byte) []byte {
+func sanitizeCodexConfigForShallowProfile(raw []byte) ([]byte, error) {
 	var out bytes.Buffer
 	inMCPSection := false
 	s := bufio.NewScanner(bytes.NewReader(raw))
+	s.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for s.Scan() {
 		line := s.Text()
 		trimmed := strings.TrimSpace(line)
@@ -766,8 +768,11 @@ func sanitizeCodexConfigForShallowProfile(raw []byte) []byte {
 			out.WriteByte('\n')
 		}
 	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
 
-	return out.Bytes()
+	return out.Bytes(), nil
 }
 
 // Meta is the JSON sidecar persisted at ~/orch-homes/<name>/.caam-shallow.json.
