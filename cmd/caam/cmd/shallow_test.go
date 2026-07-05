@@ -1437,6 +1437,18 @@ func TestShallowDeletePromptOnStderr(t *testing.T) {
 // both a claude and a codex profile. The non-deterministic base path is
 // normalized to the literal <BASE> before comparing against an inline golden.
 func TestShallowPrintEnvGolden(t *testing.T) {
+	origAgentView, hadAgentView := os.LookupEnv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
+	if err := os.Unsetenv("CLAUDE_CODE_DISABLE_AGENT_VIEW"); err != nil {
+		t.Fatalf("Unsetenv(CLAUDE_CODE_DISABLE_AGENT_VIEW): %v", err)
+	}
+	t.Cleanup(func() {
+		if hadAgentView {
+			_ = os.Setenv("CLAUDE_CODE_DISABLE_AGENT_VIEW", origAgentView)
+		} else {
+			_ = os.Unsetenv("CLAUDE_CODE_DISABLE_AGENT_VIEW")
+		}
+	})
+
 	base, _ := shallowEnv(t)
 
 	for _, name := range []string{"cgold", "claude-gold"} {
@@ -1469,22 +1481,37 @@ func TestShallowPrintEnvGolden(t *testing.T) {
 		t.Fatalf("codex print-env: %v", err)
 	}
 	wantCodex := []string{
+		"export CLAUDE_CODE_DISABLE_AGENT_VIEW='1'",
 		"export CODEX_HOME='<BASE>/cgold/.codex'",
 		"export CODEX_SQLITE_HOME='<BASE>/cgold/.codex'",
 		"export HOME='<BASE>/cgold'",
 		"export SHALLOW_PROFILE='cgold'",
 		"unset ANTHROPIC_API_KEY",
 		"unset ANTHROPIC_AUTH_TOKEN",
+		"unset ANTHROPIC_AWS_API_KEY",
+		"unset ANTHROPIC_AWS_WORKSPACE_ID",
+		"unset ANTHROPIC_FOUNDRY_API_KEY",
+		"unset ANTHROPIC_FOUNDRY_BASE_URL",
+		"unset ANTHROPIC_FOUNDRY_RESOURCE",
+		"unset ANTHROPIC_VERTEX_BASE_URL",
+		"unset ANTHROPIC_VERTEX_PROJECT_ID",
+		"unset ANTHROPIC_WORKSPACE_ID",
+		"unset AWS_BEARER_TOKEN_BEDROCK",
 		"unset CAAM_HOME",
 		"unset CAAM_SHALLOW_HOMES_DIR",
 		"unset CLAUDE_CODE_OAUTH_TOKEN",
+		"unset CLAUDE_CODE_USE_ANTHROPIC_AWS",
 		"unset CLAUDE_CODE_USE_BEDROCK",
 		"unset CLAUDE_CODE_USE_FOUNDRY",
+		"unset CLAUDE_CODE_USE_MANTLE",
 		"unset CLAUDE_CODE_USE_VERTEX",
 		"unset CLAUDE_CONFIG_DIR",
 		"unset CODEX_ACCESS_TOKEN",
 		"unset CODEX_API_KEY",
 		"unset GEMINI_HOME",
+		"unset GCLOUD_PROJECT",
+		"unset GOOGLE_APPLICATION_CREDENTIALS",
+		"unset GOOGLE_CLOUD_PROJECT",
 		"unset OPENAI_API_KEY",
 		"unset XDG_DATA_HOME",
 	}
@@ -1503,15 +1530,27 @@ func TestShallowPrintEnvGolden(t *testing.T) {
 		t.Fatalf("claude print-env: %v", err)
 	}
 	wantClaude := []string{
+		"export CLAUDE_CODE_DISABLE_AGENT_VIEW='1'",
 		"export HOME='<BASE>/claude-gold'",
 		"export SHALLOW_PROFILE='claude-gold'",
 		"unset ANTHROPIC_API_KEY",
 		"unset ANTHROPIC_AUTH_TOKEN",
+		"unset ANTHROPIC_AWS_API_KEY",
+		"unset ANTHROPIC_AWS_WORKSPACE_ID",
+		"unset ANTHROPIC_FOUNDRY_API_KEY",
+		"unset ANTHROPIC_FOUNDRY_BASE_URL",
+		"unset ANTHROPIC_FOUNDRY_RESOURCE",
+		"unset ANTHROPIC_VERTEX_BASE_URL",
+		"unset ANTHROPIC_VERTEX_PROJECT_ID",
+		"unset ANTHROPIC_WORKSPACE_ID",
+		"unset AWS_BEARER_TOKEN_BEDROCK",
 		"unset CAAM_HOME",
 		"unset CAAM_SHALLOW_HOMES_DIR",
 		"unset CLAUDE_CODE_OAUTH_TOKEN",
+		"unset CLAUDE_CODE_USE_ANTHROPIC_AWS",
 		"unset CLAUDE_CODE_USE_BEDROCK",
 		"unset CLAUDE_CODE_USE_FOUNDRY",
+		"unset CLAUDE_CODE_USE_MANTLE",
 		"unset CLAUDE_CODE_USE_VERTEX",
 		"unset CLAUDE_CONFIG_DIR",
 		"unset CODEX_ACCESS_TOKEN",
@@ -1519,6 +1558,9 @@ func TestShallowPrintEnvGolden(t *testing.T) {
 		"unset CODEX_HOME",
 		"unset CODEX_SQLITE_HOME",
 		"unset GEMINI_HOME",
+		"unset GCLOUD_PROJECT",
+		"unset GOOGLE_APPLICATION_CREDENTIALS",
+		"unset GOOGLE_CLOUD_PROJECT",
 		"unset OPENAI_API_KEY",
 		"unset XDG_DATA_HOME",
 	}

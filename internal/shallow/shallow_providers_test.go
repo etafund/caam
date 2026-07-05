@@ -290,6 +290,7 @@ func TestNoIdentityLeak(t *testing.T) {
 		realBody string
 	}
 	cases := []tc{
+		{"claude", ".claude", ".claude/.credentials.json", ".claude/.credentials.json", `{"real":"claude-identity"}`},
 		{"codex", ".codex", ".codex/auth.json", ".codex/auth.json", `{"real":"codex-identity"}`},
 		{"agy", ".gemini", ".gemini/antigravity-cli/antigravity-oauth-token", ".gemini/antigravity-cli/antigravity-oauth-token", "REAL-AGY-TOKEN"},
 	}
@@ -413,16 +414,95 @@ func TestSpawnEnvPerProvider(t *testing.T) {
 	}
 }
 
-// TestSpawnEnvAgentView proves the claude Agent View disable policy (#49):
-// CLAUDE_CODE_DISABLE_AGENT_VIEW=1 is injected by default for claude shallow
-// sessions, suppressed by --allow-agent-view (allowAgentView) and by a
-// pre-existing user CLAUDE_CODE_DISABLE_AGENT_VIEW (disableAgentViewSet), and
-// never applied to non-claude providers.
+func TestClaudeSpawnEnvKeepsConfigDirScrubbed(t *testing.T) {
+	home := "/orch/cc-alice"
+
+	set, scrub := SpawnEnv("claude", home, "cc-alice", false, false)
+	if set["HOME"] != home {
+		t.Fatalf("HOME = %q, want %q", set["HOME"], home)
+	}
+	if set["SHALLOW_PROFILE"] != "cc-alice" {
+		t.Fatalf("SHALLOW_PROFILE = %q, want cc-alice", set["SHALLOW_PROFILE"])
+	}
+	if _, ok := set["CLAUDE_CONFIG_DIR"]; ok {
+		t.Fatalf("claude shallow-spawn must not set CLAUDE_CONFIG_DIR; set=%v", set)
+	}
+	if set["CLAUDE_CODE_DISABLE_AGENT_VIEW"] != "1" {
+		t.Fatalf("default claude shallow-spawn must disable Agent View, got %q", set["CLAUDE_CODE_DISABLE_AGENT_VIEW"])
+	}
+	for _, key := range scrub {
+		if key == "CLAUDE_CONFIG_DIR" {
+			return
+		}
+	}
+	t.Fatalf("claude shallow-spawn must scrub inherited CLAUDE_CONFIG_DIR, got %v", scrub)
+}
+
+func TestClaudeLayoutSpawnEnvDeletesInheritedConfigAndAuthOverrides(t *testing.T) {
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{
+		"HOME":                      "/real",
+		"CLAUDE_CONFIG_DIR":         "/orch/cc-bob/.claude",
+		"ANTHROPIC_API_KEY":         "leak",
+		"ANTHROPIC_AWS_API_KEY":     "leak",
+		"ANTHROPIC_FOUNDRY_API_KEY": "leak",
+		"AWS_BEARER_TOKEN_BEDROCK":  "leak",
+		"CLAUDE_CODE_USE_MANTLE":    "1",
+	}
+
+	layout.SpawnEnv("/orch/cc-alice", "cc-alice", env)
+	if env["HOME"] != "/orch/cc-alice" {
+		t.Fatalf("HOME = %q, want /orch/cc-alice", env["HOME"])
+	}
+	if env["SHALLOW_PROFILE"] != "cc-alice" {
+		t.Fatalf("SHALLOW_PROFILE = %q, want cc-alice", env["SHALLOW_PROFILE"])
+	}
+	for _, key := range []string{
+		"CLAUDE_CONFIG_DIR",
+		"ANTHROPIC_API_KEY",
+		"ANTHROPIC_AWS_API_KEY",
+		"ANTHROPIC_FOUNDRY_API_KEY",
+		"AWS_BEARER_TOKEN_BEDROCK",
+		"CLAUDE_CODE_USE_MANTLE",
+	} {
+		if _, ok := env[key]; ok {
+			t.Fatalf("%s survived Claude shallow env transform: %v", key, env)
+		}
+	}
+}
+
+func TestClaudeSpawnEnvLinesKeepConfigDirUnset(t *testing.T) {
+	layout, err := LayoutForProvider("claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := layout.SpawnEnvLines("/orch/cc-alice", "cc-alice")
+	hasUnsetConfigDir := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "export CLAUDE_CONFIG_DIR=") {
+			t.Fatalf("Claude print-env must not export CLAUDE_CONFIG_DIR: %v", lines)
+		}
+		if line == "unset CLAUDE_CONFIG_DIR" {
+			hasUnsetConfigDir = true
+		}
+	}
+	if !hasUnsetConfigDir {
+		t.Fatalf("Claude print-env must unset CLAUDE_CONFIG_DIR: %v", lines)
+	}
+}
+
+// TestSpawnEnvAgentView proves the Claude Agent View disable policy (#49):
+// CLAUDE_CODE_DISABLE_AGENT_VIEW=1 is injected by default for every shallow
+// session, suppressed by --allow-agent-view (allowAgentView) and by a
+// pre-existing user CLAUDE_CODE_DISABLE_AGENT_VIEW (disableAgentViewSet).
 func TestSpawnEnvAgentView(t *testing.T) {
 	const key = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 	home := "/orch/p"
 
-	// Default claude session: disable flag injected.
+	// Default Claude session: disable flag injected.
 	set, _ := SpawnEnv("claude", home, "p", false, false)
 	if set[key] != "1" {
 		t.Fatalf("default claude must inject %s=1, got %q", key, set[key])
@@ -441,16 +521,20 @@ func TestSpawnEnvAgentView(t *testing.T) {
 		t.Fatalf("pre-set %s must NOT be overridden, got %q", key, set[key])
 	}
 
-	// Non-claude providers have no Agent View feature — never inject, regardless
-	// of the flags.
+	// The guard is shallow-session-wide, not profile-provider-specific, because a
+	// user can spawn a shell from any profile and launch claude later.
 	for _, provider := range []string{"codex", "agy"} {
-		for _, allow := range []bool{false, true} {
-			for _, preset := range []bool{false, true} {
-				set, _ := SpawnEnv(provider, home, "p", allow, preset)
-				if _, ok := set[key]; ok {
-					t.Fatalf("%s must never inject %s (allow=%v preset=%v)", provider, key, allow, preset)
-				}
-			}
+		set, _ := SpawnEnv(provider, home, "p", false, false)
+		if set[key] != "1" {
+			t.Fatalf("%s default shallow session must inject %s=1, got %v", provider, key, set)
+		}
+		set, _ = SpawnEnv(provider, home, "p", true, false)
+		if _, ok := set[key]; ok {
+			t.Fatalf("%s --allow-agent-view must not inject %s, got %v", provider, key, set)
+		}
+		set, _ = SpawnEnv(provider, home, "p", false, true)
+		if _, ok := set[key]; ok {
+			t.Fatalf("%s pre-set %s must not be overridden, got %v", provider, key, set)
 		}
 	}
 }

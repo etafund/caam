@@ -207,15 +207,19 @@ var repointingEnvVars = []string{
 	"GEMINI_HOME",       // Gemini/Antigravity: overrides ~/.gemini
 }
 
-// credentialOverrideEnvVars: env credentials that take PRECEDENCE over a harness's
-// subscription/on-disk auth. Deleted by default so a shallow profile uses its
-// vaulted identity. A user who really wants env-key auth injects it past caam:
+// credentialOverrideEnvVars: env credentials and provider selectors that take
+// PRECEDENCE over a harness's subscription/on-disk auth. Deleted by default so
+// a shallow profile uses its vaulted identity. A user who really wants env-key
+// auth injects it past caam:
 //
 //	caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 var credentialOverrideEnvVars = []string{
 	"OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", // Codex API-key / token auth
 	"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", // Claude API-key / token
-	"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", // Claude cloud-provider auth selectors
+	"ANTHROPIC_AWS_API_KEY", "ANTHROPIC_AWS_WORKSPACE_ID", "ANTHROPIC_WORKSPACE_ID", "AWS_BEARER_TOKEN_BEDROCK", // Claude AWS/auth context
+	"ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_FOUNDRY_BASE_URL", // Claude Foundry auth context
+	"ANTHROPIC_VERTEX_PROJECT_ID", "ANTHROPIC_VERTEX_BASE_URL", "GCLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS", // Claude Vertex auth context
+	"CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_USE_MANTLE", // Claude cloud-provider auth selectors
 }
 
 // caamDiscoveryEnvVars: caam's OWN direct locator vars. Stripped so a cooperative
@@ -255,11 +259,17 @@ func (l Layout) SpawnEnv(home, name string, env map[string]string) {
 
 // SpawnEnv returns the environment transform for a provider without mutating an
 // inherited env map. It shares the same cleared-var policy as Layout.SpawnEnv
-// and adds the Claude Agent View guard used by shallow-spawn.
+// and adds the Claude Agent View guard used by shallow-spawn. The Agent View
+// guard is shallow-session-wide rather than provider-specific because users can
+// spawn a shell under any profile and launch claude from there.
 func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet bool) (map[string]string, []string) {
 	set := map[string]string{
 		"HOME":            home,
 		"SHALLOW_PROFILE": name,
+	}
+
+	if !allowAgentView && !disableAgentViewSet {
+		set["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
 	}
 
 	normalized, err := NormalizeProvider(provider)
@@ -268,9 +278,6 @@ func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet b
 			for _, kv := range layout.ProviderEnvSet(home) {
 				set[kv.Key] = kv.Value
 			}
-		}
-		if normalized == ProviderClaude && !allowAgentView && !disableAgentViewSet {
-			set["CLAUDE_CODE_DISABLE_AGENT_VIEW"] = "1"
 		}
 	}
 
@@ -287,11 +294,12 @@ func SpawnEnv(provider, home, name string, allowAgentView, disableAgentViewSet b
 	return set, scrub
 }
 
-// SpawnEnvLines renders the spawn env as POSIX-shell statements for --print-env:
-// `export KEY='<quoted>'` for each set var (HOME, SHALLOW_PROFILE, provider sets),
-// then `unset KEY` for each cleared var not re-set. Values are shell-quoted, and
-// `export` (not bare KEY=VALUE) guarantees child processes inherit them. Shares the
-// cleared/set logic with SpawnEnv (single source of truth).
+// SpawnEnvLines renders this layout's base env transform as POSIX-shell
+// statements: `export KEY='<quoted>'` for each set var (HOME, SHALLOW_PROFILE,
+// provider sets), then `unset KEY` for each cleared var not re-set. Values are
+// shell-quoted, and `export` (not bare KEY=VALUE) guarantees child processes
+// inherit them. Command-level policies such as Claude's Agent View guard live in
+// the provider-aware SpawnEnv helper used by shallow-spawn.
 func (l Layout) SpawnEnvLines(home, name string) []string {
 	set := map[string]bool{}
 	var lines []string
