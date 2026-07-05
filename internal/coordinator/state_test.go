@@ -157,6 +157,73 @@ func TestDetectState(t *testing.T) {
 	}
 }
 
+func TestDetectStateRateLimitSignals(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{
+			name:   "machine rate_limit_exceeded",
+			output: `{"type":"rate_limit_error","code":"rate_limit_exceeded"}`,
+		},
+		{
+			name:   "rate limit error class",
+			output: "RateLimitError: retry later",
+		},
+		{
+			name:   "usage limit exceeded machine string",
+			output: "usage_limit_exceeded",
+		},
+		{
+			name:   "contextual http 429",
+			output: "HTTP 429 Too Many Requests, try again later",
+		},
+		{
+			name:   "contextual too many requests",
+			output: "Request failed: Too Many Requests, slow down",
+		},
+		{
+			name:   "capacity saturation",
+			output: "Claude is over capacity, please try again later.",
+		},
+		{
+			name:   "quota exceeded",
+			output: "Quota exceeded for this model.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state, _ := DetectState(tt.output)
+			if state != StateRateLimited {
+				t.Fatalf("DetectState() = %v, want %v", state, StateRateLimited)
+			}
+		})
+	}
+}
+
+func TestDetectStateRateLimitFalsePositiveProse(t *testing.T) {
+	tests := []string{
+		"Refactor the rate limiter implementation and add tests.",
+		"Document API rate limits in the README.",
+		"Unit test fixture for HTTP 429 responses.",
+		"HTTP 429 Too Many Requests fixture for integration tests.",
+		"Too Many Requests docs page.",
+		"Capacity planning notes: add two more workers next week.",
+		"The metadata capacity fields are optional.",
+		"Loaded quota configuration from project settings.",
+	}
+
+	for _, output := range tests {
+		t.Run(output, func(t *testing.T) {
+			state, _ := DetectState(output)
+			if state != StateIdle {
+				t.Fatalf("DetectState() = %v, want %v", state, StateIdle)
+			}
+		})
+	}
+}
+
 func TestDetectStateMetadata(t *testing.T) {
 	// Test that reset time is extracted from rate limit message
 	output := "You've hit your limit. This resets 2pm (America/New_York)"

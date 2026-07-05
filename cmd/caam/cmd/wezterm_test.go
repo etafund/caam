@@ -49,6 +49,73 @@ func TestMatchWeztermPaneRateLimit(t *testing.T) {
 	}
 }
 
+func TestMatchWeztermPaneRateLimitSignals(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{
+			name: "machine rate_limit_exceeded",
+			text: `{"code":"rate_limit_exceeded","message":"try again later"}`,
+		},
+		{
+			name: "rate limit error class",
+			text: "RateLimitError: retry later",
+		},
+		{
+			name: "gemini camel quota exceeded",
+			text: `reason: "quotaExceeded"`,
+		},
+		{
+			name: "resource exhausted",
+			text: "RESOURCE_EXHAUSTED: quota exhausted",
+		},
+		{
+			name: "contextual http 429",
+			text: "HTTP 429 Too Many Requests, try again later",
+		},
+		{
+			name: "contextual too many requests",
+			text: "Request failed: Too Many Requests, slow down",
+		},
+		{
+			name: "claude capacity saturation",
+			text: "Claude is over capacity, please try again later.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			match := matchWeztermPane("cursor", tt.text, nil)
+			if !match.Matched || match.Reason != "rate_limit" {
+				t.Fatalf("expected rate limit match, got: %+v", match)
+			}
+		})
+	}
+}
+
+func TestMatchWeztermPaneRateLimitFalsePositiveProse(t *testing.T) {
+	tests := []string{
+		"Refactor the rate limiter implementation and add tests.",
+		"Document API rate limits in the README.",
+		"Unit test fixture for HTTP 429 responses.",
+		"HTTP 429 Too Many Requests fixture for integration tests.",
+		"Too Many Requests docs page.",
+		"Capacity planning notes: add two more workers next week.",
+		"Loaded quota limit configuration from project settings.",
+		"The metadata capacity fields are optional.",
+	}
+
+	for _, text := range tests {
+		t.Run(text, func(t *testing.T) {
+			match := matchWeztermPane("cursor", text, nil)
+			if match.Matched {
+				t.Fatalf("expected no match, got: %+v", match)
+			}
+		})
+	}
+}
+
 func TestMatchWeztermPaneToolMarker(t *testing.T) {
 	match := matchWeztermPane("claude", "Claude Code session", nil)
 	if !match.Matched || match.Reason != "tool_marker" {

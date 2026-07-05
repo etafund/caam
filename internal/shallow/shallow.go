@@ -860,6 +860,33 @@ type CreateOptions struct {
 	Force bool
 }
 
+// RepairOptions controls conservative metadata repair for legacy shallow
+// profiles. Provider is optional: when absent, repair only proceeds if the
+// recorded legacy metadata or the profile's on-disk shape identifies exactly one
+// supported provider.
+type RepairOptions struct {
+	Provider string
+	DryRun   bool
+}
+
+// RepairResult describes one metadata repair decision.
+type RepairResult struct {
+	Name     string
+	Path     string
+	Provider string
+	Changed  bool
+	DryRun   bool
+	Reason   string
+}
+
+// RenameResult describes a shallow profile rename.
+type RenameResult struct {
+	OldName string
+	NewName string
+	OldPath string
+	NewPath string
+}
+
 // Create provisions a new shallow profile.
 //
 // Create is crash- and failure-safe with respect to an existing profile of the
@@ -948,6 +975,209 @@ func (m *Manager) Create(name string, opts CreateOptions) (string, error) {
 		return "", err
 	}
 	return home, nil
+}
+
+// RepairMetadata backfills or normalizes a shallow profile's metadata sidecar
+// without rebuilding the profile or touching credentials. It preserves
+// fail-closed provider semantics: provider inference must be exact, otherwise
+// callers must pass RepairOptions.Provider explicitly.
+func (m *Manager) RepairMetadata(name string, opts RepairOptions) (RepairResult, error) {
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return RepairResult{}, err
+	}
+	res := RepairResult{Name: name, Path: home, DryRun: opts.DryRun}
+
+	st, err := os.Lstat(home)
+	if err != nil {
+		return res, err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return res, fmt.Errorf("shallow profile %q is a symlink; refusing (potential identity hijack)", name)
+	}
+	if !st.IsDir() {
+		return res, fmt.Errorf("%s is not a directory", home)
+	}
+	if m.wouldRemoveRealHome(home) {
+		return res, fmt.Errorf("refusing to use %q as a shallow profile home: it contains your real HOME directory (%q)", home, m.realHome)
+	}
+
+	meta, metaErr := readMetaRaw(home)
+	if metaErr == nil && meta != nil && strings.TrimSpace(meta.RealHome) != "" {
+		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+			return res, err
+		}
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(opts.Provider))
+	if provider != "" {
+		p, err := NormalizeProvider(provider)
+		if err != nil {
+			return res, err
+		}
+		provider = p
+	} else if metaErr == nil && meta != nil {
+		if p := meta.ResolvedProvider(); p != "" {
+			if _, err := LayoutForProvider(p); err != nil {
+				return res, fmt.Errorf("recorded provider %q is unsupported; pass --provider to repair explicitly", p)
+			}
+			provider = p
+		}
+	}
+	if provider == "" {
+		p, err := m.inferProviderFromShape(name)
+		if err != nil {
+			return res, err
+		}
+		provider = p
+	}
+	res.Provider = provider
+
+	layout, err := LayoutForProvider(provider)
+	if err != nil {
+		return res, err
+	}
+	if err := m.validateProfileShapeCore(name, layout, false); err != nil {
+		return res, err
+	}
+
+	now := time.Now().UTC()
+	next := Meta{Name: name, Provider: provider, CreatedAt: now, RealHome: m.realHome, Version: 2}
+	reason := "metadata normalized"
+	if metaErr == nil && meta != nil {
+		next.CreatedAt = meta.CreatedAt
+		if next.CreatedAt.IsZero() {
+			next.CreatedAt = now
+		}
+		next.CredentialFrom = meta.CredentialFrom
+		if strings.TrimSpace(meta.Provider) == "" {
+			reason = "provider backfilled"
+		} else if meta.Provider != provider {
+			reason = "provider normalized"
+		} else if meta.Name != name {
+			reason = "profile name normalized"
+		} else if strings.TrimSpace(meta.RealHome) == "" {
+			reason = "recorded HOME backfilled"
+		}
+	} else {
+		if errors.Is(metaErr, os.ErrNotExist) {
+			reason = "metadata created"
+		} else {
+			reason = "malformed metadata replaced"
+		}
+	}
+
+	changed := metaErr != nil || meta == nil ||
+		meta.Name != next.Name ||
+		meta.Provider != next.Provider ||
+		!meta.CreatedAt.Equal(next.CreatedAt) ||
+		meta.CredentialFrom != next.CredentialFrom ||
+		filepath.Clean(meta.RealHome) != filepath.Clean(next.RealHome) ||
+		meta.Version != next.Version
+	res.Changed = changed
+	res.Reason = reason
+	if !changed {
+		res.Reason = "metadata already healthy"
+		return res, nil
+	}
+	if opts.DryRun {
+		return res, nil
+	}
+	if err := writeMeta(home, &next); err != nil {
+		return res, fmt.Errorf("write repaired metadata: %w", err)
+	}
+	return res, nil
+}
+
+func (m *Manager) inferProviderFromShape(name string) (string, error) {
+	var matches []string
+	for _, provider := range SupportedProviders() {
+		layout, err := LayoutForProvider(provider)
+		if err != nil {
+			continue
+		}
+		if err := m.validateProfileShapeCore(name, layout, false); err == nil {
+			matches = append(matches, provider)
+		}
+	}
+	switch len(matches) {
+	case 1:
+		return matches[0], nil
+	case 0:
+		return "", fmt.Errorf("cannot infer provider for shallow profile %q from its on-disk shape; pass --provider (%s)", name, supportedList())
+	default:
+		return "", fmt.Errorf("cannot infer provider for shallow profile %q: shape matches multiple providers (%s); pass --provider", name, strings.Join(matches, ", "))
+	}
+}
+
+// Rename moves a shallow profile directory to a new name and rewrites the
+// metadata Name field. It refuses malformed/unreadable metadata so callers can
+// repair first instead of moving an unverifiable profile.
+func (m *Manager) Rename(oldName, newName string) (RenameResult, error) {
+	oldPath, err := m.HomeFor(oldName)
+	if err != nil {
+		return RenameResult{}, err
+	}
+	newPath, err := m.HomeFor(newName)
+	if err != nil {
+		return RenameResult{}, err
+	}
+	res := RenameResult{OldName: oldName, NewName: newName, OldPath: oldPath, NewPath: newPath}
+	if oldName == newName {
+		return res, fmt.Errorf("old and new shallow profile names are identical")
+	}
+
+	st, err := os.Lstat(oldPath)
+	if err != nil {
+		return res, err
+	}
+	if st.Mode()&os.ModeSymlink != 0 {
+		return res, fmt.Errorf("shallow profile %q is a symlink; refusing (potential identity hijack)", oldName)
+	}
+	if !st.IsDir() {
+		return res, fmt.Errorf("%s is not a directory", oldPath)
+	}
+	if m.wouldRemoveRealHome(oldPath) || m.wouldRemoveRealHome(newPath) {
+		return res, fmt.Errorf("refusing rename involving a path that contains your real HOME directory (%q)", m.realHome)
+	}
+	if _, err := os.Lstat(newPath); err == nil {
+		return res, fmt.Errorf("shallow profile %q already exists at %s", newName, newPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return res, fmt.Errorf("stat destination profile: %w", err)
+	}
+	if err := m.assertIsShallowProfile(oldPath); err != nil {
+		return res, err
+	}
+	meta, err := readMetaRaw(oldPath)
+	if err != nil {
+		return res, fmt.Errorf("read metadata: %w", err)
+	}
+	if err := m.assertProfileRealHomeMatches(meta, oldPath); err != nil {
+		return res, err
+	}
+	provider := meta.ResolvedProvider()
+	if provider == "" {
+		return res, fmt.Errorf("shallow profile %q has no recorded provider; repair it before renaming", oldName)
+	}
+	layout, err := LayoutForProvider(provider)
+	if err != nil {
+		return res, err
+	}
+	if err := m.ValidateProfileShape(oldName, layout); err != nil {
+		return res, err
+	}
+
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return res, fmt.Errorf("rename shallow profile: %w", err)
+	}
+	meta.Name = newName
+	if err := writeMeta(newPath, meta); err != nil {
+		if rbErr := os.Rename(newPath, oldPath); rbErr != nil {
+			return res, fmt.Errorf("rewrite metadata after rename: %w (rollback failed: %v)", err, rbErr)
+		}
+		return res, fmt.Errorf("rewrite metadata after rename: %w (original profile restored)", err)
+	}
+	return res, nil
 }
 
 func (m *Manager) buildProfile(home, name string, layout Layout, opts CreateOptions) error {
@@ -1974,6 +2204,32 @@ func (m *Manager) assertIsShallowProfile(home string) error {
 //     symlinked ancestor; each OPTIONAL credential, IF present, the same;
 //   - the metadata sidecar is a real regular file.
 func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
+	if err := m.validateProfileShapeCore(name, layout, true); err != nil {
+		return err
+	}
+	home, err := m.HomeFor(name)
+	if err != nil {
+		return err
+	}
+
+	// FIX 2 (HOME binding): refuse a profile whose recorded RealHome differs from
+	// the HOME this manager is running under. spawn AND doctor both route through
+	// here, so this stops a harness being spawned into a profile that was built for
+	// a DIFFERENT $HOME (its symlink farm points back at the OTHER HOME's real
+	// files). A correctly-created profile records the matching RealHome → no-op.
+	// Fail closed: a present-but-unreadable sidecar can't be verified, so refuse
+	// (spawn/doctor must not run a harness against an unverifiable profile).
+	meta, merr := readMeta(home)
+	if merr != nil {
+		return fmt.Errorf("shallow profile %q has unreadable metadata (%w); recreate it", name, merr)
+	}
+	if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) validateProfileShapeCore(name string, layout Layout, checkMetadata bool) error {
 	home, err := m.HomeFor(name)
 	if err != nil {
 		return err
@@ -2046,23 +2302,10 @@ func (m *Manager) ValidateProfileShape(name string, layout Layout) error {
 			return err
 		}
 	}
-	if err := checkRealFile("metadata "+ProfileMetaFilename, filepath.Join(home, ProfileMetaFilename)); err != nil {
-		return err
-	}
-
-	// FIX 2 (HOME binding): refuse a profile whose recorded RealHome differs from
-	// the HOME this manager is running under. spawn AND doctor both route through
-	// here, so this stops a harness being spawned into a profile that was built for
-	// a DIFFERENT $HOME (its symlink farm points back at the OTHER HOME's real
-	// files). A correctly-created profile records the matching RealHome → no-op.
-	// Fail closed: a present-but-unreadable sidecar can't be verified, so refuse
-	// (spawn/doctor must not run a harness against an unverifiable profile).
-	meta, merr := readMeta(home)
-	if merr != nil {
-		return fmt.Errorf("shallow profile %q has unreadable metadata (%w); recreate it", name, merr)
-	}
-	if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
-		return err
+	if checkMetadata {
+		if err := checkRealFile("metadata "+ProfileMetaFilename, filepath.Join(home, ProfileMetaFilename)); err != nil {
+			return err
+		}
 	}
 
 	// FIX 2: reject stale/compromised FOREIGN provider auth roots. populateSymlinks
@@ -2366,13 +2609,13 @@ func (m *Manager) Delete(name string) error {
 	// FIX 2: bind the profile to the HOME it was created under. A delete run with a
 	// DIFFERENT $HOME (so m.realHome differs from the profile's recorded RealHome)
 	// would have compared the real-HOME guards above against the WRONG realHome;
-	// refuse rather than risk deleting real data that belongs to another HOME. A
-	// nil/malformed sidecar leaves meta==nil → this guard is a no-op (the
-	// assertIsShallowProfile sidecar check already gated the destructive path).
-	if meta, err := readMeta(home); err == nil {
-		if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
-			return err
-		}
+	// refuse rather than risk deleting real data that belongs to another HOME.
+	meta, err := readMeta(home)
+	if err != nil {
+		return fmt.Errorf("shallow profile %q has unreadable metadata (%w); refusing to delete", name, err)
+	}
+	if err := m.assertProfileRealHomeMatches(meta, home); err != nil {
+		return err
 	}
 	return os.RemoveAll(home)
 }
@@ -2534,6 +2777,15 @@ func writeMeta(home string, m *Meta) error {
 }
 
 func readMeta(home string) (*Meta, error) {
+	m, err := readMetaRaw(home)
+	if err != nil {
+		return nil, err
+	}
+	m.Provider = m.ResolvedProvider()
+	return m, nil // Provider is taken verbatim; may be "" or unknown for a hand-edited sidecar
+}
+
+func readMetaRaw(home string) (*Meta, error) {
 	data, err := os.ReadFile(filepath.Join(home, ProfileMetaFilename))
 	if err != nil {
 		return nil, err
@@ -2542,8 +2794,7 @@ func readMeta(home string) (*Meta, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, err
 	}
-	m.Provider = m.ResolvedProvider()
-	return &m, nil // Provider is taken verbatim; may be "" or unknown for a hand-edited sidecar
+	return &m, nil
 }
 
 // ResolvedProvider returns the metadata provider when set, otherwise infers it from

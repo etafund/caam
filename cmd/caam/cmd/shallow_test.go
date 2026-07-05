@@ -133,9 +133,27 @@ func newShallowTestRoot() *cobra.Command {
 	}
 	doctor.Flags().Bool("json", false, "")
 
+	repair := &cobra.Command{
+		Use:  "repair [name]",
+		Args: shallowProfileRepairCmd.Args,
+		RunE: shallowProfileRepairCmd.RunE,
+	}
+	repair.Flags().String("provider", "", "")
+	repair.Flags().Bool("all", false, "")
+	repair.Flags().Bool("dry-run", false, "")
+	repair.Flags().Bool("json", false, "")
+
+	rename := &cobra.Command{
+		Use:  "rename <old-name> <new-name>",
+		Args: shallowProfileRenameCmd.Args,
+		RunE: shallowProfileRenameCmd.RunE,
+	}
+	rename.Flags().Bool("dry-run", false, "")
+	rename.Flags().Bool("json", false, "")
+
 	parent := &cobra.Command{Use: "shallow-profile"}
 	parent.PersistentFlags().String("base", "", "")
-	parent.AddCommand(create, list, del, doctor)
+	parent.AddCommand(create, list, del, doctor, repair, rename)
 
 	spawn := &cobra.Command{
 		Use:  "shallow-spawn <name> -- <cmd>",
@@ -232,6 +250,72 @@ func TestShallowCreateAndList_JSON(t *testing.T) {
 	}
 	if listResp.BaseDir != base {
 		t.Fatalf("listed BaseDir %q != %q", listResp.BaseDir, base)
+	}
+}
+
+func TestShallowCreateFromVaultGeneratesDefaultNameJSON(t *testing.T) {
+	tests := []struct {
+		provider  string
+		profile   string
+		vaultFile string
+		wantName  string
+	}{
+		{provider: "claude", profile: "arthur@example.com", vaultFile: ".credentials.json", wantName: "cc-arthur"},
+		{provider: "codex", profile: "bob.smith+work@example.com", vaultFile: "auth.json", wantName: "codex-bob-smith-work"},
+		{provider: "agy", profile: "Carol Smith", vaultFile: "antigravity-oauth-token", wantName: "agy-carol-smith"},
+		{provider: "claude", profile: "!!!@example.com", vaultFile: ".credentials.json", wantName: "cc-profile"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.provider+"/"+tt.profile, func(t *testing.T) {
+			_, _ = shallowEnv(t)
+			stageVaultFile(t, tt.provider, tt.profile, tt.vaultFile, `{}`)
+			stdout, stderr, err := runCmdCaptured(t, "shallow-profile", "create",
+				"--from-vault", tt.provider+"/"+tt.profile, "--json")
+			if err != nil {
+				t.Fatalf("create: %v stderr=%q stdout=%q", err, stderr, stdout)
+			}
+			var out shallowCreateOutput
+			if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+				t.Fatalf("unmarshal create JSON %q: %v", stdout, err)
+			}
+			if out.Name != tt.wantName || out.Provider != tt.provider {
+				t.Fatalf("create output name/provider = %q/%q, want %q/%q", out.Name, out.Provider, tt.wantName, tt.provider)
+			}
+			if stderr != "" {
+				t.Fatalf("generated-name create should not warn, got stderr %q", stderr)
+			}
+		})
+	}
+}
+
+func TestShallowCreateExplicitEmailNameHintsHumanOnly(t *testing.T) {
+	_, _ = shallowEnv(t)
+	stageVaultFile(t, "claude", "arthur@example.com", ".credentials.json", `{}`)
+
+	stdout, stderr, err := runCmdCaptured(t, "shallow-profile", "create", "arthur@example.com",
+		"--from-vault", "claude/arthur@example.com")
+	if err != nil {
+		t.Fatalf("create: %v stdout=%q stderr=%q", err, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "cc-arthur") || !strings.Contains(stderr, "shallow-profile rename arthur@example.com cc-arthur") {
+		t.Fatalf("expected conventional-name hint on stderr, got %q", stderr)
+	}
+
+	stageVaultFile(t, "claude", "bob@example.com", ".credentials.json", `{}`)
+	_, stderr, err = runCmdCaptured(t, "shallow-profile", "create", "bob@example.com",
+		"--from-vault", "claude/bob@example.com", "--json")
+	if err != nil {
+		t.Fatalf("json create: %v stderr=%q", err, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("json create should suppress hint, got %q", stderr)
+	}
+}
+
+func TestShallowCreateRequiresNameWithoutFromVault(t *testing.T) {
+	_, _ = shallowEnv(t)
+	if stdout, stderr, err := runCmdCaptured(t, "shallow-profile", "create", "--json"); err == nil {
+		t.Fatalf("expected create without name/from-vault to fail, stdout=%q stderr=%q", stdout, stderr)
 	}
 }
 
@@ -921,12 +1005,19 @@ func TestShallowSpawnAgyStripsLeakyEnv(t *testing.T) {
 // TestShallowListIncludesProvider verifies the list JSON reports each profile's
 // provider.
 func TestShallowListIncludesProvider(t *testing.T) {
-	_, _ = shallowEnv(t)
+	base, _ := shallowEnv(t)
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "cbob",
 		"--tool", "codex", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "broken", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "broken", ".caam-shallow.json"),
+		[]byte(`{"name":"broken","real_home":"`+filepath.Dir(base)+`","version":2}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	stdout, _, err := runCmdCaptured(t, "shallow-profile", "list", "--json")
@@ -935,8 +1026,11 @@ func TestShallowListIncludesProvider(t *testing.T) {
 	}
 	var resp struct {
 		Profiles []struct {
-			Name     string `json:"name"`
-			Provider string `json:"provider"`
+			Name         string `json:"name"`
+			Provider     string `json:"provider"`
+			Healthy      bool   `json:"healthy"`
+			Code         string `json:"code"`
+			SuggestedFix string `json:"suggested_fix"`
 		} `json:"profiles"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
@@ -952,6 +1046,15 @@ func TestShallowListIncludesProvider(t *testing.T) {
 	if got["cbob"] != "codex" {
 		t.Fatalf("cbob provider %q != codex (%q)", got["cbob"], stdout)
 	}
+	for _, p := range resp.Profiles {
+		if p.Name == "broken" {
+			if p.Healthy || p.Code != "missing_provider_metadata" || !strings.Contains(p.SuggestedFix, "shallow-profile repair broken") {
+				t.Fatalf("broken recovery fields = %+v", p)
+			}
+			return
+		}
+	}
+	t.Fatalf("broken profile missing from list JSON: %q", stdout)
 }
 
 // TestShallowCreateManagedFilesJSON asserts the create JSON managed_files list
@@ -1346,6 +1449,102 @@ func equalStringSlices(a, b []string) bool {
 	return true
 }
 
+func TestShallowRepairJSONBackfillsMetadataAndDoctorPasses(t *testing.T) {
+	base, realHome := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacy", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "legacy", ".caam-shallow.json"),
+		[]byte(`{"name":"legacy","real_home":"`+realHome+`","version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "repair", "legacy", "--json")
+	if err != nil {
+		t.Fatalf("repair: %v stdout=%q", err, stdout)
+	}
+	var repair shallowRepairOutput
+	if err := json.Unmarshal([]byte(stdout), &repair); err != nil {
+		t.Fatalf("unmarshal repair JSON %q: %v", stdout, err)
+	}
+	if !repair.Success || len(repair.Profiles) != 1 || !repair.Profiles[0].Changed || repair.Profiles[0].Provider != "claude" {
+		t.Fatalf("repair output = %+v", repair)
+	}
+	if stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "legacy"); err != nil {
+		t.Fatalf("doctor after repair: %v stdout=%q", err, stdout)
+	}
+}
+
+func TestShallowRepairDryRunLeavesDoctorUnhealthy(t *testing.T) {
+	base, realHome := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "legacy", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "legacy", ".caam-shallow.json"),
+		[]byte(`{"name":"legacy","real_home":"`+realHome+`","version":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "repair", "legacy", "--dry-run", "--json")
+	if err != nil {
+		t.Fatalf("repair dry-run: %v stdout=%q", err, stdout)
+	}
+	var repair shallowRepairOutput
+	if err := json.Unmarshal([]byte(stdout), &repair); err != nil {
+		t.Fatalf("unmarshal repair JSON %q: %v", stdout, err)
+	}
+	if !repair.Profiles[0].Changed || !repair.Profiles[0].DryRun {
+		t.Fatalf("repair dry-run output = %+v", repair)
+	}
+	stdout, _, err = runCmdCaptured(t, "shallow-profile", "doctor", "legacy", "--json")
+	if err == nil {
+		t.Fatalf("doctor should still fail after dry-run repair, stdout=%q", stdout)
+	}
+}
+
+func TestShallowRenameJSONMovesProfileAndDoctorPasses(t *testing.T) {
+	base, _ := shallowEnv(t)
+	if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "alice", "--json"); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "rename", "alice", "cc-alice", "--json")
+	if err != nil {
+		t.Fatalf("rename: %v stdout=%q", err, stdout)
+	}
+	var out shallowRenameOutput
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("unmarshal rename JSON %q: %v", stdout, err)
+	}
+	if !out.Success || out.OldName != "alice" || out.NewName != "cc-alice" {
+		t.Fatalf("rename output = %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(base, "alice")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old profile path should be gone, got %v", err)
+	}
+	if stdout, _, err := runCmdCaptured(t, "shallow-profile", "doctor", "cc-alice"); err != nil {
+		t.Fatalf("doctor renamed profile: %v stdout=%q", err, stdout)
+	}
+}
+
+func TestShallowRenameRejectsDestinationExistsJSON(t *testing.T) {
+	_, _ = shallowEnv(t)
+	for _, name := range []string{"alice", "cc-alice"} {
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", name, "--json"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stdout, _, err := runCmdCaptured(t, "shallow-profile", "rename", "alice", "cc-alice", "--json")
+	if err == nil {
+		t.Fatalf("expected destination-exists rename error, stdout=%q", stdout)
+	}
+	var out shallowRenameOutput
+	if uerr := json.Unmarshal([]byte(stdout), &out); uerr != nil {
+		t.Fatalf("unmarshal rename error JSON %q: %v", stdout, uerr)
+	}
+	if out.Success || !strings.Contains(out.Error, "already exists") {
+		t.Fatalf("rename error output = %+v", out)
+	}
+}
+
 // TestShallowDoctorHealthy creates a codex profile and asserts doctor reports it
 // healthy and exits zero.
 func TestShallowDoctorHealthy(t *testing.T) {
@@ -1404,6 +1603,9 @@ func TestShallowDoctorMalformedMeta(t *testing.T) {
 	if !strings.Contains(stdout, "malformed") || !strings.Contains(stdout, "no recorded provider") {
 		t.Fatalf("expected malformed/no-recorded-provider message, got %q", stdout)
 	}
+	if !strings.Contains(stdout, "fix: caam shallow-profile repair nometa --provider <tool>") {
+		t.Fatalf("expected repair hint, got %q", stdout)
+	}
 
 	// Legacy metadata with no explicit provider but a valid legacy credential label
 	// should be inferred as Claude and pass doctor.
@@ -1447,9 +1649,11 @@ func TestShallowDoctorJSON(t *testing.T) {
 	var resp struct {
 		Healthy  bool `json:"healthy"`
 		Profiles []struct {
-			Name    string `json:"name"`
-			Healthy bool   `json:"healthy"`
-			Error   string `json:"error"`
+			Name         string `json:"name"`
+			Healthy      bool   `json:"healthy"`
+			Code         string `json:"code"`
+			Error        string `json:"error"`
+			SuggestedFix string `json:"suggested_fix"`
 		} `json:"profiles"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &resp); err != nil {
@@ -1458,15 +1662,26 @@ func TestShallowDoctorJSON(t *testing.T) {
 	if resp.Healthy {
 		t.Fatalf("expected overall healthy=false, got %q", stdout)
 	}
-	byName := map[string]bool{}
+	byName := map[string]struct {
+		healthy      bool
+		code         string
+		suggestedFix string
+	}{}
 	for _, p := range resp.Profiles {
-		byName[p.Name] = p.Healthy
+		byName[p.Name] = struct {
+			healthy      bool
+			code         string
+			suggestedFix string
+		}{healthy: p.Healthy, code: p.Code, suggestedFix: p.SuggestedFix}
 	}
-	if !byName["good"] {
+	if !byName["good"].healthy {
 		t.Fatalf("expected 'good' healthy=true, got %q", stdout)
 	}
-	if byName["bad"] {
+	if byName["bad"].healthy {
 		t.Fatalf("expected 'bad' healthy=false, got %q", stdout)
+	}
+	if byName["bad"].code != "invalid_shape" || !strings.Contains(byName["bad"].suggestedFix, "shallow-profile create bad") {
+		t.Fatalf("expected invalid_shape recovery hint for bad, got %+v", byName["bad"])
 	}
 }
 

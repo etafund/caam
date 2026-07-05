@@ -27,30 +27,35 @@ const (
 
 // DefaultPatterns returns the default rate limit patterns for each provider.
 func DefaultPatterns() map[Provider][]string {
+	rateLimitSignal := `(?i)(?:\brate[-_. ]?limit(?:[-_ ]?(?:ed|exceeded|error|hit|reached))\b|\brateLimit(?:ed|Exceeded|Error|Hit|Reached)\b|\b(?:error|failed|failure):?\s+rate[-_. ]?limit\b)`
+	usageLimitSignal := `(?i)(?:\busage[-_. ]?limit(?:[-_ ]?(?:ed|exceeded|error|hit|reached))\b|\busageLimit(?:ed|Exceeded|Error|Hit|Reached)\b|\b(?:error|failed|failure):?\s+usage[-_. ]?limit\b)`
+	status429Signal := `(?i)(?:\b(?:status|error|code)["']?\s*:?\s*429\b.{0,60}\b(?:too[-_. ]?many[-_. ]?requests|rate[-_. ]?limit|quota|try again|retry)\b|(?:^|[\[{(:]\s*)(?:http\s+)?429\b.{0,60}\btoo[-_. ]?many[-_. ]?requests\b.{0,40}\b(?:try again|retry later|temporarily unavailable|temporarily blocked|slow down)\b)`
+	tooManyRequestsSignal := `(?i)(?:\b(?:error|failed|failure|request failed):?\s+too[-_. ]?many[-_. ]?requests\b|\btoo[-_. ]?many[-_. ]?requests\b.{0,40}\b(?:try again|retry later|temporarily unavailable|temporarily blocked|slow down)\b)`
 	return map[Provider][]string{
 		ProviderClaude: {
-			`(?i)rate.?limit`,
-			`(?i)usage.?limit`,
-			`(?i)capacity`,
-			`\b429\b`,
-			`(?i)too.?many.?requests`,
-			`(?i)exceeded.*quota`,
-			`(?i)quota.*exceeded`,
+			rateLimitSignal,
+			usageLimitSignal,
+			`(?i)\byou(?:'|’)?ve hit your limit\b`,
+			`(?i)\blimit\b.{0,60}\breset(?:s|ting)?\b`,
+			`(?i)(?:\b(?:over|at|exceeded|reached)\b.{0,40}\bcapacity\b|\btemporarily\s+at\b.{0,40}\bcapacity\b|\bcapacity\b.{0,40}\b(?:try again|unavailable|exceeded|reached)\b)`,
+			status429Signal,
+			tooManyRequestsSignal,
+			`(?i)exceeded.{0,40}quota`,
+			`(?i)quota.{0,40}exceeded`,
 		},
 		ProviderCodex: {
-			`(?i)rate.?limit`,
+			rateLimitSignal,
 			`(?i)quota.?exceeded`,
-			`\b429\b`,
-			`(?i)too.?many.?requests`,
-			`(?i)exceeded.*rate`,
+			status429Signal,
+			tooManyRequestsSignal,
 			`(?i)slow.?down`,
 		},
 		ProviderGemini: {
 			`(?i)RESOURCE_EXHAUSTED`,
-			`(?i)quota`,
-			`(?i)rate.?limit`,
-			`\b429\b`,
-			`(?i)too.?many.?requests`,
+			`(?i)(?:\bquota[-_ ]?(?:limit[-_ ]?)?(?:exceeded|exhausted|reached)\b|\bquota(?:Limit)?(?:Exceeded|Exhausted|Reached)\b|\b(?:exceeded|exhausted|reached)\b.{0,40}\bquota\b|\bquota\b.{0,40}\b(?:exceeded|exhausted|reached)\b)`,
+			rateLimitSignal,
+			status429Signal,
+			tooManyRequestsSignal,
 		},
 	}
 }
@@ -58,6 +63,7 @@ func DefaultPatterns() map[Provider][]string {
 var (
 	defaultCompiledPatterns map[Provider][]*regexp.Regexp
 	initDefaultsOnce        sync.Once
+	ansiSequenceRE          = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\a]*(?:\a|\x1b\\)`)
 )
 
 func initDefaults() {
@@ -124,6 +130,8 @@ func NewDetector(provider Provider, customPatterns []string) (*Detector, error) 
 // Returns true if a rate limit pattern is detected.
 // The detection is sticky - once detected, it remains true.
 func (d *Detector) Check(text string) bool {
+	text = normalizeDetectorText(text)
+
 	// Fast path: check if already detected using read lock
 	d.mu.RLock()
 	if d.detected {
@@ -152,6 +160,13 @@ func (d *Detector) Check(text string) bool {
 	}
 
 	return false
+}
+
+func normalizeDetectorText(text string) string {
+	text = ansiSequenceRE.ReplaceAllString(text, "")
+	text = strings.ReplaceAll(text, "\r", "")
+	text = strings.Join(strings.Fields(text), " ")
+	return text
 }
 
 // Detected returns whether a rate limit has been detected.
@@ -230,6 +245,10 @@ func (w *ObservingWriter) Write(p []byte) (n int, err error) {
 		if w.callback != nil {
 			w.callback(line)
 		}
+	}
+
+	if len(w.buffer) > 0 {
+		w.detector.Check(string(w.buffer))
 	}
 
 	// Enforce buffer limit to prevent OOM on long lines without newlines

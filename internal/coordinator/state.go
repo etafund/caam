@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -251,7 +252,7 @@ func (t *PaneTracker) ClearAllCooldowns() {
 
 // Patterns for detecting Claude Code states.
 var Patterns = struct {
-	RateLimit        *regexp.Regexp
+	RateLimit        []*regexp.Regexp
 	SelectMethod     *regexp.Regexp
 	OAuthURL         *regexp.Regexp
 	PastePrompt      *regexp.Regexp
@@ -261,8 +262,7 @@ var Patterns = struct {
 	UsageLimitReset  *regexp.Regexp
 	CompactingBanner *regexp.Regexp
 }{
-	// "You've hit your limit · resets 2pm (America/New_York)"
-	RateLimit: regexp.MustCompile(`You've hit your limit.*resets`),
+	RateLimit: compileRateLimitPatterns(ratelimit.ProviderClaude),
 
 	// "Select login method:"
 	SelectMethod: regexp.MustCompile(`Select login method:`),
@@ -289,6 +289,28 @@ var Patterns = struct {
 	// Matches with optional box-drawing characters, middot/bullet separators,
 	// and various whitespace. Also handles "Conversation was compacted" variants.
 	CompactingBanner: regexp.MustCompile(`(?i)Conversation\s+(was\s+)?compacted[\s·•\-\|]*ctrl\+?o`),
+}
+
+func compileRateLimitPatterns(provider ratelimit.Provider) []*regexp.Regexp {
+	defaults := ratelimit.DefaultPatterns()
+	var patterns []*regexp.Regexp
+	for _, pattern := range defaults[provider] {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			panic("compile " + string(provider) + " rate-limit pattern " + pattern + ": " + err.Error())
+		}
+		patterns = append(patterns, re)
+	}
+	return patterns
+}
+
+func matchesAnyRateLimitPattern(patterns []*regexp.Regexp, text string) bool {
+	for _, re := range patterns {
+		if re.MatchString(text) {
+			return true
+		}
+	}
+	return false
 }
 
 // StripANSI removes ANSI escape codes from terminal output for pattern matching.
@@ -342,7 +364,7 @@ func DetectState(output string) (PaneState, map[string]string) {
 	}
 
 	// Check for rate limit last (lowest priority, as it might be in history)
-	if Patterns.RateLimit.MatchString(normalizedOutput) {
+	if matchesAnyRateLimitPattern(Patterns.RateLimit, normalizedOutput) {
 		if match := Patterns.UsageLimitReset.FindStringSubmatch(normalizedOutput); len(match) > 1 {
 			metadata["reset_time"] = match[1]
 		}

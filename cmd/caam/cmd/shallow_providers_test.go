@@ -337,6 +337,61 @@ func TestShallowSpawnCodex(t *testing.T) {
 		}
 	})
 
+	t.Run("misplaced reload-daemon after delimiter is rejected before exec", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+			"--from-vault", "codex/bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		_, calls, spawned := installSeams(t)
+		stdout, stderr, err := runCmdCaptured(t, "shallow-spawn", "codex-bob",
+			"--", "codex", "--reload-daemon", "resume", "abc")
+		if err == nil {
+			t.Fatalf("expected misplaced reload-daemon error, stdout=%q stderr=%q", stdout, stderr)
+		}
+		if *spawned {
+			t.Fatalf("misplaced reload-daemon must fail before exec")
+		}
+		if len(*calls) != 0 {
+			t.Fatalf("misplaced reload-daemon must fail before daemon hook, got %+v", *calls)
+		}
+		if !strings.Contains(err.Error(), "place it before '--'") ||
+			!strings.Contains(err.Error(), "caam shallow-spawn codex-bob --reload-daemon -- codex resume abc") {
+			t.Fatalf("unexpected misplaced reload-daemon error: %v", err)
+		}
+	})
+
+	t.Run("misplaced reload-daemon reports json error", func(t *testing.T) {
+		_, _ = shallowEnv(t)
+		stageVaultFile(t, "codex", "bob", "auth.json", `{}`)
+		if _, _, err := runCmdCaptured(t, "shallow-profile", "create", "codex-bob",
+			"--from-vault", "codex/bob", "--json"); err != nil {
+			t.Fatal(err)
+		}
+
+		_, calls, spawned := installSeams(t)
+		stdout, _, err := runCmdCaptured(t, "shallow-spawn", "codex-bob", "--json",
+			"--", "codex", "--reload-daemon")
+		if err == nil {
+			t.Fatalf("expected misplaced reload-daemon JSON error, stdout=%q", stdout)
+		}
+		if *spawned || len(*calls) != 0 {
+			t.Fatalf("misplaced reload-daemon must fail before side effects; spawned=%v calls=%+v", *spawned, *calls)
+		}
+		var out struct {
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}
+		if uerr := json.Unmarshal([]byte(stdout), &out); uerr != nil {
+			t.Fatalf("unmarshal JSON error %q: %v", stdout, uerr)
+		}
+		if out.Success || !strings.Contains(out.Error, "place it before '--'") {
+			t.Fatalf("unexpected JSON error: %+v", out)
+		}
+	})
+
 	t.Run("non-codex profile accepts flag but skips daemon action", func(t *testing.T) {
 		_, _ = shallowEnv(t)
 		// A claude profile (default provider) with empty credentials.

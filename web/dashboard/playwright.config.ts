@@ -6,7 +6,10 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: process.env.CI ? 1 : undefined,
-  reporter: process.env.CI ? "github" : "html",
+  outputDir: ".playwright-test-results",
+  reporter: process.env.CI
+    ? "github"
+    : [["html", { outputFolder: ".playwright-report", open: "never" }]],
   use: {
     baseURL: "http://localhost:3000",
     trace: "on-first-retry",

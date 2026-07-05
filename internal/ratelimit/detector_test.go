@@ -80,7 +80,7 @@ func TestDetector_Check(t *testing.T) {
 		{
 			name:     "claude 429",
 			provider: ProviderClaude,
-			texts:    []string{"HTTP 429 Too Many Requests"},
+			texts:    []string{"HTTP 429 Too Many Requests, retry later"},
 			want:     true,
 		},
 		{
@@ -141,6 +141,226 @@ func TestDetector_Check(t *testing.T) {
 
 			if got != tt.want {
 				t.Errorf("Check() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetector_DefaultPatternCorpus(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider Provider
+		text     string
+		want     bool
+	}{
+		{
+			name:     "claude rate limiter prose is not a limit",
+			provider: ProviderClaude,
+			text:     "Refactor the rate limiter implementation and add tests.",
+			want:     false,
+		},
+		{
+			name:     "claude rate limits docs are not a limit",
+			provider: ProviderClaude,
+			text:     "Document API rate limits in the README.",
+			want:     false,
+		},
+		{
+			name:     "claude capacity planning is not saturation",
+			provider: ProviderClaude,
+			text:     "Capacity planning notes: add two more workers next week.",
+			want:     false,
+		},
+		{
+			name:     "claude estimated capacity is not saturation",
+			provider: ProviderClaude,
+			text:     "Estimated capacity planning notes for next quarter.",
+			want:     false,
+		},
+		{
+			name:     "claude metadata capacity field is not saturation",
+			provider: ProviderClaude,
+			text:     "The metadata capacity fields are optional.",
+			want:     false,
+		},
+		{
+			name:     "claude http 429 fixture is not enough",
+			provider: ProviderClaude,
+			text:     "Unit test fixture for HTTP 429 responses.",
+			want:     false,
+		},
+		{
+			name:     "claude too many requests docs are not enough",
+			provider: ProviderClaude,
+			text:     "Document how the API maps Too Many Requests to retry logic.",
+			want:     false,
+		},
+		{
+			name:     "claude plain 429 too many requests docs are not enough",
+			provider: ProviderClaude,
+			text:     "HTTP 429 Too Many Requests is documented in the fixture table.",
+			want:     false,
+		},
+		{
+			name:     "claude capacity saturation",
+			provider: ProviderClaude,
+			text:     "Claude is over capacity, please try again later.",
+			want:     true,
+		},
+		{
+			name:     "claude rate limit error machine string",
+			provider: ProviderClaude,
+			text:     `{"type":"rate_limit_error","message":"retry later"}`,
+			want:     true,
+		},
+		{
+			name:     "claude usage limit exceeded machine string",
+			provider: ProviderClaude,
+			text:     "usage_limit_exceeded",
+			want:     true,
+		},
+		{
+			name:     "claude contextual 429 response",
+			provider: ProviderClaude,
+			text:     `{"error":{"status":429,"message":"Too Many Requests, try again later"}}`,
+			want:     true,
+		},
+		{
+			name:     "claude contextual too many requests response",
+			provider: ProviderClaude,
+			text:     "Error: Too Many Requests, retry later.",
+			want:     true,
+		},
+		{
+			name:     "claude hit limit",
+			provider: ProviderClaude,
+			text:     "You've hit your limit · resets at 5pm.",
+			want:     true,
+		},
+		{
+			name:     "ansi wrapped rate limit",
+			provider: ProviderClaude,
+			text:     "\x1b[31mrate\x1b[0m \x1b[1mlimit\x1b[0m exceeded",
+			want:     true,
+		},
+		{
+			name:     "codex rate limited",
+			provider: ProviderCodex,
+			text:     "Request failed: rate limited, try again later.",
+			want:     true,
+		},
+		{
+			name:     "codex rate-limit hit",
+			provider: ProviderCodex,
+			text:     "rate-limit hit for this account",
+			want:     true,
+		},
+		{
+			name:     "codex rate limiter prose is not a limit",
+			provider: ProviderCodex,
+			text:     "This package implements a rate limiter.",
+			want:     false,
+		},
+		{
+			name:     "codex rate limiting middleware is not a limit",
+			provider: ProviderCodex,
+			text:     "This package implements rate limiting middleware.",
+			want:     false,
+		},
+		{
+			name:     "codex too many requests fixture is not enough",
+			provider: ProviderCodex,
+			text:     "Use an HTTP 429 Too Many Requests fixture in this test.",
+			want:     false,
+		},
+		{
+			name:     "codex rate limit exceeded machine string",
+			provider: ProviderCodex,
+			text:     `{"code":"rate_limit_exceeded","message":"try again later"}`,
+			want:     true,
+		},
+		{
+			name:     "codex rate limit error class",
+			provider: ProviderCodex,
+			text:     "RateLimitError: retry later",
+			want:     true,
+		},
+		{
+			name:     "codex contextual 429 response",
+			provider: ProviderCodex,
+			text:     `{"status":429,"error":"too many requests; retry later"}`,
+			want:     true,
+		},
+		{
+			name:     "gemini quota config is not exhaustion",
+			provider: ProviderGemini,
+			text:     "Loaded quota configuration from project settings.",
+			want:     false,
+		},
+		{
+			name:     "gemini quota limit config is not exhaustion",
+			provider: ProviderGemini,
+			text:     "Quota limits are configured per project.",
+			want:     false,
+		},
+		{
+			name:     "gemini quota limit setting is not exhaustion",
+			provider: ProviderGemini,
+			text:     "Loaded quota limit configuration from project settings.",
+			want:     false,
+		},
+		{
+			name:     "gemini 429 docs are not enough",
+			provider: ProviderGemini,
+			text:     "The docs mention 429 Too Many Requests as a possible response.",
+			want:     false,
+		},
+		{
+			name:     "gemini quota exceeded",
+			provider: ProviderGemini,
+			text:     "Quota exceeded for project location us-central1.",
+			want:     true,
+		},
+		{
+			name:     "gemini rate limit exceeded machine string",
+			provider: ProviderGemini,
+			text:     `reason: "rateLimitExceeded"`,
+			want:     true,
+		},
+		{
+			name:     "gemini quota exceeded machine string",
+			provider: ProviderGemini,
+			text:     `reason: "quotaExceeded"`,
+			want:     true,
+		},
+		{
+			name:     "gemini quota limit exceeded machine string",
+			provider: ProviderGemini,
+			text:     "quota_limit_exceeded",
+			want:     true,
+		},
+		{
+			name:     "gemini contextual too many requests response",
+			provider: ProviderGemini,
+			text:     "Request failed: Too Many Requests, try again later.",
+			want:     true,
+		},
+		{
+			name:     "gemini resource exhausted",
+			provider: ProviderGemini,
+			text:     "RESOURCE_EXHAUSTED: quota exhausted",
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d, err := NewDetector(tt.provider, nil)
+			if err != nil {
+				t.Fatalf("NewDetector() error = %v", err)
+			}
+			if got := d.Check(tt.text); got != tt.want {
+				t.Fatalf("Check(%q) = %v, want %v; reason=%q", tt.text, got, tt.want, d.Reason())
 			}
 		})
 	}
@@ -251,7 +471,7 @@ func TestObservingWriter_PartialLines(t *testing.T) {
 	// Write partial data
 	w.Write([]byte("Hello "))
 	w.Write([]byte("rate "))
-	w.Write([]byte("limit\n"))
+	w.Write([]byte("limit reached\n"))
 	w.Write([]byte("Done"))
 	w.Flush()
 
@@ -263,6 +483,21 @@ func TestObservingWriter_PartialLines(t *testing.T) {
 	// Should have two lines
 	if len(lines) != 2 {
 		t.Errorf("callback called %d times, want 2", len(lines))
+	}
+}
+
+func TestObservingWriterDetectsNoNewlinePrompt(t *testing.T) {
+	d, err := NewDetector(ProviderClaude, nil)
+	if err != nil {
+		t.Fatalf("NewDetector() error = %v", err)
+	}
+
+	w := NewObservingWriter(d, nil)
+	if _, err := w.Write([]byte("You've hit your limit · resets at 5pm")); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if !d.Detected() {
+		t.Fatal("Detector did not catch no-newline rate-limit prompt")
 	}
 }
 

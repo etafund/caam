@@ -480,6 +480,191 @@ func TestDeleteUnknownProfile(t *testing.T) {
 	}
 }
 
+func TestDeleteRejectsMalformedMetadata(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "alice")
+	if err := os.WriteFile(filepath.Join(profileHome, ProfileMetaFilename), []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.Delete("alice"); err == nil || !strings.Contains(err.Error(), "refusing to delete") {
+		t.Fatalf("expected malformed metadata delete refusal, got %v", err)
+	}
+	if _, err := os.Stat(profileHome); err != nil {
+		t.Fatalf("profile should remain after refused delete: %v", err)
+	}
+}
+
+func TestRepairMetadataBackfillsProviderFromLegacyCredentialLabel(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("legacy", CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "legacy")
+	meta := Meta{
+		Name:           "legacy",
+		CredentialFrom: "vault:claude/legacy",
+		RealHome:       home,
+		Version:        1,
+	}
+	if err := writeMeta(profileHome, &meta); err != nil {
+		t.Fatal(err)
+	}
+	res, err := mgr.RepairMetadata("legacy", RepairOptions{})
+	if err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if !res.Changed || res.Provider != ProviderClaude {
+		t.Fatalf("repair result = %+v, want changed claude", res)
+	}
+	got, err := readMetaRaw(profileHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != ProviderClaude || got.CredentialFrom != "vault:claude/legacy" {
+		t.Fatalf("metadata after repair = %+v", got)
+	}
+}
+
+func TestRepairMetadataInfersProviderFromShape(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("codex-bob", CreateOptions{Provider: ProviderCodex}); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "codex-bob")
+	meta := Meta{Name: "codex-bob", RealHome: home, Version: 1}
+	if err := writeMeta(profileHome, &meta); err != nil {
+		t.Fatal(err)
+	}
+	res, err := mgr.RepairMetadata("codex-bob", RepairOptions{})
+	if err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if res.Provider != ProviderCodex || !res.Changed {
+		t.Fatalf("repair result = %+v, want changed codex", res)
+	}
+	got, err := readMetaRaw(profileHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != ProviderCodex {
+		t.Fatalf("provider after repair = %q, want codex", got.Provider)
+	}
+}
+
+func TestRepairMetadataDryRunDoesNotWrite(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "alice")
+	meta := Meta{Name: "alice", RealHome: home, Version: 1}
+	if err := writeMeta(profileHome, &meta); err != nil {
+		t.Fatal(err)
+	}
+	res, err := mgr.RepairMetadata("alice", RepairOptions{DryRun: true})
+	if err != nil {
+		t.Fatalf("repair dry-run: %v", err)
+	}
+	if !res.Changed || !res.DryRun {
+		t.Fatalf("repair dry-run result = %+v", res)
+	}
+	got, err := readMetaRaw(profileHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != "" {
+		t.Fatalf("dry-run wrote provider %q", got.Provider)
+	}
+}
+
+func TestRepairMetadataRefusesForeignRecordedHome(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	if _, err := mgr.Create("alice", CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "alice")
+	rewriteRecordedRealHome(t, profileHome, t.TempDir())
+	if _, err := mgr.RepairMetadata("alice", RepairOptions{}); err == nil || !strings.Contains(err.Error(), "different HOME") {
+		t.Fatalf("expected foreign HOME repair refusal, got %v", err)
+	}
+}
+
+func TestRenameMovesProfileAndRewritesMetadataName(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	src := credSource(t, `{"identity":"alice"}`)
+	if _, err := mgr.Create("alice", CreateOptions{Provider: ProviderClaude, CredentialSource: src, CredentialFromLabel: "vault:claude/alice"}); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(mgr.BaseDir(), "alice")
+	oldMeta, err := readMetaRaw(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := mgr.Rename("alice", "cc-alice")
+	if err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if res.OldName != "alice" || res.NewName != "cc-alice" {
+		t.Fatalf("rename result = %+v", res)
+	}
+	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old path should be gone after rename, got %v", err)
+	}
+	newPath := filepath.Join(mgr.BaseDir(), "cc-alice")
+	gotMeta, err := readMetaRaw(newPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMeta.Name != "cc-alice" ||
+		gotMeta.Provider != oldMeta.Provider ||
+		gotMeta.CredentialFrom != oldMeta.CredentialFrom ||
+		gotMeta.RealHome != oldMeta.RealHome ||
+		!gotMeta.CreatedAt.Equal(oldMeta.CreatedAt) {
+		t.Fatalf("metadata after rename = %+v, before = %+v", gotMeta, oldMeta)
+	}
+	cred, err := mgr.CredentialPath("cc-alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if body, err := os.ReadFile(cred); err != nil || string(body) != `{"identity":"alice"}` {
+		t.Fatalf("credential after rename body=%q err=%v", body, err)
+	}
+	layout, _ := LayoutForProvider(ProviderClaude)
+	if err := mgr.ValidateProfileShape("cc-alice", layout); err != nil {
+		t.Fatalf("renamed profile should validate: %v", err)
+	}
+}
+
+func TestRenameRejectsDestinationExistsAndMissingProvider(t *testing.T) {
+	home := fakeHome(t)
+	mgr := newMgr(t, home)
+	for _, name := range []string{"alice", "bob"} {
+		if _, err := mgr.Create(name, CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := mgr.Rename("alice", "bob"); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected destination-exists error, got %v", err)
+	}
+	profileHome := filepath.Join(mgr.BaseDir(), "alice")
+	meta := Meta{Name: "alice", RealHome: home, Version: 2}
+	if err := writeMeta(profileHome, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Rename("alice", "cc-alice"); err == nil || !strings.Contains(err.Error(), "no recorded provider") {
+		t.Fatalf("expected missing-provider rename refusal, got %v", err)
+	}
+}
+
 // TestCredentialIsolation ensures that mutating one shallow profile's
 // .credentials.json does NOT affect another profile or the real HOME.
 func TestCredentialIsolation(t *testing.T) {

@@ -163,29 +163,29 @@ A "shallow" `$HOME` per identity: only the auth-bearing files are real, **everyt
 
 ```bash
 # Stage credentials in caam's vault first (one-time per account).
-caam backup claude alice@example.com
-caam backup codex  bob@example.com
-caam backup agy    carol@example.com
+caam backup claude alice
+caam backup codex  bob
+caam backup agy    carol
 
-# Create a shallow profile per identity. The provider is INFERRED from the vault
-# spec, so no --tool flag is needed for --from-vault:
-caam shallow-profile create alice --from-vault claude/alice@example.com   # → claude
-caam shallow-profile create bob   --from-vault codex/bob@example.com      # → codex
-caam shallow-profile create carol --from-vault agy/carol@example.com      # → agy
+# Create a shallow profile per identity. With --from-vault, the name can be
+# omitted and caam derives a provider-prefixed name from the vault profile slug:
+caam shallow-profile create --from-vault claude/alice   # creates cc-alice
+caam shallow-profile create --from-vault codex/bob      # creates codex-bob
+caam shallow-profile create --from-vault agy/carol      # creates agy-carol
 
 # Spawn concurrent sessions, each pinned to its own identity and provider.
-caam shallow-spawn alice -- claude  &   # session 1, alice's Claude quota
-caam shallow-spawn bob   -- codex   &   # session 2, bob's Codex identity
-caam shallow-spawn carol -- agy     &   # session 3, carol's Antigravity identity
+caam shallow-spawn cc-alice  -- claude  &   # session 1, alice's Claude quota
+caam shallow-spawn codex-bob -- codex   &   # session 2, bob's Codex identity
+caam shallow-spawn agy-carol -- agy     &   # session 3, carol's Antigravity identity
 wait
 ```
 
-The provider is only needed explicitly via `--tool` when it can't be inferred — i.e. with `--from-file` (the filename is never inspected, so it defaults to `claude`) or when creating an empty-credential profile:
+When naming manually, prefer conventional Claude names like `cc-work` or `cc-alice` so they do not collide with Codex profile names. The provider is only needed explicitly via `--tool` when it can't be inferred — i.e. with `--from-file` (the filename is never inspected, so it defaults to `claude`) or when creating an empty-credential profile:
 
 ```bash
 caam shallow-profile create cfile    --tool codex --from-file /path/auth.json  # codex from a file
 caam shallow-profile create cscratch --tool codex                              # codex, empty creds
-caam shallow-profile create scratch                                            # claude (default), empty creds
+caam shallow-profile create cc-scratch                                          # claude (default), empty creds
 ```
 
 **Claude layout** under `<base>/<name>/`:
@@ -236,7 +236,7 @@ Only the oauth token is required; the other three are optional companions copied
 
 **Smart fallback:** if a candidate (e.g. `~/.cargo`) doesn't exist in your real `~/`, no symlink is created — no broken links for users who don't have a given tool installed.
 
-> **Codex daemon caveat:** a long-lived Codex daemon caches auth in memory. Shallow Codex sessions set `CODEX_HOME` (and `CODEX_SQLITE_HOME`) to the shallow `.codex` **and** use the allow-list above, so a daemon started inside a shallow session is *designed* to belong to that shallow `CODEX_HOME`. This relies on Codex rooting its daemon/socket discovery under `CODEX_HOME`; the exact runtime-dir names are an external Codex artifact and should be verified against your installed Codex.
+> **Codex daemon caveat:** a long-lived Codex daemon caches auth in memory. Shallow Codex sessions set `CODEX_HOME` (and `CODEX_SQLITE_HOME`) to the shallow `.codex` **and** use the allow-list above, so a daemon started inside a shallow session is *designed* to belong to that shallow `CODEX_HOME`. This relies on Codex rooting its daemon/socket discovery under `CODEX_HOME`; the exact runtime-dir names are an external Codex artifact and should be verified against your installed Codex. If you need caam to reload the daemon for a shallow Codex run, pass the flag before the command separator: `caam shallow-spawn codex-bob --reload-daemon -- codex`, not after `codex`.
 
 **Env isolation:** `shallow-spawn` clears the active harness's repointing vars (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `GEMINI_HOME`), inherited credential-override vars (`OPENAI_API_KEY`, `CODEX_API_KEY`, the `ANTHROPIC_*` / `CLAUDE_CODE_USE_*` vars, …), and caam's own discovery vars (`CAAM_HOME`, `CAAM_SHALLOW_HOMES_DIR`), then sets the active harness's own env (e.g. Codex's `CODEX_HOME`/`CODEX_SQLITE_HOME`). So a shallow profile uses its vaulted subscription identity, not an inherited key. To intentionally use env-key auth, inject it past caam:
 
@@ -259,15 +259,23 @@ caam shallow-spawn p -- env OPENAI_API_KEY=… codex
 **Subcommands:**
 
 ```bash
-caam shallow-profile create <name> [--from-vault <tool>/<profile>] [--from-file <path>] [--tool <provider>] [--force] [--json]
+caam shallow-profile create [name] [--from-vault <tool>/<profile>] [--from-file <path>] [--tool <provider>] [--force] [--json]
 caam shallow-profile list [--json]
 caam shallow-profile delete <name> [--force] [--json]
 caam shallow-profile doctor [name] [--json]                                    # health-check
-caam shallow-spawn <name> -- <cmd> [args...]
+caam shallow-profile repair [name] [--all] [--provider <provider>] [--dry-run] [--json]
+caam shallow-profile rename <old> <new> [--dry-run] [--json]
+caam shallow-spawn <name> [--reload-daemon] -- <cmd> [args...]
 caam shallow-spawn <name> --print-env       # emit eval-able export/unset lines, no exec
 ```
 
+With `--from-vault`, `create` may omit `[name]`; caam derives `cc-<slug>` for Claude, `codex-<slug>` for Codex, and `agy-<slug>` for Antigravity from the vault profile slug. Pass an explicit name when you want a different convention.
+
 `shallow-profile doctor` runs the same read-only integrity check that `shallow-spawn` performs right before exec — the recorded provider must be supported, the auth-bearing dirs/files must be real (not symlinked), and the required credential must be present. With no name it checks every profile; run it before fanning out parallel sessions to catch a corrupted profile early. Pass `--json` for automation. It exits non-zero if any diagnosed profile is unhealthy (or a named one doesn't exist).
+
+`shallow-profile repair [name]` safely repairs legacy profiles whose provider metadata is missing or stale. Use `[name]` for one profile or `--all` to scan every profile; combine with `--provider` to constrain inference, preview changes with `--dry-run`, and use `--json` for automation.
+
+`shallow-profile rename <old> <new>` renames the profile directory and rewrites metadata to the new name. Use it instead of manually moving directories; pass `--dry-run` to preview and `--json` for machine-readable output.
 
 `--tool` (`claude`, `codex`, or `agy`) is inferred from `--from-vault`; pass it only when not inferable (with `--from-file`, or for an empty-cred profile). The base directory defaults to `~/orch-homes/`. Override with `$CAAM_SHALLOW_HOMES_DIR` or the `--base` flag (per-command, useful for tests). `--print-env` emits shell-quoted `export KEY='value'` lines for the vars it sets and `unset KEY` for every var it clears, so a wrapper can reproduce the exec path's isolation with `eval "$(caam shallow-spawn <name> --print-env)"`.
 
@@ -282,13 +290,13 @@ codex login                                  # → bob's OpenAI account
 caam backup codex bob
 
 # Create the shallow identities — provider inferred from each vault spec.
-caam shallow-profile create alice --from-vault claude/alice
-caam shallow-profile create bob   --from-vault codex/bob
+caam shallow-profile create --from-vault claude/alice   # creates cc-alice
+caam shallow-profile create --from-vault codex/bob      # creates codex-bob
 
 # Fan two concurrent sessions. Each lands on its own quota, but both share
 # your real ~/.bashrc, ~/.gitconfig, ~/.ssh AND each harness's own history.
-caam shallow-spawn alice -- claude --print "audit pkg/auth for race conditions"   &
-caam shallow-spawn bob   -- codex exec "write tests for internal/shallow"         &
+caam shallow-spawn cc-alice  -- claude --print "audit pkg/auth for race conditions"   &
+caam shallow-spawn codex-bob -- codex exec "write tests for internal/shallow"         &
 wait
 ```
 

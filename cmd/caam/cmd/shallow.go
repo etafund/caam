@@ -93,13 +93,15 @@ func init() {
 	shallowProfileCmd.AddCommand(shallowProfileListCmd)
 	shallowProfileCmd.AddCommand(shallowProfileDeleteCmd)
 	shallowProfileCmd.AddCommand(shallowProfileDoctorCmd)
+	shallowProfileCmd.AddCommand(shallowProfileRepairCmd)
+	shallowProfileCmd.AddCommand(shallowProfileRenameCmd)
 	rootCmd.AddCommand(shallowProfileCmd)
 	rootCmd.AddCommand(shallowSpawnCmd)
 }
 
 // shallowProfileCreateCmd creates a new shallow profile.
 var shallowProfileCreateCmd = &cobra.Command{
-	Use:   "create <name>",
+	Use:   "create [name]",
 	Short: "Create a new shallow profile",
 	Long: `Create a new shallow profile. Provisions the symlink farm and copies a
 credential file into the provider's primary auth path inside the shallow HOME.
@@ -115,8 +117,13 @@ Credential source (one of):
                                   for non-claude providers)
   (none)                          Leave the credential empty; populate later via login
 
+When --from-vault is set, <name> may be omitted. caam derives a conventional
+provider-prefixed name from the vault profile (for example
+claude/arthur@example.com -> cc-arthur, codex/arthur@example.com -> codex-arthur).
+
 Examples:
   caam shallow-profile create alice --from-vault claude/alice@example.com
+  caam shallow-profile create --from-vault claude/alice@example.com
   caam shallow-profile create cbob  --from-vault codex/bob@example.com
   caam shallow-profile create agatha --from-vault agy/agatha@example.com
   caam shallow-profile create cbob  --tool codex --from-file /tmp/bob.auth.json
@@ -125,7 +132,7 @@ Examples:
   caam shallow-profile create alice --json
   caam shallow-profile create alice --force           # overwrite existing
   caam shallow-profile create alice --base /tmp/test-orch-homes`,
-	Args: cobra.ExactArgs(1),
+	Args: shallowProfileCreateArgs,
 	RunE: runShallowProfileCreate,
 }
 
@@ -149,6 +156,20 @@ type shallowCreateOutput struct {
 	CredentialFrom string   `json:"credential_from,omitempty"`
 	ManagedFiles   []string `json:"managed_files,omitempty"`
 	Error          string   `json:"error,omitempty"`
+}
+
+func shallowProfileCreateArgs(cmd *cobra.Command, args []string) error {
+	if len(args) == 1 {
+		return nil
+	}
+	if len(args) == 0 {
+		fromVault, _ := cmd.Flags().GetString("from-vault")
+		if strings.TrimSpace(fromVault) != "" {
+			return nil
+		}
+		return fmt.Errorf("requires a profile name unless --from-vault is provided")
+	}
+	return fmt.Errorf("accepts at most 1 arg, received %d", len(args))
 }
 
 // shallowVaultRef is a parsed --from-vault reference.
@@ -202,6 +223,61 @@ func inferShallowProvider(toolFlag, fromVault string) (string, error) {
 	return p, nil
 }
 
+func shallowNameSlug(profile string) string {
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if before, _, ok := strings.Cut(profile, "@"); ok {
+		profile = before
+	}
+	var b strings.Builder
+	lastDash := false
+	for _, r := range profile {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+			lastDash = false
+		default:
+			if !lastDash && b.Len() > 0 {
+				b.WriteByte('-')
+				lastDash = true
+			}
+		}
+	}
+	slug := strings.Trim(b.String(), "-")
+	if slug == "" {
+		return "profile"
+	}
+	return slug
+}
+
+func defaultShallowName(providerID, vaultProfile string) string {
+	prefix := providerID + "-"
+	switch providerID {
+	case shallow.ProviderClaude:
+		prefix = "cc-"
+	case shallow.ProviderCodex:
+		prefix = "codex-"
+	case shallow.ProviderAgy:
+		prefix = "agy-"
+	}
+	return prefix + shallowNameSlug(vaultProfile)
+}
+
+func maybePrintShallowNameHint(cmd *cobra.Command, name, providerID, fromVault string, jsonOut bool) {
+	if jsonOut || strings.TrimSpace(fromVault) == "" {
+		return
+	}
+	ref, err := parseShallowVaultRef(fromVault)
+	if err != nil {
+		return
+	}
+	suggested := defaultShallowName(providerID, ref.Profile)
+	if name == suggested || !strings.Contains(name, "@") {
+		return
+	}
+	fmt.Fprintf(cmd.ErrOrStderr(), "hint: conventional shallow name for %s is %q; create it directly with `caam shallow-profile create --from-vault %s/%s` or rename with `caam shallow-profile rename %s %s`.\n",
+		fromVault, suggested, ref.Tool, ref.Profile, name, suggested)
+}
+
 // resolveShallowVaultDir returns the vault profile DIR + descriptive label for
 // an ALREADY-resolved provider, after verifying the provider's Primary
 // credential is present in the vault.
@@ -225,7 +301,6 @@ func resolveShallowVaultDir(providerID string, ref shallowVaultRef) (sourceDir, 
 }
 
 func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
-	name := args[0]
 	jsonOut, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
 	tool, _ := cmd.Flags().GetString("tool")
@@ -234,6 +309,10 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	fromFile, _ := cmd.Flags().GetString("from-file")
 	fromClaudeJSON, _ := cmd.Flags().GetString("from-claude-json")
 
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
 	output := shallowCreateOutput{Name: name}
 	emit := func(err error) error {
 		if jsonOut {
@@ -265,6 +344,13 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 		return emit(err)
 	}
 	output.Provider = providerID // set early so JSON ERROR output also carries the resolved provider
+	if name == "" {
+		ref, _ := parseShallowVaultRef(fromVault) // already validated inside inferShallowProvider
+		name = defaultShallowName(providerID, ref.Profile)
+		output.Name = name
+	} else {
+		maybePrintShallowNameHint(cmd, name, providerID, fromVault, jsonOut)
+	}
 	if fromClaudeJSON != "" && providerID != shallow.ProviderClaude {
 		return emit(fmt.Errorf("--from-claude-json is only valid for --tool claude (got %s)", providerID))
 	}
@@ -366,6 +452,9 @@ type shallowListItem struct {
 	Path           string    `json:"path"`
 	CredentialFrom string    `json:"credential_from,omitempty"`
 	CreatedAt      time.Time `json:"created_at,omitempty"`
+	Healthy        bool      `json:"healthy"`
+	Code           string    `json:"code,omitempty"`
+	SuggestedFix   string    `json:"suggested_fix,omitempty"`
 }
 
 type shallowListOutput struct {
@@ -404,7 +493,14 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 	if jsonOut {
 		out := shallowListOutput{BaseDir: mgr.BaseDir(), Count: len(profiles)}
 		for _, p := range profiles {
-			item := shallowListItem{Name: p.Name, Path: p.Path}
+			diag := diagnoseShallowProfile(mgr, p.Name)
+			item := shallowListItem{
+				Name:         p.Name,
+				Path:         p.Path,
+				Healthy:      diag.Healthy,
+				Code:         diag.Code,
+				SuggestedFix: diag.SuggestedFix,
+			}
 			if p.Meta != nil {
 				item.Provider = p.Meta.Provider // verbatim; no claude fallback
 				item.CredentialFrom = p.Meta.CredentialFrom
@@ -432,6 +528,7 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 		prov := "—"
 		credFrom := "(none)"
 		created := "?"
+		diag := diagnoseShallowProfile(mgr, p.Name)
 		if p.Meta != nil {
 			if p.Meta.Provider != "" {
 				prov = p.Meta.Provider
@@ -444,6 +541,9 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 			}
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "%-22s  %-8s  %-32s  %s\n", p.Name, prov, credFrom, created)
+		if !diag.Healthy && diag.SuggestedFix != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "  fix: %s\n", diag.SuggestedFix)
+		}
 	}
 	return nil
 }
@@ -572,12 +672,271 @@ func init() {
 	shallowProfileDoctorCmd.Flags().Bool("json", false, "output as JSON")
 }
 
+var shallowProfileRepairCmd = &cobra.Command{
+	Use:   "repair [name]",
+	Short: "Repair shallow profile metadata without touching credentials",
+	Long: `Repair the .caam-shallow.json metadata sidecar for one shallow profile
+or every shallow profile under the base dir. This command is intentionally
+conservative: it only writes metadata when the provider can be resolved from
+legacy metadata, from exactly one safe on-disk provider shape, or from an
+explicit --provider value. It never rebuilds credentials or follows symlinks.
+
+Examples:
+  caam shallow-profile repair alice --dry-run
+  caam shallow-profile repair alice --provider claude
+  caam shallow-profile repair --all --json`,
+	Args: runShallowProfileRepairArgs,
+	RunE: runShallowProfileRepair,
+}
+
+func init() {
+	shallowProfileRepairCmd.Flags().String("provider", "", "provider to record when inference is ambiguous (claude, codex, agy)")
+	shallowProfileRepairCmd.Flags().Bool("all", false, "repair every shallow profile under the base dir")
+	shallowProfileRepairCmd.Flags().Bool("dry-run", false, "show what would be repaired without writing metadata")
+	shallowProfileRepairCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+type shallowRepairResult struct {
+	Name         string `json:"name"`
+	Provider     string `json:"provider,omitempty"`
+	Path         string `json:"path"`
+	Changed      bool   `json:"changed"`
+	DryRun       bool   `json:"dry_run,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	Error        string `json:"error,omitempty"`
+	SuggestedFix string `json:"suggested_fix,omitempty"`
+}
+
+type shallowRepairOutput struct {
+	Profiles []shallowRepairResult `json:"profiles"`
+	Success  bool                  `json:"success"`
+}
+
+func runShallowProfileRepairArgs(cmd *cobra.Command, args []string) error {
+	all, _ := cmd.Flags().GetBool("all")
+	if all {
+		if len(args) != 0 {
+			return fmt.Errorf("--all cannot be combined with a profile name")
+		}
+		return nil
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("requires a profile name or --all")
+	}
+	return nil
+}
+
+func runShallowProfileRepair(cmd *cobra.Command, args []string) error {
+	jsonOut, _ := cmd.Flags().GetBool("json")
+	all, _ := cmd.Flags().GetBool("all")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	provider, _ := cmd.Flags().GetString("provider")
+
+	emitErr := func(err error) error {
+		if jsonOut {
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(shallowRepairOutput{Success: false})
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return err
+		}
+		return err
+	}
+
+	mgr, err := resolveShallowManager(cmd)
+	if err != nil {
+		return emitErr(fmt.Errorf("init shallow manager: %w", err))
+	}
+
+	var names []string
+	if all {
+		profiles, err := mgr.List()
+		if err != nil {
+			return emitErr(fmt.Errorf("list shallow profiles: %w", err))
+		}
+		for _, p := range profiles {
+			names = append(names, p.Name)
+		}
+	} else {
+		names = []string{args[0]}
+	}
+
+	out := shallowRepairOutput{Success: true}
+	for _, name := range names {
+		res, err := mgr.RepairMetadata(name, shallow.RepairOptions{Provider: provider, DryRun: dryRun})
+		item := shallowRepairResult{
+			Name:     name,
+			Provider: res.Provider,
+			Path:     res.Path,
+			Changed:  res.Changed,
+			DryRun:   dryRun,
+			Reason:   res.Reason,
+		}
+		if err != nil {
+			out.Success = false
+			item.Error = err.Error()
+			item.SuggestedFix = fmt.Sprintf("caam shallow-profile repair %s --provider <tool>", name)
+		}
+		out.Profiles = append(out.Profiles, item)
+	}
+
+	if jsonOut {
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(out)
+		if !out.Success {
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+			return fmt.Errorf("one or more shallow profiles could not be repaired")
+		}
+		return nil
+	}
+
+	if len(out.Profiles) == 0 {
+		fmt.Fprintf(cmd.OutOrStdout(), "No shallow profiles found in %s — nothing to repair.\n", mgr.BaseDir())
+		return nil
+	}
+	for _, r := range out.Profiles {
+		if r.Error != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "✗ %s: %s\n", r.Name, r.Error)
+			if r.SuggestedFix != "" {
+				fmt.Fprintf(cmd.OutOrStdout(), "  fix: %s\n", r.SuggestedFix)
+			}
+			continue
+		}
+		action := "repaired"
+		if dryRun {
+			action = "would repair"
+		}
+		if !r.Changed {
+			action = "already healthy"
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "✓ %s (%s): %s", r.Name, r.Provider, action)
+		if r.Reason != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), " — %s", r.Reason)
+		}
+		fmt.Fprintln(cmd.OutOrStdout())
+	}
+	if !out.Success {
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+		return fmt.Errorf("one or more shallow profiles could not be repaired")
+	}
+	return nil
+}
+
+var shallowProfileRenameCmd = &cobra.Command{
+	Use:   "rename <old-name> <new-name>",
+	Short: "Rename a shallow profile and update its metadata",
+	Long: `Rename a shallow profile directory and rewrite its metadata Name field.
+The destination must not already exist. If metadata cannot be read, repair the
+profile first so caam can verify it before moving the directory.
+
+Examples:
+  caam shallow-profile rename arthur@feta.fund cc-arthur
+  caam shallow-profile rename codex-bob codex-arthur --dry-run
+  caam shallow-profile rename old-name new-name --json`,
+	Args: cobra.ExactArgs(2),
+	RunE: runShallowProfileRename,
+}
+
+func init() {
+	shallowProfileRenameCmd.Flags().Bool("dry-run", false, "show what would be renamed without moving anything")
+	shallowProfileRenameCmd.Flags().Bool("json", false, "output as JSON")
+}
+
+type shallowRenameOutput struct {
+	Success bool   `json:"success"`
+	OldName string `json:"old_name"`
+	NewName string `json:"new_name"`
+	OldPath string `json:"old_path,omitempty"`
+	NewPath string `json:"new_path,omitempty"`
+	DryRun  bool   `json:"dry_run,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+func runShallowProfileRename(cmd *cobra.Command, args []string) error {
+	oldName, newName := args[0], args[1]
+	jsonOut, _ := cmd.Flags().GetBool("json")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	out := shallowRenameOutput{OldName: oldName, NewName: newName, DryRun: dryRun}
+
+	emit := func(err error) error {
+		if jsonOut {
+			out.Success = err == nil
+			if err != nil {
+				out.Error = err.Error()
+			}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(out)
+			if err != nil {
+				cmd.SilenceErrors = true
+				cmd.SilenceUsage = true
+			}
+			return err
+		}
+		return err
+	}
+
+	mgr, err := resolveShallowManager(cmd)
+	if err != nil {
+		return emit(fmt.Errorf("init shallow manager: %w", err))
+	}
+	oldPath, err := mgr.HomeFor(oldName)
+	if err != nil {
+		return emit(err)
+	}
+	newPath, err := mgr.HomeFor(newName)
+	if err != nil {
+		return emit(err)
+	}
+	out.OldPath, out.NewPath = oldPath, newPath
+	if dryRun {
+		if _, err := mgr.Get(oldName); err != nil {
+			return emit(err)
+		}
+		if _, err := os.Lstat(newPath); err == nil {
+			return emit(fmt.Errorf("shallow profile %q already exists at %s", newName, newPath))
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return emit(fmt.Errorf("stat destination profile: %w", err))
+		}
+		if jsonOut {
+			out.Success = true
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			return enc.Encode(out)
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Would rename shallow profile %q -> %q\n", oldName, newName)
+		fmt.Fprintf(cmd.OutOrStdout(), "  %s -> %s\n", oldPath, newPath)
+		return nil
+	}
+
+	res, err := mgr.Rename(oldName, newName)
+	if err != nil {
+		return emit(err)
+	}
+	out.OldPath, out.NewPath = res.OldPath, res.NewPath
+	if jsonOut {
+		out.Success = true
+		enc := json.NewEncoder(cmd.OutOrStdout())
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "Renamed shallow profile %q -> %q\n", oldName, newName)
+	fmt.Fprintf(cmd.OutOrStdout(), "  %s -> %s\n", res.OldPath, res.NewPath)
+	return nil
+}
+
 // shallowDoctorResult is one profile's diagnosis.
 type shallowDoctorResult struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	Healthy  bool   `json:"healthy"`
-	Error    string `json:"error"`
+	Name         string `json:"name"`
+	Provider     string `json:"provider"`
+	Healthy      bool   `json:"healthy"`
+	Code         string `json:"code,omitempty"`
+	Error        string `json:"error"`
+	SuggestedFix string `json:"suggested_fix,omitempty"`
 }
 
 type shallowDoctorOutput struct {
@@ -593,8 +952,11 @@ func diagnoseShallowProfile(mgr *shallow.Manager, name string) shallowDoctorResu
 	prof, err := mgr.Get(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			res.Code = "not_found"
 			res.Error = "does not exist"
+			res.SuggestedFix = fmt.Sprintf("caam shallow-profile create %s --from-vault <tool>/<profile>", name)
 		} else {
+			res.Code = "load_failed"
 			res.Error = err.Error()
 		}
 		return res
@@ -604,18 +966,24 @@ func diagnoseShallowProfile(mgr *shallow.Manager, name string) shallowDoctorResu
 		provider = prof.Meta.ResolvedProvider()
 	}
 	if prof.Meta == nil || provider == "" {
+		res.Code = "missing_provider_metadata"
 		res.Error = "malformed metadata (no recorded provider); recreate it"
+		res.SuggestedFix = fmt.Sprintf("caam shallow-profile repair %s --provider <tool>", name)
 		return res
 	}
 	res.Provider = provider
 	layout, err := shallow.LayoutForProvider(provider)
 	if err != nil {
+		res.Code = "unsupported_provider"
 		res.Error = fmt.Sprintf("unsupported provider %q (supported: %s)",
 			provider, strings.Join(shallow.SupportedProviders(), ", "))
+		res.SuggestedFix = fmt.Sprintf("caam shallow-profile repair %s --provider <tool>", name)
 		return res
 	}
 	if err := mgr.ValidateProfileShape(name, layout); err != nil {
+		res.Code = "invalid_shape"
 		res.Error = err.Error()
+		res.SuggestedFix = fmt.Sprintf("caam shallow-profile create %s --from-vault %s/<profile> --force", name, provider)
 		return res
 	}
 	res.Healthy = true
@@ -700,6 +1068,9 @@ func runShallowProfileDoctor(cmd *cobra.Command, args []string) error {
 			fmt.Fprintf(cmd.OutOrStdout(), "✗ %s (%s): %s\n", r.Name, r.Provider, r.Error)
 		} else {
 			fmt.Fprintf(cmd.OutOrStdout(), "✗ %s: %s\n", r.Name, r.Error)
+		}
+		if r.SuggestedFix != "" {
+			fmt.Fprintf(cmd.OutOrStdout(), "  fix: %s\n", r.SuggestedFix)
 		}
 	}
 
@@ -838,6 +1209,10 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 		return emit(err)
 	}
 
+	if err := detectMisplacedShallowReloadDaemon(name, provider, rest); err != nil {
+		return emit(err)
+	}
+
 	if printEnv {
 		if jsonOut {
 			// Render the env transform as data: `set` mirrors SpawnEnv's writes
@@ -909,6 +1284,28 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 var runShallowCodexDaemonCheck = checkCodexDaemonForCodexHome
 
 var printShallowCodexDaemonWarning = printCodexDaemonWarning
+
+func detectMisplacedShallowReloadDaemon(name, provider string, rest []string) error {
+	if provider != shallow.ProviderCodex || len(rest) == 0 {
+		return nil
+	}
+	if filepath.Base(rest[0]) != "codex" {
+		return nil
+	}
+	flagAt := -1
+	for i, arg := range rest[1:] {
+		if arg == "--reload-daemon" {
+			flagAt = i + 1
+			break
+		}
+	}
+	if flagAt == -1 {
+		return nil
+	}
+	corrected := append([]string{"caam", "shallow-spawn", name, "--reload-daemon", "--"}, rest...)
+	corrected = append(corrected[:5+flagAt], corrected[5+flagAt+1:]...)
+	return fmt.Errorf("--reload-daemon is a caam shallow-spawn flag, not a codex flag; place it before '--': %s", strings.Join(corrected, " "))
+}
 
 // spawnExec replaces the current process image with the target on Unix.
 // Wrapped in a function so tests can inject a fake.

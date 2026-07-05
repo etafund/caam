@@ -218,12 +218,12 @@ func TestTeeWriter(t *testing.T) {
 			detector: detector,
 		}
 
-		// Write complete line with rate limit
-		tw.Write([]byte("429 Too Many Requests\n"))
+		// Write complete line with a contextual 429 rate limit.
+		tw.Write([]byte("HTTP 429 Too Many Requests, retry later\n"))
 		tw.Flush()
 
 		if !detector.Detected() {
-			t.Error("Detector failed to detect '429' in complete line")
+			t.Error("Detector failed to detect contextual 429 in complete line")
 		}
 	})
 

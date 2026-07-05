@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/ratelimit"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -370,14 +371,8 @@ var (
 		regexp.MustCompile(`(?i)\bgemini\b`),
 		regexp.MustCompile(`(?i)google\s+ai`),
 	}
-	rateLimitMarkers = []*regexp.Regexp{
-		regexp.MustCompile(`(?i)you'?ve hit your limit`),
-		regexp.MustCompile(`(?i)usage limit`),
-		regexp.MustCompile(`(?i)rate limit`),
-		regexp.MustCompile(`(?i)too many requests`),
-		regexp.MustCompile(`(?i)resource_exhausted`),
-		regexp.MustCompile(`(?i)\b429\b`),
-	}
+	rateLimitMarkers       = compileWeztermRateLimitMarkers(ratelimit.ProviderClaude, ratelimit.ProviderCodex, ratelimit.ProviderGemini)
+	claudeRateLimitMarkers = compileWeztermRateLimitMarkers(ratelimit.ProviderClaude)
 )
 
 func matchWeztermPane(tool, text string, override *regexp.Regexp) matchResult {
@@ -415,6 +410,21 @@ func matchesAny(patterns []*regexp.Regexp, text string) bool {
 		}
 	}
 	return false
+}
+
+func compileWeztermRateLimitMarkers(providers ...ratelimit.Provider) []*regexp.Regexp {
+	defaults := ratelimit.DefaultPatterns()
+	var markers []*regexp.Regexp
+	for _, provider := range providers {
+		for _, pattern := range defaults[provider] {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				panic(fmt.Sprintf("compile %s rate-limit pattern %q: %v", provider, pattern, err))
+			}
+			markers = append(markers, re)
+		}
+	}
+	return markers
 }
 
 func normalizeWeztermText(text string) string {
@@ -663,14 +673,12 @@ func (r *RecoverPaneState) IsOnCooldown() bool {
 
 // Recovery state detection patterns (using coordinator patterns).
 var recoverPatterns = struct {
-	RateLimit    *regexp.Regexp
 	SelectMethod *regexp.Regexp
 	OAuthURL     *regexp.Regexp
 	PastePrompt  *regexp.Regexp
 	LoginSuccess *regexp.Regexp
 	LoginFailed  *regexp.Regexp
 }{
-	RateLimit:    regexp.MustCompile(`(?i)you'?ve hit your limit.*resets`),
 	SelectMethod: regexp.MustCompile(`(?i)select login method:`),
 	OAuthURL:     regexp.MustCompile(`https://claude\.ai/oauth/authorize\?[^\s]+`),
 	PastePrompt:  regexp.MustCompile(`(?i)paste code here if prompted`),
@@ -709,7 +717,7 @@ func detectRecoverState(text string) (RecoverState, string, string) {
 	}
 
 	// Check for rate limit
-	if recoverPatterns.RateLimit.MatchString(normalized) {
+	if matchesAny(claudeRateLimitMarkers, normalized) {
 		return RecoverRateLimited, "rate_limit", ""
 	}
 
