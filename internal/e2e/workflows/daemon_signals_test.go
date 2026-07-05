@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -55,6 +56,13 @@ func TestDaemonSignals(t *testing.T) {
 
 	cmd := exec.Command(exe, "-test.run=^TestDaemonHelper$")
 	cmd.Env = daemonEnv
+	// Run the daemon as the leader of its OWN process group so teardown can
+	// signal the ENTIRE tree — the daemon AND any grandchild it (or a tool it
+	// drives, e.g. a Codex plugin-clone helper) may spawn — not just the direct
+	// child. Reaping only the direct child left grandchildren writing files
+	// under the temp home, racing t.TempDir() RemoveAll and failing cleanup with
+	// "directory not empty" (issue #48).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Redirect stdout/stderr to a file we can read
 	logFile, err := os.Create(logPath)
@@ -71,18 +79,43 @@ func TestDaemonSignals(t *testing.T) {
 		waitCh <- cmd.Wait()
 	}()
 	daemonExited := false
-	defer func() {
-		if daemonExited || cmd.Process == nil {
+
+	var stopOnce sync.Once
+	pgid := cmd.Process.Pid // process-group id, because the child is the group leader
+	signalGroup := func(sig syscall.Signal) {
+		if pgid > 0 {
+			_ = syscall.Kill(-pgid, sig)
 			return
 		}
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		select {
-		case <-waitCh:
-			daemonExited = true
-		case <-time.After(3 * time.Second):
-			t.Log("timed out waiting for daemon cleanup after SIGTERM")
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(sig)
 		}
-	}()
+	}
+
+	// stopDaemon deterministically tears the daemon's whole process group down.
+	// It is idempotent and registered as a t.Cleanup so it runs before the
+	// temp-home cleanup even if the test fails early.
+	stopDaemon := func() {
+		stopOnce.Do(func() {
+			if daemonExited || cmd.Process == nil {
+				return
+			}
+			signalGroup(syscall.SIGTERM)
+			select {
+			case <-waitCh:
+				daemonExited = true
+			case <-time.After(3 * time.Second):
+				signalGroup(syscall.SIGKILL)
+				select {
+				case <-waitCh:
+					daemonExited = true
+				case <-time.After(3 * time.Second):
+					t.Log("timed out waiting for daemon cleanup after SIGKILL")
+				}
+			}
+		})
+	}
+	t.Cleanup(stopDaemon)
 
 	daemonPID := waitForDaemonSignalPID(t, pidFile, logPath, logFile, waitCh, &daemonExited)
 	require.Equal(t, cmd.Process.Pid, daemonPID, "PID file must target the isolated daemon subprocess")
@@ -140,6 +173,13 @@ func TestDaemonSignals(t *testing.T) {
 	logs = readDaemonSignalLogs(t, logPath, logFile)
 	require.Contains(t, logs, "shutting down...")
 	require.Contains(t, logs, "Daemon stopped gracefully")
+
+	// Product stop reaps the daemon leader; clean any remaining process-group
+	// descendants before temp-directory cleanup runs.
+	signalGroup(syscall.SIGTERM)
+	time.Sleep(200 * time.Millisecond)
+	signalGroup(syscall.SIGKILL)
+	stopOnce.Do(func() {})
 
 	h.EndStep("Stop")
 }

@@ -314,6 +314,13 @@ func TestShallowSpawnCodex(t *testing.T) {
 		if (*calls)[0].codexHome != filepath.Join(base, "codex-bob", ".codex") {
 			t.Fatalf("daemon-check codex home = %q", (*calls)[0].codexHome)
 		}
+		// The reload must be SCOPED to this profile's CODEX_HOME (issue #47), not
+		// a host-wide reload — otherwise it would disrupt concurrent codex
+		// profiles.
+		wantHome := filepath.Join(base, "codex-bob", ".codex")
+		if (*calls)[0].codexHome != wantHome {
+			t.Fatalf("daemon-check codexHome = %q, want %q (reload must be scoped to the target profile)", (*calls)[0].codexHome, wantHome)
+		}
 	})
 
 	t.Run("codex profile without flag warns but does not reload", func(t *testing.T) {

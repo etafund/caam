@@ -47,17 +47,26 @@ func checkCodexDaemonForCodexHome(tool string, reload bool, codexHome string) co
 	return checkCodexDaemonScoped(tool, reload, codexHome)
 }
 
+// checkCodexDaemonScoped is checkCodexDaemon with an optional CODEX_HOME scope.
+//
+// codexHome == "" preserves the host-wide behavior used by the vault-style
+// `activate`/`next` flows (which swap the single real ~/.codex, so ANY running
+// Codex daemon is affected). When codexHome is non-empty (shallow-spawn), the
+// detected daemons are filtered down to only those whose environment points at
+// that exact CODEX_HOME (or HOME/.codex fallback), so reloading profile cod-a
+// never SIGTERMs the daemons serving a concurrent profile cod-b (issue #47).
+//
+// Attribution is fail-safe: a daemon whose environment cannot be inspected
+// (macOS/BSD, or an unreadable /proc/<pid>/environ) is EXCLUDED from a scoped
+// reload, so we never kill a process we could not positively tie to the target.
 func checkCodexDaemonScoped(tool string, reload bool, codexHome string) codexDaemonWarning {
 	if strings.ToLower(strings.TrimSpace(tool)) != "codex" {
 		return codexDaemonWarning{}
 	}
 
-	var procs []codexd.Process
-	var supported bool
-	if strings.TrimSpace(codexHome) != "" {
-		procs, supported = codexd.DetectForCodexHome(codexHome)
-	} else {
-		procs, supported = codexd.Detect()
+	procs, supported := codexd.Detect()
+	if supported && strings.TrimSpace(codexHome) != "" {
+		procs = codexd.FilterByCodexHome(procs, codexHome)
 	}
 	if !supported || len(procs) == 0 {
 		// Either we cannot scan (e.g. Windows) or no daemon is running. In both

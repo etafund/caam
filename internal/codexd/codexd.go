@@ -36,14 +36,69 @@ type Process struct {
 	// "mcp-server". May be empty if we matched a generic persistent codex
 	// process we could not classify precisely.
 	Subcommand string
-	// CodexHome is the process's CODEX_HOME, when the platform lets us inspect
-	// it. It is used to avoid reloading another shallow profile's daemon.
+
+	// --- environment attribution (issue #47) ---
+	//
+	// These are populated by reading the process environment AFTER the process
+	// has been classified as a Codex daemon, so we never inspect the environ of
+	// unrelated processes. They let a scoped reload (shallow-spawn) target only
+	// the daemon serving a specific CODEX_HOME instead of every Codex daemon on
+	// the host.
+
+	// EnvKnown is true when the process environment was successfully read. It is
+	// false on platforms/paths without an environment-inspection mechanism
+	// (macOS/BSD `ps` scanning, or when /proc/<pid>/environ is unreadable). A
+	// scoped reload treats an unknown environment as "cannot attribute" and
+	// leaves such a daemon alone rather than risk disrupting another profile.
+	EnvKnown bool
+	// CodexHome is the daemon's CODEX_HOME (may be empty even when EnvKnown).
 	CodexHome string
-	// Home is the process's HOME, used as a fallback because Codex defaults to
-	// HOME/.codex when CODEX_HOME is unset.
+	// Home is the daemon's HOME (used for the HOME/.codex fallback).
 	Home string
-	// ShallowProfile is the process's SHALLOW_PROFILE marker, when present.
+	// ShallowProfile is the daemon's SHALLOW_PROFILE marker, if it was spawned
+	// under a caam shallow profile.
 	ShallowProfile string
+}
+
+// EffectiveCodexHome returns the CODEX_HOME the daemon is effectively using,
+// applying the HOME/.codex fallback when CODEX_HOME is unset. The second return
+// value is false when the environment is unknown or gives no basis to attribute
+// the daemon to a codex home (so a scoped reload will skip it, fail-safe).
+func (p Process) EffectiveCodexHome() (string, bool) {
+	if !p.EnvKnown {
+		return "", false
+	}
+	if h := strings.TrimSpace(p.CodexHome); h != "" {
+		return filepath.Clean(h), true
+	}
+	if home := strings.TrimSpace(p.Home); home != "" {
+		return filepath.Clean(filepath.Join(home, ".codex")), true
+	}
+	return "", false
+}
+
+// FilterByCodexHome returns only the daemons whose effective CODEX_HOME matches
+// the target (issue #47). It is fail-safe: a daemon whose environment cannot be
+// inspected (EnvKnown == false) is EXCLUDED, so a scoped reload never SIGTERMs a
+// process it could not positively attribute to the target profile. An empty
+// target returns the input unchanged (host-wide behavior for activate/next).
+func FilterByCodexHome(procs []Process, codexHome string) []Process {
+	target := strings.TrimSpace(codexHome)
+	if target == "" {
+		return procs
+	}
+	target = filepath.Clean(target)
+	out := make([]Process, 0, len(procs))
+	for _, p := range procs {
+		eff, ok := p.EffectiveCodexHome()
+		if !ok {
+			continue
+		}
+		if eff == target {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // rawProc is the platform-agnostic representation a scanner yields.
@@ -57,10 +112,13 @@ type rawProc struct {
 // inspect, or (nil, false) if process scanning is unavailable on this platform.
 var scanProcesses func() ([]rawProc, bool)
 
-// readProcessEnviron is set by platforms that can cheaply read another
-// process's environment. It is only called after a process has already been
-// classified as a Codex daemon.
-var readProcessEnviron func(pid int) ([]byte, bool)
+// readProcEnviron is set by a per-platform file. Given a PID it returns that
+// process's environment as a KEY->VALUE map and whether it could be read. It is
+// nil on platforms with no dependency-free environment-inspection mechanism
+// (macOS/BSD, Windows); Detect() then leaves Process.EnvKnown false and scoped
+// reloads fall back to leaving unattributable daemons alone. It is ONLY called
+// for a process already classified as a Codex daemon (issue #47).
+var readProcEnviron func(pid int) (map[string]string, bool)
 
 // Detect scans running processes and returns any that look like a persistent
 // Codex daemon (app-server / mcp-server). The second return value is false when
@@ -85,16 +143,25 @@ func Detect() (procs []Process, supported bool) {
 		if !match {
 			continue
 		}
-		codexHome, home, shallowProfile := processEnvMetadata(p.pid)
 		seen[p.pid] = struct{}{}
-		procs = append(procs, Process{
-			PID:            p.pid,
-			Cmdline:        strings.TrimSpace(p.cmdline),
-			Subcommand:     sub,
-			CodexHome:      codexHome,
-			Home:           home,
-			ShallowProfile: shallowProfile,
-		})
+		proc := Process{
+			PID:        p.pid,
+			Cmdline:    strings.TrimSpace(p.cmdline),
+			Subcommand: sub,
+		}
+		// Inspect the environment ONLY now that the process is a confirmed Codex
+		// daemon, so a scoped reload can attribute it to a specific CODEX_HOME
+		// (issue #47). Skipped when no inspection mechanism exists on this
+		// platform (readProcEnviron == nil) or the environ is unreadable.
+		if readProcEnviron != nil {
+			if env, ok := readProcEnviron(p.pid); ok {
+				proc.EnvKnown = true
+				proc.CodexHome = env["CODEX_HOME"]
+				proc.Home = env["HOME"]
+				proc.ShallowProfile = env["SHALLOW_PROFILE"]
+			}
+		}
+		procs = append(procs, proc)
 	}
 
 	sort.Slice(procs, func(i, j int) bool { return procs[i].PID < procs[j].PID })
@@ -109,64 +176,17 @@ func DetectForCodexHome(codexHome string) (procs []Process, supported bool) {
 	if !supported {
 		return nil, false
 	}
-	target := normalizePath(codexHome)
-	if target == "" {
-		return all, true
-	}
-	for _, p := range all {
-		if p.UsesCodexHome(target) {
-			procs = append(procs, p)
-		}
-	}
-	return procs, true
+	return FilterByCodexHome(all, codexHome), true
 }
 
 // UsesCodexHome reports whether this daemon appears to use codexHome.
 func (p Process) UsesCodexHome(codexHome string) bool {
-	target := normalizePath(codexHome)
+	target := strings.TrimSpace(codexHome)
 	if target == "" {
 		return false
 	}
-	if normalizePath(p.CodexHome) == target {
-		return true
-	}
-	if p.Home != "" && normalizePath(filepath.Join(p.Home, ".codex")) == target {
-		return true
-	}
-	return false
-}
-
-func processEnvMetadata(pid int) (codexHome, home, shallowProfile string) {
-	if readProcessEnviron == nil {
-		return "", "", ""
-	}
-	data, ok := readProcessEnviron(pid)
-	if !ok || len(data) == 0 {
-		return "", "", ""
-	}
-	for _, part := range strings.Split(string(data), "\x00") {
-		key, value, ok := strings.Cut(part, "=")
-		if !ok {
-			continue
-		}
-		switch key {
-		case "CODEX_HOME":
-			codexHome = value
-		case "HOME":
-			home = value
-		case "SHALLOW_PROFILE":
-			shallowProfile = value
-		}
-	}
-	return codexHome, home, shallowProfile
-}
-
-func normalizePath(path string) string {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return ""
-	}
-	return filepath.Clean(path)
+	effective, ok := p.EffectiveCodexHome()
+	return ok && effective == filepath.Clean(target)
 }
 
 // daemonSubcommands maps a recognized first token of a codex daemon subcommand
