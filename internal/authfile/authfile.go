@@ -15,12 +15,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -310,6 +312,44 @@ type Vault struct {
 }
 
 const originalProfileName = "_original"
+const profileMetaFilename = "meta.json"
+const quarantineDirName = ".caam-quarantine"
+const profileBackupDirName = ".caam-profile-backups"
+const backupCurrentRetries = 100
+
+var timeNow = time.Now
+
+type vaultProfileMeta struct {
+	Tool            string             `json:"tool"`
+	Profile         string             `json:"profile"`
+	Description     string             `json:"description,omitempty"`
+	BackedUpAt      string             `json:"backed_up_at"`
+	Files           int                `json:"files"`
+	ManifestVersion int                `json:"manifest_version,omitempty"`
+	Type            string             `json:"type,omitempty"`
+	CreatedBy       string             `json:"created_by,omitempty"`
+	OriginalPaths   []string           `json:"original_paths,omitempty"`
+	ManagedFiles    []managedFileState `json:"managed_files,omitempty"`
+}
+
+type managedFileState struct {
+	VaultName               string `json:"vault_name"`
+	OriginalPath            string `json:"original_path"`
+	Required                bool   `json:"required"`
+	Present                 bool   `json:"present"`
+	ClaudeDesktopTokenCache bool   `json:"claude_desktop_token_cache,omitempty"`
+}
+
+type backupPlanEntry struct {
+	spec                AuthFileSpec
+	state               managedFileState
+	claudeDesktopFields map[string]interface{}
+}
+
+type restoreCleanupEntry struct {
+	spec  AuthFileSpec
+	state managedFileState
+}
 
 // IsSystemProfile reports whether a profile name is reserved for system-managed
 // profiles (created automatically by caam safety features).
@@ -366,6 +406,9 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateUniqueVaultNames(fileSet); err != nil {
+		return err
+	}
 
 	tool := strings.TrimSpace(fileSet.Tool)
 	profile = strings.TrimSpace(profile)
@@ -383,10 +426,10 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 			return fmt.Errorf("stat profile dir: %w", err)
 		}
 	}
-
-	// Create profile directory
-	if err := os.MkdirAll(profileDir, 0700); err != nil {
-		return fmt.Errorf("create profile dir: %w", err)
+	if st, err := os.Stat(profileDir); err == nil && !st.IsDir() {
+		return fmt.Errorf("profile path exists and is not a directory: %s", profileDir)
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat profile dir: %w", err)
 	}
 
 	backedUp := 0
@@ -394,7 +437,10 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 	optionalFound := false
 	var missingRequired []string
 	var originalPaths []string
+	managedFiles := make([]managedFileState, 0, len(fileSet.Files))
+	plan := make([]backupPlanEntry, 0, len(fileSet.Files))
 	for _, spec := range fileSet.Files {
+		state := managedStateForSpec(fileSet.Tool, spec)
 		// Claude Desktop config: capture ONLY the oauth:tokenCache* fields, so we
 		// never persist (or later clobber) unrelated desktop settings (PR #44).
 		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
@@ -403,39 +449,43 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 				return err
 			}
 			if !ok {
+				managedFiles = append(managedFiles, state)
 				continue // no token cache present — nothing to back up
-			}
-			destPath := filepath.Join(profileDir, filepath.Base(spec.Path))
-			if err := writeJSONFileAtomic(destPath, fields, 0600); err != nil {
-				return fmt.Errorf("backup %s: %w", spec.Path, err)
 			}
 			backedUp++
 			optionalFound = true
 			originalPaths = append(originalPaths, spec.Path)
+			state.Present = true
+			managedFiles = append(managedFiles, state)
+			plan = append(plan, backupPlanEntry{
+				spec:                spec,
+				state:               state,
+				claudeDesktopFields: fields,
+			})
 			continue
 		}
 
-		if _, err := os.Stat(spec.Path); os.IsNotExist(err) {
+		if _, err := os.Stat(spec.Path); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("stat %s: %w", spec.Path, err)
+			}
 			if spec.Required {
 				missingRequired = append(missingRequired, spec.Path)
 			}
+			managedFiles = append(managedFiles, state)
 			continue // Skip optional files that don't exist
 		}
 
-		// Copy file to vault
-		filename := filepath.Base(spec.Path)
-		destPath := filepath.Join(profileDir, filename)
-
-		if err := copyFile(spec.Path, destPath); err != nil {
-			return fmt.Errorf("backup %s: %w", spec.Path, err)
-		}
 		backedUp++
 		if spec.Required {
 			requiredFound = true
-		} else {
+		} else if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, spec.Path) {
 			optionalFound = true
 		}
 		originalPaths = append(originalPaths, spec.Path)
+		state.Present = true
+		managedFiles = append(managedFiles, state)
+		plan = append(plan, backupPlanEntry{spec: spec, state: state})
 	}
 
 	if backedUp == 0 {
@@ -447,25 +497,50 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 		}
 	}
 
+	stagingDir, err := v.newBackupStagingDir(tool, profile)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.RemoveAll(stagingDir)
+		}
+	}()
+
+	for _, f := range managedFiles {
+		if f.Present {
+			continue
+		}
+		stalePath := filepath.Join(profileDir, f.VaultName)
+		if _, err := v.copyManagedPathToQuarantine(stagingDir, "backup", f.OriginalPath, stalePath); err != nil {
+			return fmt.Errorf("quarantine stale backup %s: %w", stalePath, err)
+		}
+	}
+	for _, entry := range plan {
+		destPath := filepath.Join(stagingDir, entry.state.VaultName)
+		if entry.state.ClaudeDesktopTokenCache {
+			if err := writeJSONFileAtomic(destPath, entry.claudeDesktopFields, 0600); err != nil {
+				return fmt.Errorf("backup %s: %w", entry.spec.Path, err)
+			}
+			continue
+		}
+		if err := copyFile(entry.spec.Path, destPath); err != nil {
+			return fmt.Errorf("backup %s: %w", entry.spec.Path, err)
+		}
+	}
+
 	// Write metadata
-	metaPath := filepath.Join(profileDir, "meta.json")
-	meta := struct {
-		Tool          string   `json:"tool"`
-		Profile       string   `json:"profile"`
-		Description   string   `json:"description,omitempty"` // Free-form notes about profile purpose
-		BackedUpAt    string   `json:"backed_up_at"`
-		Files         int      `json:"files"`
-		Type          string   `json:"type,omitempty"`       // user|system
-		CreatedBy     string   `json:"created_by,omitempty"` // user|auto|first-activate
-		OriginalPaths []string `json:"original_paths,omitempty"`
-	}{
-		Tool:          tool,
-		Profile:       profile,
-		BackedUpAt:    time.Now().Format(time.RFC3339),
-		Files:         backedUp,
-		Type:          "user",
-		CreatedBy:     "user",
-		OriginalPaths: originalPaths,
+	meta := vaultProfileMeta{
+		Tool:            tool,
+		Profile:         profile,
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           backedUp,
+		ManifestVersion: 1,
+		Type:            "user",
+		CreatedBy:       "user",
+		OriginalPaths:   originalPaths,
+		ManagedFiles:    managedFiles,
 	}
 	if IsSystemProfile(profile) {
 		meta.Type = "system"
@@ -474,42 +549,14 @@ func (v *Vault) Backup(fileSet AuthFileSet, profile string) error {
 			meta.CreatedBy = "first-activate"
 		}
 	}
-	raw, err := json.Marshal(meta)
-	if err != nil {
-		return fmt.Errorf("marshal metadata: %w", err)
+	if err := writeJSONFileAtomic(filepath.Join(stagingDir, profileMetaFilename), meta, 0600); err != nil {
+		return fmt.Errorf("write metadata: %w", err)
 	}
 
-	// Atomic write: write to temp file, fsync, then rename
-	dir := filepath.Dir(metaPath)
-	f, err := os.CreateTemp(dir, "meta.json.tmp.*")
-	if err != nil {
-		return fmt.Errorf("create temp metadata file: %w", err)
+	if err := v.commitProfileStaging(tool, profile, profileDir, stagingDir); err != nil {
+		return err
 	}
-	tmpPath := f.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := f.Write(raw); err != nil {
-		f.Close()
-		return fmt.Errorf("write temp metadata file: %w", err)
-	}
-
-	if err := f.Chmod(0600); err != nil {
-		f.Close()
-		return fmt.Errorf("chmod temp metadata file: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("sync temp metadata file: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close temp metadata file: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, metaPath); err != nil {
-		return fmt.Errorf("rename metadata file: %w", err)
-	}
+	committed = true
 
 	return nil
 }
@@ -543,15 +590,28 @@ func (v *Vault) BackupCurrent(fileSet AuthFileSet) (string, error) {
 		return "", nil
 	}
 
-	// Generate timestamped backup name
-	timestamp := time.Now().Format("20060102_150405")
-	backupName := "_backup_" + timestamp
+	for attempt := range backupCurrentRetries {
+		// Generate timestamped backup name with nanosecond precision so repeated
+		// safety backups in the same second do not collide with immutable system
+		// profiles. Retry handles fixed clocks and filesystem timestamp quirks.
+		now := timeNow()
+		timestamp := fmt.Sprintf("%s_%09d", now.Format("20060102_150405"), now.Nanosecond())
+		backupName := "_backup_" + timestamp
+		if attempt > 0 {
+			backupName = fmt.Sprintf("%s_%03d", backupName, attempt)
+		}
 
-	if err := v.Backup(fileSet, backupName); err != nil {
-		return "", fmt.Errorf("backup current: %w", err)
+		if err := v.Backup(fileSet, backupName); err != nil {
+			if errors.Is(err, errProtectedSystemProfile) {
+				continue
+			}
+			return "", fmt.Errorf("backup current: %w", err)
+		}
+
+		return backupName, nil
 	}
 
-	return backupName, nil
+	return "", fmt.Errorf("backup current: could not create unique backup name after %d attempts", backupCurrentRetries)
 }
 
 // ResnapshotOutgoing re-captures the live auth files of the currently-active
@@ -713,32 +773,80 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateUniqueVaultNames(fileSet); err != nil {
+		return err
+	}
 
 	if _, err := os.Stat(profileDir); os.IsNotExist(err) {
 		return fmt.Errorf("profile %s/%s not found in vault; run 'caam ls %s' to see available profiles", fileSet.Tool, profile, fileSet.Tool)
-	}
-
-	// Migrate legacy Gemini OAuth filename in vault.
-	if fileSet.Tool == "gemini" {
-		if err := MigrateGeminiVaultDir(profileDir); err != nil {
-			return fmt.Errorf("vault migration (oauth_credentials.json -> oauth_creds.json): %w", err)
-		}
 	}
 
 	restored := 0
 	requiredFound := false
 	optionalFound := false
 	var missingRequired []string
+	var pendingRequiredCleanup []restoreCleanupEntry
+	managedManifest, hasManagedManifest, err := v.managedFileManifest(profileDir)
+	if err != nil {
+		return err
+	}
+	if fileSet.Tool == "gemini" && !hasManagedManifest {
+		if err := MigrateGeminiVaultDir(profileDir); err != nil {
+			return fmt.Errorf("vault migration (oauth_credentials.json -> oauth_creds.json): %w", err)
+		}
+	}
+	if hasManagedManifest {
+		if err := preflightManagedRestore(fileSet, profileDir, managedManifest); err != nil {
+			return err
+		}
+	} else {
+		if err := preflightLegacyRestoreAuthViability(fileSet, profileDir); err != nil {
+			return err
+		}
+	}
 	for _, spec := range fileSet.Files {
 		filename := filepath.Base(spec.Path)
 		srcPath := filepath.Join(profileDir, filename)
+		state, stateKnown := managedStateForRestore(fileSet, managedManifest, spec)
+		stateMatchesSpec := stateKnown && filepath.Clean(state.OriginalPath) == filepath.Clean(spec.Path)
+		if hasManagedManifest {
+			if !stateKnown {
+				continue
+			}
+			if !stateMatchesSpec {
+				continue
+			}
+			srcPath = filepath.Join(profileDir, state.VaultName)
+		}
+
+		if hasManagedManifest && !state.Present {
+			if _, err := v.quarantineManagedPath(profileDir, "restore-vault", state.OriginalPath, srcPath); err != nil {
+				return fmt.Errorf("quarantine stale vault auth file %s: %w", srcPath, err)
+			}
+			if spec.Required {
+				missingRequired = append(missingRequired, srcPath)
+				if fileSet.AllowOptionalOnly {
+					pendingRequiredCleanup = append(pendingRequiredCleanup, restoreCleanupEntry{spec: spec, state: state})
+				}
+				continue
+			}
+			if err := v.cleanupAbsentManagedLive(profileDir, fileSet, spec, state); err != nil {
+				return err
+			}
+			continue
+		}
 
 		// Check if backup exists
 		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
+			if hasManagedManifest && state.Present {
+				return fmt.Errorf("managed backup listed in metadata but missing: %s", srcPath)
+			}
 			if spec.Required {
 				missingRequired = append(missingRequired, srcPath)
 			}
 			continue // Skip optional files
+		} else if err != nil {
+			return fmt.Errorf("stat backup %s: %w", srcPath, err)
 		}
 
 		// Claude Desktop config: MERGE the snapshot's oauth:tokenCache* fields
@@ -746,8 +854,15 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		// unrelated desktop settings intact, so switching the CAAM profile also
 		// swaps the account the desktop cache would otherwise reassert (PR #44).
 		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
-			if err := restoreClaudeDesktopTokenCache(srcPath, spec.Path); err != nil {
+			restoredTokenCache, err := restoreClaudeDesktopTokenCache(srcPath, spec.Path)
+			if err != nil {
 				return err
+			}
+			if !restoredTokenCache {
+				if spec.Required {
+					missingRequired = append(missingRequired, srcPath)
+				}
+				continue
 			}
 			restored++
 			optionalFound = true
@@ -772,7 +887,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 			restored++
 			if spec.Required {
 				requiredFound = true
-			} else {
+			} else if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, srcPath) {
 				optionalFound = true
 			}
 			continue
@@ -785,7 +900,7 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 		restored++
 		if spec.Required {
 			requiredFound = true
-		} else {
+		} else if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, srcPath) {
 			optionalFound = true
 		}
 	}
@@ -796,6 +911,11 @@ func (v *Vault) Restore(fileSet AuthFileSet, profile string) error {
 	if len(missingRequired) > 0 {
 		if !(fileSet.AllowOptionalOnly && !requiredFound && optionalFound) {
 			return fmt.Errorf("required backup not found: %s", missingRequired[0])
+		}
+	}
+	for _, entry := range pendingRequiredCleanup {
+		if err := v.cleanupAbsentManagedLive(profileDir, fileSet, entry.spec, entry.state); err != nil {
+			return err
 		}
 	}
 
@@ -818,6 +938,9 @@ func (v *Vault) List(tool string) ([]string, error) {
 
 	var profiles []string
 	for _, e := range entries {
+		if hiddenVaultEntry(e.Name()) {
+			continue
+		}
 		if e.IsDir() {
 			profiles = append(profiles, e.Name())
 		}
@@ -838,6 +961,9 @@ func (v *Vault) ListAll() (map[string][]string, error) {
 	}
 
 	for _, e := range entries {
+		if hiddenVaultEntry(e.Name()) {
+			continue
+		}
 		if e.IsDir() {
 			profiles, err := v.List(e.Name())
 			if err != nil {
@@ -990,6 +1116,9 @@ func (v *Vault) ActiveProfile(fileSet AuthFileSet) (string, error) {
 			currentHashes[base] = hashes
 			continue
 		}
+		if !optionalFileCountsAsAuth(fileSet.Tool, spec.Path, spec.Path) {
+			continue
+		}
 		optionalHashes[base] = hashes
 	}
 
@@ -1112,7 +1241,9 @@ func HasAuthFiles(fileSet AuthFileSet) bool {
 			if spec.Required {
 				return true
 			}
-			optionalFound = true
+			if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, spec.Path) {
+				optionalFound = true
+			}
 		}
 	}
 	if fileSet.AllowOptionalOnly && optionalFound {
@@ -1191,22 +1322,23 @@ func claudeDesktopTokenCache(path string) (fields map[string]interface{}, ok boo
 // restoreClaudeDesktopTokenCache merges the token-cache fields captured in the
 // vault snapshot (vaultPath) into the live desktop config (livePath), replacing
 // any stale cache and preserving every other setting. The live file is created
-// if it does not yet exist.
-func restoreClaudeDesktopTokenCache(vaultPath, livePath string) error {
+// if it does not yet exist. The bool reports whether token-cache fields were
+// actually restored.
+func restoreClaudeDesktopTokenCache(vaultPath, livePath string) (bool, error) {
 	fields, ok, err := claudeDesktopTokenCache(vaultPath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
-		return nil // snapshot has nothing to restore
+		return false, nil // snapshot has nothing to restore
 	}
 	live := map[string]interface{}{}
 	if data, rerr := os.ReadFile(livePath); rerr == nil {
 		if uerr := json.Unmarshal(data, &live); uerr != nil {
-			return fmt.Errorf("parse live Claude desktop config %s: %w", livePath, uerr)
+			return false, fmt.Errorf("parse live Claude desktop config %s: %w", livePath, uerr)
 		}
 	} else if !os.IsNotExist(rerr) {
-		return fmt.Errorf("read live Claude desktop config: %w", rerr)
+		return false, fmt.Errorf("read live Claude desktop config: %w", rerr)
 	}
 	// Drop any stale cache, then apply the snapshot's fields.
 	for _, k := range claudeDesktopTokenKeys {
@@ -1216,12 +1348,12 @@ func restoreClaudeDesktopTokenCache(vaultPath, livePath string) error {
 		live[k] = v
 	}
 	if err := os.MkdirAll(filepath.Dir(livePath), 0700); err != nil {
-		return fmt.Errorf("create Claude desktop config dir: %w", err)
+		return false, fmt.Errorf("create Claude desktop config dir: %w", err)
 	}
 	if err := writeJSONFileAtomic(livePath, live, 0600); err != nil {
-		return fmt.Errorf("write Claude desktop config: %w", err)
+		return false, fmt.Errorf("write Claude desktop config: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 // scrubClaudeDesktopTokenCache deletes only the oauth:tokenCache* keys from the
@@ -1275,6 +1407,568 @@ func hashClaudeDesktopConfig(path string) (string, error) {
 	h.Write([]byte("claude:desktop:"))
 	h.Write(canonical)
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func managedStateForSpec(tool string, spec AuthFileSpec) managedFileState {
+	return managedFileState{
+		VaultName:               filepath.Base(spec.Path),
+		OriginalPath:            spec.Path,
+		Required:                spec.Required,
+		ClaudeDesktopTokenCache: isClaudeDesktopConfig(tool, spec.Path),
+	}
+}
+
+func validateUniqueVaultNames(fileSet AuthFileSet) error {
+	seen := make(map[string]string, len(fileSet.Files))
+	for _, spec := range fileSet.Files {
+		name := managedStateForSpec(fileSet.Tool, spec).VaultName
+		if prev, ok := seen[name]; ok {
+			return fmt.Errorf("duplicate managed auth vault name %q for %s and %s", name, prev, spec.Path)
+		}
+		seen[name] = spec.Path
+	}
+	return nil
+}
+
+func hiddenVaultEntry(name string) bool {
+	return strings.HasPrefix(name, ".")
+}
+
+func (v *Vault) newBackupStagingDir(tool, profile string) (string, error) {
+	toolDir, err := v.safeToolDir(tool)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(toolDir, 0700); err != nil {
+		return "", fmt.Errorf("create tool dir: %w", err)
+	}
+	dir, err := os.MkdirTemp(toolDir, "."+profile+".staging.*")
+	if err != nil {
+		return "", fmt.Errorf("create staging profile dir: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", fmt.Errorf("chmod staging profile dir: %w", err)
+	}
+	return dir, nil
+}
+
+func (v *Vault) commitProfileStaging(tool, profile, profileDir, stagingDir string) error {
+	if st, err := os.Stat(profileDir); err == nil {
+		if !st.IsDir() {
+			return fmt.Errorf("profile path exists and is not a directory: %s", profileDir)
+		}
+		backupDir, err := v.profileReplacementBackupDir(tool, profile)
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(profileDir, backupDir); err != nil {
+			return fmt.Errorf("move old profile aside: %w", err)
+		}
+		if err := os.Rename(stagingDir, profileDir); err != nil {
+			_ = os.Rename(backupDir, profileDir)
+			return fmt.Errorf("commit staged profile: %w", err)
+		}
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("stat profile dir: %w", err)
+	}
+	if err := os.Rename(stagingDir, profileDir); err != nil {
+		return fmt.Errorf("commit staged profile: %w", err)
+	}
+	return nil
+}
+
+func (v *Vault) profileReplacementBackupDir(tool, profile string) (string, error) {
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	dir := filepath.Join(v.basePath, profileBackupDirName, tool, profile, stamp)
+	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
+		return "", fmt.Errorf("create profile replacement backup dir: %w", err)
+	}
+	return dir, nil
+}
+
+func (v *Vault) managedFileManifest(profileDir string) (map[string]managedFileState, bool, error) {
+	metaPath := filepath.Join(profileDir, profileMetaFilename)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read profile metadata: %w", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, false, fmt.Errorf("parse profile metadata %s: %w", metaPath, err)
+	}
+	_, managedFieldPresent := raw["managed_files"]
+	var meta vaultProfileMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, false, fmt.Errorf("parse profile metadata %s: %w", metaPath, err)
+	}
+	if len(meta.ManagedFiles) == 0 {
+		if managedFieldPresent || meta.ManifestVersion > 0 {
+			return map[string]managedFileState{}, true, nil
+		}
+		return nil, false, nil
+	}
+	managedProfile := managedFieldPresent || meta.ManifestVersion > 0
+	managed := make(map[string]managedFileState, len(meta.ManagedFiles))
+	originalPaths := make(map[string]string, len(meta.ManagedFiles))
+	for _, state := range meta.ManagedFiles {
+		state.OriginalPath = strings.TrimSpace(state.OriginalPath)
+		if state.OriginalPath == "" || !filepath.IsAbs(state.OriginalPath) {
+			if managedProfile {
+				return nil, false, fmt.Errorf("invalid managed file metadata in %s", metaPath)
+			}
+			continue
+		}
+		originalPath := filepath.Clean(state.OriginalPath)
+		if prev, exists := originalPaths[originalPath]; exists {
+			return nil, false, fmt.Errorf("duplicate managed original path %q for %s and %s", originalPath, prev, state.VaultName)
+		}
+		originalPaths[originalPath] = state.VaultName
+		name := strings.TrimSpace(state.VaultName)
+		if name == "" {
+			name = filepath.Base(originalPath)
+		}
+		if name == "" || name == "." || name == string(os.PathSeparator) || name != filepath.Base(name) {
+			if managedProfile {
+				return nil, false, fmt.Errorf("invalid managed file metadata in %s", metaPath)
+			}
+			continue
+		}
+		state.VaultName = name
+		if prev, exists := managed[name]; exists {
+			return nil, false, fmt.Errorf("duplicate managed file metadata %q for %s and %s", name, prev.OriginalPath, state.OriginalPath)
+		}
+		managed[name] = state
+	}
+	return managed, len(managed) > 0, nil
+}
+
+func preflightManagedRestore(fileSet AuthFileSet, profileDir string, manifest map[string]managedFileState) error {
+	requiredMissing := false
+	requiredPresent := false
+	authOptionalPresent := false
+	for _, spec := range fileSet.Files {
+		srcPath := filepath.Join(profileDir, filepath.Base(spec.Path))
+		if geminiHasDuplicateOAuthAlias(fileSet, manifest, spec) {
+			return fmt.Errorf("duplicate Gemini managed OAuth metadata for %s", spec.Path)
+		}
+		state, stateKnown := managedStateForRestore(fileSet, manifest, spec)
+		if !stateKnown {
+			if spec.Required {
+				return fmt.Errorf("managed metadata missing required file: %s", srcPath)
+			}
+			continue
+		}
+		srcPath = filepath.Join(profileDir, state.VaultName)
+		if filepath.Clean(state.OriginalPath) != filepath.Clean(spec.Path) {
+			if spec.Required {
+				return fmt.Errorf("managed metadata path mismatch for required file: %s", srcPath)
+			}
+			continue
+		}
+		if !state.Present {
+			if spec.Required {
+				requiredMissing = true
+			}
+			if st, err := os.Lstat(srcPath); err == nil {
+				if !st.Mode().IsRegular() {
+					return fmt.Errorf("managed stale backup path is not a regular file: %s", srcPath)
+				}
+			} else if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("stat stale backup %s: %w", srcPath, err)
+			}
+			if spec.Required && !fileSet.AllowOptionalOnly {
+				return fmt.Errorf("required backup not found: %s", srcPath)
+			}
+			continue
+		}
+		if spec.Required {
+			requiredPresent = true
+		} else if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, srcPath) {
+			authOptionalPresent = true
+		}
+		st, err := os.Stat(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("managed backup listed in metadata but missing: %s", srcPath)
+			}
+			return fmt.Errorf("stat backup %s: %w", srcPath, err)
+		}
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("managed backup path is not a regular file: %s", srcPath)
+		}
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if _, ok, err := claudeDesktopTokenCache(srcPath); err != nil {
+				return err
+			} else if !ok {
+				return fmt.Errorf("managed Claude desktop token cache listed but empty: %s", srcPath)
+			}
+		}
+	}
+	if requiredMissing && fileSet.AllowOptionalOnly && !requiredPresent && !authOptionalPresent {
+		return fmt.Errorf("required backup not found and no auth-bearing optional backup is present")
+	}
+	return nil
+}
+
+func preflightLegacyRestoreAuthViability(fileSet AuthFileSet, profileDir string) error {
+	requiredMissing := false
+	requiredPresent := false
+	authOptionalPresent := false
+	var firstMissingRequired string
+	for _, spec := range fileSet.Files {
+		srcPath := filepath.Join(profileDir, filepath.Base(spec.Path))
+		st, err := os.Stat(srcPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				if spec.Required {
+					requiredMissing = true
+					if firstMissingRequired == "" {
+						firstMissingRequired = srcPath
+					}
+				}
+				continue
+			}
+			return fmt.Errorf("stat backup %s: %w", srcPath, err)
+		}
+		if !st.Mode().IsRegular() {
+			return fmt.Errorf("backup path is not a regular file: %s", srcPath)
+		}
+		if spec.Required {
+			requiredPresent = true
+			continue
+		}
+		if isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+			if _, ok, err := claudeDesktopTokenCache(srcPath); err == nil && ok {
+				authOptionalPresent = true
+			}
+			continue
+		}
+		if optionalFileCountsAsAuth(fileSet.Tool, spec.Path, srcPath) {
+			authOptionalPresent = true
+		}
+	}
+	if requiredMissing && !(fileSet.AllowOptionalOnly && !requiredPresent && authOptionalPresent) {
+		return fmt.Errorf("required backup not found: %s", firstMissingRequired)
+	}
+	return nil
+}
+
+func managedStateForRestore(fileSet AuthFileSet, manifest map[string]managedFileState, spec AuthFileSpec) (managedFileState, bool) {
+	filename := filepath.Base(spec.Path)
+	targetPath := filepath.Clean(spec.Path)
+	for _, candidate := range manifest {
+		if filepath.Clean(candidate.OriginalPath) == targetPath {
+			return candidate, true
+		}
+	}
+	if fileSet.Tool == "gemini" && filename == "oauth_creds.json" {
+		legacyState, ok := manifest["oauth_credentials.json"]
+		if ok && geminiLegacyOAuthPathMatches(legacyState.OriginalPath, spec.Path) {
+			legacyState.OriginalPath = spec.Path
+			return legacyState, true
+		}
+	}
+	state, ok := manifest[filename]
+	if ok {
+		return state, true
+	}
+	return managedFileState{}, false
+}
+
+func geminiHasDuplicateOAuthAlias(fileSet AuthFileSet, manifest map[string]managedFileState, spec AuthFileSpec) bool {
+	if fileSet.Tool != "gemini" || filepath.Base(spec.Path) != "oauth_creds.json" {
+		return false
+	}
+	current, hasCurrent := manifest["oauth_creds.json"]
+	legacy, hasLegacy := manifest["oauth_credentials.json"]
+	return hasCurrent &&
+		hasLegacy &&
+		filepath.Clean(current.OriginalPath) == filepath.Clean(spec.Path) &&
+		geminiLegacyOAuthPathMatches(legacy.OriginalPath, spec.Path)
+}
+
+func geminiLegacyOAuthPathMatches(legacyPath, currentPath string) bool {
+	legacyPath = filepath.Clean(legacyPath)
+	currentPath = filepath.Clean(currentPath)
+	return filepath.Base(legacyPath) == "oauth_credentials.json" &&
+		filepath.Base(currentPath) == "oauth_creds.json" &&
+		filepath.Dir(legacyPath) == filepath.Dir(currentPath)
+}
+
+func optionalFileCountsAsAuth(tool, specPath, contentPath string) bool {
+	if tool != "claude" {
+		return true
+	}
+	if filepath.Base(specPath) == ".claude.json" {
+		return false
+	}
+	if filepath.Base(specPath) == "settings.json" && filepath.Base(filepath.Dir(specPath)) == ".claude" {
+		return claudeSettingsHasAPIKeyHelper(contentPath)
+	}
+	return true
+}
+
+func claudeSettingsHasAPIKeyHelper(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var root map[string]interface{}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false
+	}
+	v, exists := root["apiKeyHelper"]
+	return exists && nonEmptyIdentityValue(v)
+}
+
+func authPathSharedWithOtherProvider(tool, path string) bool {
+	target := filepath.Clean(path)
+	for _, candidate := range []AuthFileSet{
+		ClaudeAuthFiles(),
+		CodexAuthFiles(),
+		GeminiAuthFiles(),
+		AntigravityAuthFiles(),
+		OpenCodeAuthFiles(),
+		CursorAuthFiles(),
+	} {
+		if candidate.Tool == tool {
+			continue
+		}
+		for _, spec := range candidate.Files {
+			if filepath.Clean(spec.Path) == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (v *Vault) cleanupAbsentManagedLive(profileDir string, fileSet AuthFileSet, spec AuthFileSpec, state managedFileState) error {
+	if authPathSharedWithOtherProvider(fileSet.Tool, spec.Path) {
+		return nil
+	}
+	managedLive, err := v.livePathMatchesVaultSnapshot(fileSet, spec)
+	if err != nil {
+		return err
+	}
+	if !managedLive {
+		return nil
+	}
+	if state.ClaudeDesktopTokenCache || isClaudeDesktopConfig(fileSet.Tool, spec.Path) {
+		if _, err := v.quarantineClaudeDesktopTokenCache(profileDir, "restore", spec.Path); err != nil {
+			return fmt.Errorf("quarantine stale Claude desktop token cache %s: %w", spec.Path, err)
+		}
+		return nil
+	}
+	if _, err := v.quarantineManagedPath(profileDir, "restore", spec.Path, spec.Path); err != nil {
+		return fmt.Errorf("quarantine stale live auth file %s: %w", spec.Path, err)
+	}
+	return nil
+}
+
+func (v *Vault) livePathMatchesVaultSnapshot(fileSet AuthFileSet, spec AuthFileSpec) (bool, error) {
+	st, err := os.Lstat(spec.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat live auth path %s: %w", spec.Path, err)
+	}
+	if !st.Mode().IsRegular() {
+		return false, fmt.Errorf("managed auth path is not a regular file: %s", spec.Path)
+	}
+	liveHash, ok, err := managedCleanupHash(fileSet.Tool, spec.Path, isClaudeDesktopConfig(fileSet.Tool, spec.Path))
+	if err != nil || !ok {
+		return false, nil
+	}
+	profiles, err := v.List(fileSet.Tool)
+	if err != nil {
+		return false, err
+	}
+	targetPath := filepath.Clean(spec.Path)
+	for _, profile := range profiles {
+		profileDir := v.ProfilePath(fileSet.Tool, profile)
+		manifest, ok, err := v.managedFileManifest(profileDir)
+		if err != nil {
+			continue
+		}
+		if !ok {
+			continue
+		}
+		state, stateKnown := managedStateForRestore(fileSet, manifest, spec)
+		if !stateKnown || !state.Present || filepath.Clean(state.OriginalPath) != targetPath {
+			continue
+		}
+		backupPath := filepath.Join(profileDir, state.VaultName)
+		if _, err := os.Stat(backupPath); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return false, fmt.Errorf("stat vault auth file %s: %w", backupPath, err)
+		}
+		backupHash, ok, err := managedCleanupHash(fileSet.Tool, backupPath, state.ClaudeDesktopTokenCache)
+		if err != nil || !ok {
+			continue
+		}
+		if liveHash == backupHash {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func managedCleanupHash(tool, path string, useClaudeDesktopTokenCache bool) (string, bool, error) {
+	if useClaudeDesktopTokenCache || isClaudeDesktopConfig(tool, path) {
+		fields, ok, err := claudeDesktopTokenCache(path)
+		if err != nil || !ok {
+			return "", false, err
+		}
+		canonical, err := json.Marshal(fields)
+		if err != nil {
+			return "", false, err
+		}
+		h := sha256.New()
+		h.Write([]byte("claude:desktop:"))
+		h.Write(canonical)
+		return hex.EncodeToString(h.Sum(nil)), true, nil
+	}
+	hash, err := hashFile(path)
+	return hash, err == nil, err
+}
+
+func (v *Vault) copyManagedPathToQuarantine(profileDir, reason, originalPath, path string) (bool, error) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !st.Mode().IsRegular() {
+		return false, fmt.Errorf("managed auth path is not a regular file: %s", path)
+	}
+	dst, err := quarantineDestination(profileDir, reason, originalPath)
+	if err != nil {
+		return false, err
+	}
+	if err := copyFile(path, dst); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (v *Vault) quarantineManagedPath(profileDir, reason, originalPath, path string) (bool, error) {
+	st, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !st.Mode().IsRegular() {
+		return false, fmt.Errorf("managed auth path is not a regular file: %s", path)
+	}
+	dst, err := quarantineDestination(profileDir, reason, originalPath)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Rename(path, dst); err != nil {
+		if !errors.Is(err, syscall.EXDEV) {
+			return false, err
+		}
+		sourceHash, err := hashFile(path)
+		if err != nil {
+			return false, err
+		}
+		if err := copyFile(path, dst); err != nil {
+			return false, err
+		}
+		dstHash, err := hashFile(dst)
+		if err != nil {
+			return false, err
+		}
+		if dstHash != sourceHash {
+			return false, fmt.Errorf("quarantine copy hash mismatch for %s", path)
+		}
+		current, err := os.Lstat(path)
+		if err != nil {
+			return false, err
+		}
+		currentHash, err := hashFile(path)
+		if err != nil {
+			return false, err
+		}
+		if !os.SameFile(st, current) || currentHash != sourceHash {
+			return false, fmt.Errorf("source changed while quarantining %s", path)
+		}
+		if err := os.Remove(path); err != nil {
+			return false, fmt.Errorf("remove quarantined source %s: %w", path, err)
+		}
+	}
+	return true, nil
+}
+
+func (v *Vault) quarantineClaudeDesktopTokenCache(profileDir, reason, livePath string) (bool, error) {
+	fields, ok, err := claudeDesktopTokenCache(livePath)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	dst, err := quarantineDestination(profileDir, reason, livePath)
+	if err != nil {
+		return false, err
+	}
+	if err := writeJSONFileAtomic(dst, fields, 0600); err != nil {
+		return false, err
+	}
+	if err := scrubClaudeDesktopTokenCache(livePath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func quarantineDestination(profileDir, reason, originalPath string) (string, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "managed"
+	}
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	dir := filepath.Join(profileDir, quarantineDirName, reason, stamp)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	base := quarantineFileName(originalPath)
+	dst := filepath.Join(dir, base)
+	if _, err := os.Lstat(dst); os.IsNotExist(err) {
+		return dst, nil
+	} else if err != nil {
+		return "", err
+	}
+	for i := 1; ; i++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%d-%s", i, base))
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+}
+
+func quarantineFileName(originalPath string) string {
+	cleaned := filepath.Clean(originalPath)
+	sum := sha256.Sum256([]byte(cleaned))
+	prefix := hex.EncodeToString(sum[:8])
+	base := filepath.Base(cleaned)
+	if base == "." || base == string(os.PathSeparator) || base == "" {
+		base = "managed-auth-file"
+	}
+	return prefix + "-" + base
 }
 
 // writeJSONFileAtomic marshals v (indented) and writes it to path atomically.
@@ -1838,6 +2532,9 @@ func validateVaultSegment(kind, val string) (string, error) {
 	}
 	if val == "." || val == ".." {
 		return "", fmt.Errorf("invalid %s: %q", kind, val)
+	}
+	if strings.HasPrefix(val, ".") {
+		return "", fmt.Errorf("invalid %s: %q (leading period is reserved for caam internal directories)", kind, val)
 	}
 	// Only allow safe characters: alphanumeric, underscore, hyphen, period, and @.
 	// This prevents shell injection when profile names are used in shell scripts

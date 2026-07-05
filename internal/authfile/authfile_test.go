@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestNewVault(t *testing.T) {
@@ -407,6 +409,1785 @@ func TestVaultRestore(t *testing.T) {
 			t.Fatalf("Restore() error = %v", err)
 		}
 	})
+}
+
+func TestVaultRestoreQuarantinesStaleOptionalLiveFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"with-optional"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"with-optional"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "with-optional"); err != nil {
+		t.Fatalf("Backup(with-optional): %v", err)
+	}
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"required-only"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(optionalPath, optionalPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "required-only"); err != nil {
+		t.Fatalf("Backup(required-only): %v", err)
+	}
+
+	if err := v.Restore(fileSet, "with-optional"); err != nil {
+		t.Fatalf("Restore(with-optional): %v", err)
+	}
+	if _, err := os.Stat(optionalPath); err != nil {
+		t.Fatalf("optional should exist after restoring with-optional: %v", err)
+	}
+
+	if err := v.Restore(fileSet, "required-only"); err != nil {
+		t.Fatalf("Restore(required-only): %v", err)
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("optional should be quarantined away after restoring required-only, stat err=%v", err)
+	}
+	if got := string(readSingleQuarantinedFile(t, v.ProfilePath("testtool", "required-only"), "optional.json")); got != `{"optional":"with-optional"}` {
+		t.Fatalf("quarantined optional content = %q", got)
+	}
+}
+
+func TestVaultBackupQuarantinesStaleOptionalVaultFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"v1"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"v1"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err != nil {
+		t.Fatalf("Backup(v1): %v", err)
+	}
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"v2"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(optionalPath, optionalPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err != nil {
+		t.Fatalf("Backup(v2): %v", err)
+	}
+
+	if _, err := os.Stat(v.BackupPath("testtool", "acct", "optional.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale optional backup should be quarantined away, stat err=%v", err)
+	}
+	if got := string(readSingleQuarantinedFile(t, v.ProfilePath("testtool", "acct"), "optional.json")); got != `{"optional":"v1"}` {
+		t.Fatalf("quarantined vault optional content = %q", got)
+	}
+
+	var meta struct {
+		ManagedFiles []managedFileState `json:"managed_files"`
+	}
+	data, err := os.ReadFile(filepath.Join(v.ProfilePath("testtool", "acct"), "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	var sawAbsentOptional bool
+	for _, f := range meta.ManagedFiles {
+		if f.VaultName == "optional.json" && !f.Present && !f.Required {
+			sawAbsentOptional = true
+		}
+	}
+	if !sawAbsentOptional {
+		t.Fatalf("meta.json did not record absent optional managed file: %+v", meta.ManagedFiles)
+	}
+
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"foreign-live"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Restore(fileSet, "acct"); err != nil {
+		t.Fatalf("Restore(acct): %v", err)
+	}
+	data, err = os.ReadFile(optionalPath)
+	if err != nil {
+		t.Fatalf("restore should leave unproven foreign live optional in place: %v", err)
+	}
+	if string(data) != `{"optional":"foreign-live"}` {
+		t.Fatalf("foreign live optional changed: %q", data)
+	}
+}
+
+func TestVaultBackupMissingRequiredDoesNotMutateExistingProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"old"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"old"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err != nil {
+		t.Fatalf("Backup(old): %v", err)
+	}
+
+	if err := os.Rename(requiredPath, requiredPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"new-foreign"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err == nil {
+		t.Fatal("Backup() succeeded with missing required file")
+	}
+
+	data, err := os.ReadFile(v.BackupPath("testtool", "acct", "optional.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"optional":"old"}` {
+		t.Fatalf("failed backup mutated optional snapshot: %q", data)
+	}
+}
+
+func TestVaultBackupPostValidationFailureDoesNotMutateExistingProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"old"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"old"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err != nil {
+		t.Fatalf("Backup(old): %v", err)
+	}
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"new"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(optionalPath, optionalPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(optionalPath, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "acct"); err == nil {
+		t.Fatal("Backup() succeeded with directory at planned auth-file path")
+	}
+
+	data, err := os.ReadFile(v.BackupPath("testtool", "acct", "required.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"required":"old"}` {
+		t.Fatalf("failed staged backup mutated required snapshot: %q", data)
+	}
+	data, err = os.ReadFile(v.BackupPath("testtool", "acct", "optional.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"optional":"old"}` {
+		t.Fatalf("failed staged backup mutated optional snapshot: %q", data)
+	}
+}
+
+func TestVaultBackupNoFilesDoesNotCreateProfileDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	missingPath := filepath.Join(tmpDir, "auth", "required.json")
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: missingPath, Required: true}},
+	}
+
+	if err := v.Backup(fileSet, "missing"); err == nil {
+		t.Fatal("Backup() succeeded with no files")
+	}
+	if _, err := os.Stat(v.ProfilePath("testtool", "missing")); !os.IsNotExist(err) {
+		t.Fatalf("failed backup should not create profile dir, stat err=%v", err)
+	}
+}
+
+func TestVaultBackupClaudeSettingsOnlyDoesNotCreateAuthProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	if err := v.Backup(ClaudeAuthFiles(), "settings-only"); err == nil {
+		t.Fatal("Backup() accepted .claude.json settings as an auth-bearing optional profile")
+	}
+	if _, err := os.Stat(v.ProfilePath("claude", "settings-only")); !os.IsNotExist(err) {
+		t.Fatalf("settings-only Claude backup should not create a profile dir, stat err=%v", err)
+	}
+}
+
+func TestVaultBackupClaudeUserSettingsWithoutAPIKeyHelperDoesNotCreateAuthProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	if err := v.Backup(ClaudeAuthFiles(), "plain-user-settings"); err == nil {
+		t.Fatal("Backup() accepted plain .claude/settings.json as an auth-bearing optional profile")
+	}
+	if _, err := os.Stat(v.ProfilePath("claude", "plain-user-settings")); !os.IsNotExist(err) {
+		t.Fatalf("plain user settings backup should not create a profile dir, stat err=%v", err)
+	}
+}
+
+func TestVaultBackupClaudeAPIKeyHelperSettingsCreatesOptionalAuthProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"apiKeyHelper":"security find-generic-password -w -s claude"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	if err := v.Backup(ClaudeAuthFiles(), "api-key-helper"); err != nil {
+		t.Fatalf("Backup() rejected API-key-helper settings: %v", err)
+	}
+	if _, err := os.Stat(v.ProfilePath("claude", "api-key-helper")); err != nil {
+		t.Fatalf("API-key-helper backup should create a profile dir: %v", err)
+	}
+}
+
+func TestClaudeSettingsOnlyDoesNotCountAsAuthFilesOrActiveProfile(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+	settingsPath := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileSet := ClaudeAuthFiles()
+	if HasAuthFiles(fileSet) {
+		t.Fatal("HasAuthFiles() treated .claude.json settings as auth")
+	}
+
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	profileDir := v.ProfilePath("claude", "settings-only")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, ".claude.json"), []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	active, err := v.ActiveProfile(fileSet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active != "" {
+		t.Fatalf("ActiveProfile() matched settings-only Claude profile %q", active)
+	}
+}
+
+func TestClaudeAPIKeyHelperSettingsCountsAsAuthFiles(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	settingsPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(settingsPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"apiKeyHelper":"op read op://vault/claude/key"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !HasAuthFiles(ClaudeAuthFiles()) {
+		t.Fatal("HasAuthFiles() did not treat apiKeyHelper settings as auth")
+	}
+}
+
+func TestVaultBackupCurrentUsesUniqueNames(t *testing.T) {
+	oldNow := timeNow
+	timeNow = func() time.Time {
+		return time.Date(2026, 7, 5, 12, 0, 0, 123456789, time.UTC)
+	}
+	t.Cleanup(func() { timeNow = oldNow })
+
+	tmpDir := t.TempDir()
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(authDir, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"token":"current"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+	}
+
+	first, err := v.BackupCurrent(fileSet)
+	if err != nil {
+		t.Fatalf("BackupCurrent(first): %v", err)
+	}
+	second, err := v.BackupCurrent(fileSet)
+	if err != nil {
+		t.Fatalf("BackupCurrent(second): %v", err)
+	}
+	if first == "" || second == "" || first == second {
+		t.Fatalf("BackupCurrent names = %q, %q; want distinct non-empty names", first, second)
+	}
+}
+
+func TestVaultRejectsDuplicateVaultNames(t *testing.T) {
+	tmpDir := t.TempDir()
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: filepath.Join(tmpDir, "a", "auth.json"), Required: false},
+			{Tool: "testtool", Path: filepath.Join(tmpDir, "b", "auth.json"), Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+
+	if err := v.Backup(fileSet, "dup"); err == nil {
+		t.Fatal("Backup() accepted duplicate vault basenames")
+	}
+	if err := v.Restore(fileSet, "dup"); err == nil {
+		t.Fatal("Restore() accepted duplicate vault basenames")
+	}
+}
+
+func TestVaultRejectsDotPrefixedProfileName(t *testing.T) {
+	tmpDir := t.TempDir()
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	authPath := filepath.Join(authDir, "auth.json")
+	if err := os.WriteFile(authPath, []byte(`{"token":"x"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+	}
+	if err := v.Backup(fileSet, ".work"); err == nil {
+		t.Fatal("Backup() accepted dot-prefixed profile name")
+	}
+}
+
+func TestVaultRestoreRequiresExactCleanupProof(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, ".claude.json")
+	fileSet := AuthFileSet{
+		Tool: "claude",
+		Files: []AuthFileSpec{
+			{Tool: "claude", Path: requiredPath, Required: true},
+			{Tool: "claude", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"with-settings"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"theme":"snapshot"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "with-settings"); err != nil {
+		t.Fatalf("Backup(with-settings): %v", err)
+	}
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"without-settings"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(optionalPath, optionalPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "without-settings"); err != nil {
+		t.Fatalf("Backup(without-settings): %v", err)
+	}
+
+	if err := os.WriteFile(optionalPath, []byte(`{"theme":"foreign-live-user-data"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Restore(fileSet, "without-settings"); err != nil {
+		t.Fatalf("Restore(without-settings): %v", err)
+	}
+	data, err := os.ReadFile(optionalPath)
+	if err != nil {
+		t.Fatalf("restore should leave byte-different settings-only file in place: %v", err)
+	}
+	if string(data) != `{"theme":"foreign-live-user-data"}` {
+		t.Fatalf("settings-only live file changed: %q", data)
+	}
+}
+
+func TestVaultRestoreLegacyProfileIsNotCleanupProof(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "target-without-optional"); err != nil {
+		t.Fatalf("Backup(target-without-optional): %v", err)
+	}
+
+	legacyDir := v.ProfilePath("testtool", "legacy-proof")
+	if err := os.MkdirAll(legacyDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "optional.json"), []byte(`{"optional":"legacy-proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "meta.json"), []byte(`{"tool":"testtool","profile":"legacy-proof","files":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"legacy-proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Restore(fileSet, "target-without-optional"); err != nil {
+		t.Fatalf("Restore(target-without-optional): %v", err)
+	}
+	data, err := os.ReadFile(optionalPath)
+	if err != nil {
+		t.Fatalf("restore should leave live optional when only proof is legacy: %v", err)
+	}
+	if string(data) != `{"optional":"legacy-proof"}` {
+		t.Fatalf("legacy-proof live optional changed: %q", data)
+	}
+}
+
+func TestVaultRestoreAbsentMetadataMustMatchSpecPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	oldDir := filepath.Join(tmpDir, "old")
+	newDir := filepath.Join(tmpDir, "new")
+	for _, dir := range []string{authDir, oldDir, newDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	oldOptionalPath := filepath.Join(oldDir, "optional.json")
+	newOptionalPath := filepath.Join(newDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: newOptionalPath, Required: false},
+		},
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newOptionalPath, []byte(`{"optional":"proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "current-proof"); err != nil {
+		t.Fatalf("Backup(current-proof): %v", err)
+	}
+
+	targetDir := v.ProfilePath("testtool", "target-old-absent")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "target-old-absent",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: true},
+			{VaultName: "optional.json", OriginalPath: oldOptionalPath, Required: false, Present: false},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(newOptionalPath, []byte(`{"optional":"proof"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Restore(fileSet, "target-old-absent"); err != nil {
+		t.Fatalf("Restore(target-old-absent): %v", err)
+	}
+	data, err := os.ReadFile(newOptionalPath)
+	if err != nil {
+		t.Fatalf("restore should leave current-path optional in place: %v", err)
+	}
+	if string(data) != `{"optional":"proof"}` {
+		t.Fatalf("current-path optional changed: %q", data)
+	}
+}
+
+func TestVaultRestoreOptionalOnlyQuarantinesStaleRequiredLiveFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+	v := NewVault(vaultDir)
+
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"with-required"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"with-required"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "with-required"); err != nil {
+		t.Fatalf("Backup(with-required): %v", err)
+	}
+
+	if err := os.Rename(requiredPath, requiredPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"optional-only"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fileSet, "optional-only"); err != nil {
+		t.Fatalf("Backup(optional-only): %v", err)
+	}
+
+	if err := v.Restore(fileSet, "with-required"); err != nil {
+		t.Fatalf("Restore(with-required): %v", err)
+	}
+	if err := v.Restore(fileSet, "optional-only"); err != nil {
+		t.Fatalf("Restore(optional-only): %v", err)
+	}
+	if _, err := os.Stat(requiredPath); !os.IsNotExist(err) {
+		t.Fatalf("required auth should be quarantined away for optional-only profile, stat err=%v", err)
+	}
+	if got := string(readSingleQuarantinedFile(t, v.ProfilePath("testtool", "optional-only"), "required.json")); got != `{"required":"with-required"}` {
+		t.Fatalf("quarantined required content = %q", got)
+	}
+}
+
+func TestVaultRestorePresentMetadataMustMatchSpecPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	oldDir := filepath.Join(tmpDir, "old")
+	newDir := filepath.Join(tmpDir, "new")
+	for _, dir := range []string{authDir, oldDir, newDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	oldOptionalPath := filepath.Join(oldDir, "optional.json")
+	newOptionalPath := filepath.Join(newDir, "optional.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "target-old-present")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"old-path"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "target-old-present",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           2,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: true},
+			{VaultName: "optional.json", OriginalPath: oldOptionalPath, Required: false, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: newOptionalPath, Required: false},
+		},
+	}
+	if err := v.Restore(fileSet, "target-old-present"); err != nil {
+		t.Fatalf("Restore(target-old-present): %v", err)
+	}
+	if _, err := os.Stat(newOptionalPath); !os.IsNotExist(err) {
+		t.Fatalf("restore should not copy old-path optional to current path, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedManifestMissingEntryDoesNotRestoreStaleBasename(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "managed-missing-entry")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"stale-basename"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "managed-missing-entry",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	if err := v.Restore(fileSet, "managed-missing-entry"); err != nil {
+		t.Fatalf("Restore(managed-missing-entry): %v", err)
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("managed restore should not copy stale optional basename without metadata entry, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedManifestMissingRequiredEntryFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "missing-required-entry")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"stale-basename"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "missing-required-entry",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "optional.json", OriginalPath: optionalPath, Required: false, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+	if err := v.Restore(fileSet, "missing-required-entry"); err == nil {
+		t.Fatal("Restore() succeeded with required spec missing from managed metadata")
+	}
+	if _, err := os.Stat(requiredPath); !os.IsNotExist(err) {
+		t.Fatalf("managed restore should not copy stale required basename without metadata entry, stat err=%v", err)
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("restore should fail before mutating optional auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreMalformedManagedMetadataFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "malformed-meta")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), []byte(`{`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: requiredPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "malformed-meta"); err == nil {
+		t.Fatal("Restore() succeeded with malformed managed metadata")
+	}
+	if _, err := os.Stat(requiredPath); !os.IsNotExist(err) {
+		t.Fatalf("malformed metadata should fail before restoring live auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedEmptyMetadataFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "empty-managed-meta")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), []byte(`{"manifest_version":1,"managed_files":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: requiredPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "empty-managed-meta"); err == nil {
+		t.Fatal("Restore() succeeded with empty managed metadata")
+	}
+	if _, err := os.Stat(requiredPath); !os.IsNotExist(err) {
+		t.Fatalf("empty managed metadata should fail before restoring live auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreInvalidManagedMetadataEntryFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "invalid-managed-entry")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), []byte(`{"manifest_version":1,"managed_files":[{"vault_name":"","original_path":"","present":true}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: requiredPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "invalid-managed-entry"); err == nil {
+		t.Fatal("Restore() succeeded with invalid managed metadata entry")
+	}
+	if _, err := os.Stat(requiredPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid managed metadata should fail before restoring live auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreGeminiManagedMetadataUsesMigratedOAuthName(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	geminiDir := filepath.Join(tmpDir, ".gemini")
+	if err := os.MkdirAll(geminiDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	currentPath := filepath.Join(geminiDir, "oauth_creds.json")
+	legacyPath := filepath.Join(geminiDir, "oauth_credentials.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("gemini", "legacy-managed")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "oauth_credentials.json"), []byte(`{"token":"legacy"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "gemini",
+		Profile:         "legacy-managed",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "oauth_credentials.json", OriginalPath: legacyPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "gemini",
+		Files: []AuthFileSpec{{Tool: "gemini", Path: currentPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "legacy-managed"); err != nil {
+		t.Fatalf("Restore(legacy-managed): %v", err)
+	}
+	data, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"token":"legacy"}` {
+		t.Fatalf("restored Gemini OAuth content = %q", data)
+	}
+}
+
+func TestVaultRestoreGeminiManagedMetadataUsesLegacySnapshotWhenBothOAuthNamesExist(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	geminiDir := filepath.Join(tmpDir, ".gemini")
+	if err := os.MkdirAll(geminiDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	currentPath := filepath.Join(geminiDir, "oauth_creds.json")
+	legacyPath := filepath.Join(geminiDir, "oauth_credentials.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("gemini", "legacy-managed-both")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "oauth_credentials.json"), []byte(`{"token":"metadata-referenced"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "oauth_creds.json"), []byte(`{"token":"stale-new-name"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "gemini",
+		Profile:         "legacy-managed-both",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "oauth_credentials.json", OriginalPath: legacyPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "gemini",
+		Files: []AuthFileSpec{{Tool: "gemini", Path: currentPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "legacy-managed-both"); err != nil {
+		t.Fatalf("Restore(legacy-managed-both): %v", err)
+	}
+	data, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"token":"metadata-referenced"}` {
+		t.Fatalf("restored Gemini OAuth content = %q", data)
+	}
+}
+
+func TestVaultRestoreGeminiManagedInvalidMetaDoesNotMigrate(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	geminiDir := filepath.Join(tmpDir, ".gemini")
+	if err := os.MkdirAll(geminiDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	currentPath := filepath.Join(geminiDir, "oauth_creds.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("gemini", "invalid-managed")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldVaultPath := filepath.Join(targetDir, "oauth_credentials.json")
+	newVaultPath := filepath.Join(targetDir, "oauth_creds.json")
+	if err := os.WriteFile(oldVaultPath, []byte(`{"token":"old"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newVaultPath, []byte(`{"token":"new"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), []byte(`{"manifest_version":1,"managed_files":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "gemini",
+		Files: []AuthFileSpec{{Tool: "gemini", Path: currentPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "invalid-managed"); err == nil {
+		t.Fatal("Restore() succeeded with invalid managed Gemini metadata")
+	}
+	oldData, err := os.ReadFile(oldVaultPath)
+	if err != nil {
+		t.Fatalf("old Gemini vault file was touched: %v", err)
+	}
+	newData, err := os.ReadFile(newVaultPath)
+	if err != nil {
+		t.Fatalf("new Gemini vault file was touched: %v", err)
+	}
+	if string(oldData) != `{"token":"old"}` || string(newData) != `{"token":"new"}` {
+		t.Fatalf("Gemini vault files changed: old=%q new=%q", oldData, newData)
+	}
+	if _, err := os.Stat(currentPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid metadata should fail before restoring live Gemini auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedUsesMetadataVaultNameForSource(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	authPath := filepath.Join(authDir, "auth.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "custom-vault-name")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "auth.snapshot"), []byte(`{"token":"snapshot"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "custom-vault-name",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "auth.snapshot", OriginalPath: authPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "custom-vault-name"); err != nil {
+		t.Fatalf("Restore(custom-vault-name): %v", err)
+	}
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"token":"snapshot"}` {
+		t.Fatalf("restored auth content = %q", data)
+	}
+}
+
+func TestVaultRestoreManagedOriginalPathMatchBeatsStaleBasename(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	oldDir := filepath.Join(tmpDir, "old")
+	for _, dir := range []string{authDir, oldDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	authPath := filepath.Join(authDir, "auth.json")
+	oldPath := filepath.Join(oldDir, "auth.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "shadowed-basename")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "auth.json"), []byte(`{"token":"stale-basename"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "auth.snapshot"), []byte(`{"token":"correct"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "shadowed-basename",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           2,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "auth.json", OriginalPath: oldPath, Required: true, Present: true},
+			{VaultName: "auth.snapshot", OriginalPath: authPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "shadowed-basename"); err != nil {
+		t.Fatalf("Restore(shadowed-basename): %v", err)
+	}
+	data, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != `{"token":"correct"}` {
+		t.Fatalf("restored auth content = %q", data)
+	}
+}
+
+func TestVaultRestoreManagedCleanupProofUsesMetadataVaultName(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	v := NewVault(vaultDir)
+	proofDir := v.ProfilePath("testtool", "proof")
+	if err := os.MkdirAll(proofDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "optional.snapshot"), []byte(`{"optional":"stale"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	proofMeta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "proof",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "optional.snapshot", OriginalPath: optionalPath, Required: false, Present: true},
+		},
+	}
+	raw, err := json.Marshal(proofMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proofDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := v.ProfilePath("testtool", "target")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "required.json"), []byte(`{"required":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	targetMeta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "target",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: true},
+			{VaultName: "optional.snapshot", OriginalPath: optionalPath, Required: false, Present: false},
+		},
+	}
+	raw, err = json.Marshal(targetMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"stale"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	if err := v.Restore(fileSet, "target"); err != nil {
+		t.Fatalf("Restore(target): %v", err)
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("cleanup proof with metadata vault name should quarantine live optional, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedPreflightOptionalBeforeRequiredAbsentDoesNotMutate(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	optionalPath := filepath.Join(authDir, "optional.json")
+	requiredPath := filepath.Join(authDir, "required.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "preflight-required-absent")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "preflight-required-absent",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "optional.json", OriginalPath: optionalPath, Required: false, Present: true},
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: false},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: optionalPath, Required: false},
+			{Tool: "testtool", Path: requiredPath, Required: true},
+		},
+	}
+	if err := v.Restore(fileSet, "preflight-required-absent"); err == nil {
+		t.Fatal("Restore() succeeded with required managed auth absent and optional-only disabled")
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("preflight should fail before restoring earlier optional auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreClaudeManagedSettingsOnlyDoesNotMutate(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(home, ".claude", ".credentials.json")
+	settingsPath := filepath.Join(home, ".claude.json")
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	targetDir := v.ProfilePath("claude", "settings-only")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, ".claude.json"), []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "claude",
+		Profile:         "settings-only",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: ".credentials.json", OriginalPath: requiredPath, Required: true, Present: false},
+			{VaultName: ".claude.json", OriginalPath: settingsPath, Required: false, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.Restore(ClaudeAuthFiles(), "settings-only"); err == nil {
+		t.Fatal("Restore() accepted .claude.json settings as an auth-bearing optional profile")
+	}
+	if _, err := os.Stat(settingsPath); !os.IsNotExist(err) {
+		t.Fatalf("settings-only restore should fail before writing live .claude.json, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreClaudeLegacySettingsOnlyDoesNotMutate(t *testing.T) {
+	tmpDir := t.TempDir()
+	home := filepath.Join(tmpDir, "home")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+	if err := os.MkdirAll(home, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	settingsPath := filepath.Join(home, ".claude.json")
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	targetDir := v.ProfilePath("claude", "legacy-settings-only")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, ".claude.json"), []byte(`{"theme":"dark"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.Restore(ClaudeAuthFiles(), "legacy-settings-only"); err == nil {
+		t.Fatal("Restore() accepted legacy .claude.json settings as an auth-bearing optional profile")
+	}
+	if _, err := os.Stat(settingsPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy settings-only restore should fail before writing live .claude.json, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedPreflightDirectorySourceDoesNotMutate(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	optionalPath := filepath.Join(authDir, "optional.json")
+	requiredPath := filepath.Join(authDir, "required.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "preflight-directory-source")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(targetDir, "required.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "preflight-directory-source",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           2,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "optional.json", OriginalPath: optionalPath, Required: false, Present: true},
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: optionalPath, Required: false},
+			{Tool: "testtool", Path: requiredPath, Required: true},
+		},
+	}
+	if err := v.Restore(fileSet, "preflight-directory-source"); err == nil {
+		t.Fatal("Restore() succeeded with directory managed source")
+	}
+	if _, err := os.Stat(optionalPath); !os.IsNotExist(err) {
+		t.Fatalf("preflight should fail before restoring earlier optional auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedDuplicateOriginalPathFailsClosed(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	authPath := filepath.Join(authDir, "auth.json")
+	v := NewVault(vaultDir)
+	targetDir := v.ProfilePath("testtool", "duplicate-original")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "a.json"), []byte(`{"token":"a"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "b.json"), []byte(`{"token":"b"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "duplicate-original",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           2,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "a.json", OriginalPath: authPath, Required: true, Present: true},
+			{VaultName: "b.json", OriginalPath: authPath, Required: true, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fileSet := AuthFileSet{
+		Tool:  "testtool",
+		Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+	}
+	if err := v.Restore(fileSet, "duplicate-original"); err == nil {
+		t.Fatal("Restore() succeeded with duplicate managed original paths")
+	}
+	if _, err := os.Stat(authPath); !os.IsNotExist(err) {
+		t.Fatalf("duplicate original paths should fail before restoring live auth, stat err=%v", err)
+	}
+}
+
+func TestVaultRestoreManagedRejectsPathfulVaultName(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	authPath := filepath.Join(authDir, "auth.json")
+	v := NewVault(vaultDir)
+	for _, vaultName := range []string{"subdir/auth.json", "../auth.json", "/abs/auth.json"} {
+		profile := "bad-vault-name-" + strings.NewReplacer("/", "-", ".", "dot").Replace(vaultName)
+		targetDir := v.ProfilePath("testtool", profile)
+		if err := os.MkdirAll(targetDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(targetDir, "auth.json"), []byte(`{"token":"target"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		meta := vaultProfileMeta{
+			Tool:            "testtool",
+			Profile:         profile,
+			BackedUpAt:      time.Now().Format(time.RFC3339),
+			Files:           1,
+			ManifestVersion: 1,
+			ManagedFiles: []managedFileState{
+				{VaultName: vaultName, OriginalPath: authPath, Required: true, Present: true},
+			},
+		}
+		raw, err := json.Marshal(meta)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		fileSet := AuthFileSet{
+			Tool:  "testtool",
+			Files: []AuthFileSpec{{Tool: "testtool", Path: authPath, Required: true}},
+		}
+		if err := v.Restore(fileSet, profile); err == nil {
+			t.Fatalf("Restore() succeeded with pathful vault name %q", vaultName)
+		}
+		if _, err := os.Stat(authPath); !os.IsNotExist(err) {
+			t.Fatalf("pathful vault name should fail before restoring live auth, stat err=%v", err)
+		}
+	}
+}
+
+func TestVaultRestoreLegacyProfileMissingOptionalDoesNotQuarantineLiveFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	profileDir := filepath.Join(vaultDir, "testtool", "legacy")
+	if err := os.MkdirAll(profileDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	if err := os.WriteFile(filepath.Join(profileDir, "required.json"), []byte(`{"required":"legacy"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "meta.json"), []byte(`{"tool":"testtool","profile":"legacy","files":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(optionalPath, []byte(`{"optional":"live"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(vaultDir)
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+	}
+	if err := v.Restore(fileSet, "legacy"); err != nil {
+		t.Fatalf("Restore(legacy): %v", err)
+	}
+	data, err := os.ReadFile(optionalPath)
+	if err != nil {
+		t.Fatalf("legacy restore should leave live optional in place: %v", err)
+	}
+	if string(data) != `{"optional":"live"}` {
+		t.Fatalf("live optional changed: %q", data)
+	}
+}
+
+func TestVaultRestoreCorruptOtherProfileIsNotCleanupProof(t *testing.T) {
+	tmpDir := t.TempDir()
+	vaultDir := filepath.Join(tmpDir, "vault")
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	requiredPath := filepath.Join(authDir, "required.json")
+	optionalPath := filepath.Join(authDir, "optional.json")
+	v := NewVault(vaultDir)
+	fileSet := AuthFileSet{
+		Tool: "testtool",
+		Files: []AuthFileSpec{
+			{Tool: "testtool", Path: requiredPath, Required: true},
+			{Tool: "testtool", Path: optionalPath, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+
+	corruptDir := v.ProfilePath("testtool", "corrupt-proof")
+	if err := os.MkdirAll(corruptDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "required.json"), []byte(`{"required":"live"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "meta.json"), []byte(`{`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	targetDir := v.ProfilePath("testtool", "optional-only")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "optional.json"), []byte(`{"optional":"target"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	meta := vaultProfileMeta{
+		Tool:            "testtool",
+		Profile:         "optional-only",
+		BackedUpAt:      time.Now().Format(time.RFC3339),
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: false},
+			{VaultName: "optional.json", OriginalPath: optionalPath, Required: false, Present: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(requiredPath, []byte(`{"required":"live"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := v.Restore(fileSet, "optional-only"); err != nil {
+		t.Fatalf("Restore(optional-only): %v", err)
+	}
+	data, err := os.ReadFile(requiredPath)
+	if err != nil {
+		t.Fatalf("corrupt unrelated proof profile should not authorize cleanup: %v", err)
+	}
+	if string(data) != `{"required":"live"}` {
+		t.Fatalf("required auth changed: %q", data)
+	}
+}
+
+func TestVaultRestoreDoesNotQuarantineSharedProviderOptional(t *testing.T) {
+	tmpDir := t.TempDir()
+	geminiHome := filepath.Join(tmpDir, "gemini-home")
+	t.Setenv("HOME", filepath.Join(tmpDir, "home"))
+	t.Setenv("GEMINI_HOME", geminiHome)
+	if err := os.MkdirAll(geminiHome, 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	settingsPath := filepath.Join(geminiHome, "settings.json")
+	sharedPath := filepath.Join(geminiHome, "oauth_creds.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"active":"gemini"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedPath, []byte(`{"shared":"belongs-to-agy-too"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	v := NewVault(filepath.Join(tmpDir, "vault"))
+	fs := GeminiAuthFiles()
+	if err := v.Backup(fs, "with-shared"); err != nil {
+		t.Fatalf("Backup(with-shared): %v", err)
+	}
+
+	if err := os.Rename(sharedPath, sharedPath+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(settingsPath, []byte(`{"active":"settings-only"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Backup(fs, "settings-only"); err != nil {
+		t.Fatalf("Backup(settings-only): %v", err)
+	}
+
+	if err := os.WriteFile(sharedPath, []byte(`{"shared":"belongs-to-agy-too"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.Restore(fs, "settings-only"); err != nil {
+		t.Fatalf("Restore(settings-only): %v", err)
+	}
+	data, err := os.ReadFile(sharedPath)
+	if err != nil {
+		t.Fatalf("shared optional should remain live: %v", err)
+	}
+	if string(data) != `{"shared":"belongs-to-agy-too"}` {
+		t.Fatalf("shared optional changed: %q", data)
+	}
+}
+
+func readSingleQuarantinedFile(t *testing.T, profileDir, base string) []byte {
+	t.Helper()
+	var matches []string
+	err := filepath.WalkDir(filepath.Join(profileDir, ".caam-quarantine"), func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(filepath.Base(path), "-"+base) {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("quarantine matches for %s = %v, want exactly one", base, matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }
 
 func TestMigrateGeminiVaultDir(t *testing.T) {

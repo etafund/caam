@@ -45,13 +45,13 @@ stealth:
 	createProfile := func(name string) {
 		dir := filepath.Join(vaultDir, "claude", name)
 		require.NoError(t, os.MkdirAll(dir, 0755))
-		// Mock auth file. The identity-bearing field for Claude's .claude.json is
-		// oauthAccount; it must be distinct per profile, otherwise every profile
-		// hashes to the same "no-identity" sentinel and ActiveProfile (which
-		// content-matches) would always resolve to the first profile, breaking
-		// round-robin's current-profile detection across activations.
-		content := fmt.Sprintf(`{"oauthAccount":{"emailAddress":"%s@example.com","accountUuid":"uuid-%s"}}`, name, name)
-		require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(content), 0600))
+		// Mock required Claude auth plus companion settings. The required
+		// credentials carry the account identity used by ActiveProfile; the
+		// settings file is restored for user-visible verification below.
+		creds := fmt.Sprintf(`{"claudeAiOauth":{"refreshToken":"refresh-%s","accessToken":"access-%s"}}`, name, name)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".credentials.json"), []byte(creds), 0600))
+		settings := fmt.Sprintf(`{"oauthAccount":{"emailAddress":"%s@example.com","accountUuid":"uuid-%s"}}`, name, name)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(settings), 0600))
 	}
 
 	createProfile("p1")

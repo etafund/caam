@@ -145,6 +145,170 @@ func TestClaudeDesktopBackupRestoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClaudeDesktopRestoreMissingSnapshotScrubsTokenCacheOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+
+	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	fs := ClaudeAuthFiles()
+
+	writeCreds := func(token string) {
+		p := filepath.Join(home, ".claude", ".credentials.json")
+		writeJSONT(t, p, map[string]interface{}{
+			"claudeAiOauth": map[string]interface{}{"accessToken": token, "refreshToken": token},
+		})
+	}
+
+	desktop := desktopPath(home)
+	writeCreds("A-TOKEN")
+	writeJSONT(t, desktop, map[string]interface{}{
+		"userTheme":          "solarized",
+		"oauth:tokenCacheV2": "ENC-A",
+	})
+	if err := vault.Backup(fs, "with-desktop"); err != nil {
+		t.Fatalf("backup with desktop: %v", err)
+	}
+
+	writeCreds("B-TOKEN")
+	writeJSONT(t, desktop, map[string]interface{}{
+		"userTheme": "solarized",
+	})
+	if err := vault.Backup(fs, "without-desktop"); err != nil {
+		t.Fatalf("backup without desktop: %v", err)
+	}
+
+	if err := vault.Restore(fs, "with-desktop"); err != nil {
+		t.Fatalf("restore with desktop: %v", err)
+	}
+	writeJSONT(t, desktop, map[string]interface{}{
+		"userTheme":          "custom-live",
+		"windowBounds":       "100,100,800,600",
+		"oauth:tokenCacheV2": "ENC-A",
+	})
+	if err := vault.Restore(fs, "without-desktop"); err != nil {
+		t.Fatalf("restore without desktop: %v", err)
+	}
+	live := readJSONT(t, desktop)
+	if _, ok := live["oauth:tokenCacheV2"]; ok {
+		t.Fatalf("restore did not scrub stale token cache: %v", live)
+	}
+	if live["userTheme"] != "custom-live" || live["windowBounds"] != "100,100,800,600" {
+		t.Fatalf("restore clobbered unrelated settings: %v", live)
+	}
+}
+
+func TestClaudeDesktopRestoreMissingSnapshotPreservesForeignTokenCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".config", "claude-code"))
+
+	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	fs := ClaudeAuthFiles()
+	creds := filepath.Join(home, ".claude", ".credentials.json")
+	writeJSONT(t, creds, map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{"accessToken": "B-TOKEN", "refreshToken": "B-TOKEN"},
+	})
+	desktop := desktopPath(home)
+	writeJSONT(t, desktop, map[string]interface{}{"userTheme": "solarized"})
+	if err := vault.Backup(fs, "without-desktop"); err != nil {
+		t.Fatalf("backup without desktop: %v", err)
+	}
+
+	writeJSONT(t, desktop, map[string]interface{}{
+		"userTheme":          "custom-live",
+		"oauth:tokenCacheV2": "ENC-FOREIGN",
+	})
+	if err := vault.Restore(fs, "without-desktop"); err != nil {
+		t.Fatalf("restore without desktop: %v", err)
+	}
+	live := readJSONT(t, desktop)
+	if live["oauth:tokenCacheV2"] != "ENC-FOREIGN" {
+		t.Fatalf("restore scrubbed unproven desktop token cache: %v", live)
+	}
+	if live["userTheme"] != "custom-live" {
+		t.Fatalf("restore clobbered unrelated settings: %v", live)
+	}
+}
+
+func TestClaudeDesktopTokenlessSnapshotReportsNoRestore(t *testing.T) {
+	home := t.TempDir()
+	vaultPath := filepath.Join(t.TempDir(), "config.json")
+	livePath := desktopPath(home)
+	writeJSONT(t, vaultPath, map[string]interface{}{"userTheme": "snapshot"})
+	writeJSONT(t, livePath, map[string]interface{}{
+		"userTheme":          "live",
+		"oauth:tokenCacheV2": "ENC-LIVE",
+	})
+
+	restored, err := restoreClaudeDesktopTokenCache(vaultPath, livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored {
+		t.Fatal("tokenless snapshot reported a restored token cache")
+	}
+	live := readJSONT(t, livePath)
+	if live["oauth:tokenCacheV2"] != "ENC-LIVE" || live["userTheme"] != "live" {
+		t.Fatalf("tokenless snapshot changed live desktop config: %v", live)
+	}
+}
+
+func TestClaudeDesktopTokenlessSnapshotDoesNotAuthorizeOptionalOnlyCleanup(t *testing.T) {
+	home := t.TempDir()
+	vault := NewVault(filepath.Join(t.TempDir(), "vault"))
+	requiredPath := filepath.Join(home, ".claude", ".credentials.json")
+	desktop := desktopPath(home)
+	fileSet := AuthFileSet{
+		Tool: "claude",
+		Files: []AuthFileSpec{
+			{Tool: "claude", Path: requiredPath, Required: true},
+			{Tool: "claude", Path: desktop, Required: false},
+		},
+		AllowOptionalOnly: true,
+	}
+
+	writeJSONT(t, requiredPath, map[string]interface{}{
+		"claudeAiOauth": map[string]interface{}{"accessToken": "A-TOKEN", "refreshToken": "A-TOKEN"},
+	})
+	if err := vault.Backup(fileSet, "with-required"); err != nil {
+		t.Fatalf("backup with required: %v", err)
+	}
+
+	targetDir := vault.ProfilePath("claude", "tokenless-desktop")
+	if err := os.MkdirAll(targetDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeJSONT(t, filepath.Join(targetDir, "config.json"), map[string]interface{}{
+		"userTheme": "tokenless-snapshot",
+	})
+	meta := vaultProfileMeta{
+		Tool:            "claude",
+		Profile:         "tokenless-desktop",
+		BackedUpAt:      "2026-07-05T00:00:00Z",
+		Files:           1,
+		ManifestVersion: 1,
+		ManagedFiles: []managedFileState{
+			{VaultName: "required.json", OriginalPath: requiredPath, Required: true, Present: false},
+			{VaultName: "config.json", OriginalPath: desktop, Required: false, Present: true, ClaudeDesktopTokenCache: true},
+		},
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "meta.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := vault.Restore(fileSet, "tokenless-desktop"); err == nil {
+		t.Fatal("Restore() succeeded with tokenless Claude Desktop snapshot")
+	}
+	if _, err := os.Stat(requiredPath); err != nil {
+		t.Fatalf("tokenless optional restore should leave required auth in place: %v", err)
+	}
+}
+
 // TestClaudeDesktopActiveProfileHashIgnoresSettings proves the hash keys on the
 // token cache only, so unrelated desktop settings don't perturb detection.
 func TestClaudeDesktopActiveProfileHashIgnoresSettings(t *testing.T) {
