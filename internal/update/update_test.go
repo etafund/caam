@@ -37,10 +37,16 @@ func TestCompareVersions(t *testing.T) {
 		{"a greater minor", "1.2.0", "1.1.0", 1},
 		{"a less patch", "1.0.1", "1.0.2", -1},
 		{"a greater patch", "1.0.2", "1.0.1", 1},
+		{"core numeric overflow order", "9999999999999999999.0.0", "10000000000000000000.0.0", -1},
 		{"dev vs version", "dev", "1.0.0", -1},
 		{"version vs dev", "1.0.0", "dev", 1},
 		{"dev equal", "dev", "dev", 0},
-		{"prerelease ignored", "1.0.0-beta", "1.0.0", 0},
+		{"prerelease less than final", "1.0.0-beta", "1.0.0", -1},
+		{"final greater than prerelease", "1.0.0", "1.0.0-beta", 1},
+		{"prerelease lexical order", "1.0.0-alpha", "1.0.0-beta", -1},
+		{"prerelease numeric order", "1.0.0-beta.2", "1.0.0-beta.10", -1},
+		{"prerelease numeric overflow order", "1.0.0-beta.9999999999999999999", "1.0.0-beta.10000000000000000000", -1},
+		{"shorter prerelease is lower", "1.0.0-beta", "1.0.0-beta.1", -1},
 		{"different lengths", "1.0", "1.0.0", -1},
 	}
 
@@ -244,11 +250,12 @@ func TestUpdateTargetVersionSkipsLatestPrecheck(t *testing.T) {
 }
 
 func TestUpdateRollbackRestoresBackupWhenReplaceFails(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("PATH", filepath.Join(tmpDir, "empty-path"))
-	if err := os.MkdirAll(os.Getenv("PATH"), 0700); err != nil {
-		t.Fatalf("mkdir empty PATH dir: %v", err)
+	if runtime.GOOS == "windows" {
+		t.Skip("self-update is disabled on Windows until atomic replacement is implemented")
 	}
+	tmpDir := t.TempDir()
+	writeFakeCosign(t, tmpDir, 0)
+	t.Setenv("PATH", tmpDir)
 
 	exePath := filepath.Join(tmpDir, "caam")
 	original := []byte("original binary")
@@ -318,6 +325,54 @@ func TestUpdateRollbackRestoresBackupWhenReplaceFails(t *testing.T) {
 	}
 	if !bytes.Equal(restored, original) {
 		t.Fatalf("exe after rollback = %q, want original %q", restored, original)
+	}
+}
+
+func TestUpdateFailsWhenSignatureVerificationFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("self-update is disabled on Windows until atomic replacement is implemented")
+	}
+	tmpDir := t.TempDir()
+	writeFakeCosign(t, tmpDir, 1)
+	t.Setenv("PATH", tmpDir)
+
+	exePath := filepath.Join(tmpDir, "caam")
+	if err := os.WriteFile(exePath, []byte("original binary"), 0755); err != nil {
+		t.Fatalf("write exe: %v", err)
+	}
+
+	assetName := releaseAssetName("1.2.3")
+	archiveBytes := releaseArchive(t, []byte("new binary"))
+	archiveHash := sha256.Sum256(archiveBytes)
+	checksums := fmt.Sprintf("%x  %s\n", archiveHash, assetName)
+	release := Release{
+		TagName: "v1.2.3",
+		HTMLURL: "https://example.com/v1.2.3",
+		Assets: []Asset{
+			{Name: assetName, BrowserDownloadURL: "https://downloads.example/binary", Size: int64(len(archiveBytes))},
+			{Name: checksumsAssetName, BrowserDownloadURL: "https://downloads.example/checksums"},
+			{Name: signatureAssetName, BrowserDownloadURL: "https://downloads.example/signature"},
+		},
+	}
+
+	u := New(Config{
+		Owner:         "test",
+		Repo:          "repo",
+		TargetVersion: "1.2.3",
+		HTTPClient:    releaseHTTPClient(t, release, archiveBytes, checksums),
+		ExePath:       exePath,
+		BackupDir:     tmpDir,
+	})
+
+	result, err := u.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "verify signature") {
+		t.Fatalf("Update error = %v, want signature verification failure", err)
+	}
+	if result == nil {
+		t.Fatal("Update result is nil, want partial result with signature status")
+	}
+	if result.SignatureOK {
+		t.Fatal("SignatureOK = true, want false")
 	}
 }
 
@@ -395,12 +450,67 @@ func releaseArchive(t *testing.T, binary []byte) []byte {
 	return buf.Bytes()
 }
 
+func writeFakeCosign(t *testing.T, dir string, exitCode int) {
+	t.Helper()
+
+	name := "cosign"
+	content := fmt.Sprintf("#!/bin/sh\nexit %d\n", exitCode)
+	if runtime.GOOS == "windows" {
+		name = "cosign.bat"
+		content = fmt.Sprintf("@echo off\r\nexit /b %d\r\n", exitCode)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0755); err != nil {
+		t.Fatalf("write fake cosign: %v", err)
+	}
+}
+
+func releaseHTTPClient(t *testing.T, release Release, archiveBytes []byte, checksums string) *http.Client {
+	t.Helper()
+	return testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.String() {
+		case "https://api.github.com/repos/test/repo/releases/tags/v1.2.3":
+			body, err := json.Marshal(release)
+			if err != nil {
+				return nil, err
+			}
+			return bytesHTTPResponse(http.StatusOK, body), nil
+		case "https://downloads.example/binary":
+			return bytesHTTPResponse(http.StatusOK, archiveBytes), nil
+		case "https://downloads.example/checksums":
+			return bytesHTTPResponse(http.StatusOK, []byte(checksums)), nil
+		case "https://downloads.example/signature":
+			return bytesHTTPResponse(http.StatusOK, []byte("signature")), nil
+		default:
+			return bytesHTTPResponse(http.StatusNotFound, []byte("not found")), nil
+		}
+	}))
+}
+
 func releaseListClient(t *testing.T, releases []Release) *http.Client {
 	t.Helper()
 	return testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.URL.Path != "/repos/test/test/releases" {
 			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
 		}
+		body, err := json.Marshal(releases)
+		if err != nil {
+			return nil, err
+		}
+		return jsonHTTPResponse(http.StatusOK, string(body)), nil
+	}))
+}
+
+func releaseListPagesClient(t *testing.T, pages map[string][]Release) *http.Client {
+	t.Helper()
+	return testHTTPClient(roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/repos/test/test/releases" {
+			return jsonHTTPResponse(http.StatusNotFound, `{"message":"not found"}`), nil
+		}
+		page := req.URL.Query().Get("page")
+		if page == "" {
+			page = "1"
+		}
+		releases := pages[page]
 		body, err := json.Marshal(releases)
 		if err != nil {
 			return nil, err
@@ -513,6 +623,84 @@ func TestFetchLatestRelease_FiltersPrereleases(t *testing.T) {
 	}
 	if release.TagName != "v1.0.0" {
 		t.Errorf("TagName = %q, want v1.0.0", release.TagName)
+	}
+}
+
+func TestFetchLatestRelease_BetaPrefersPrereleases(t *testing.T) {
+	releases := []Release{
+		{TagName: "v1.0.0", Prerelease: false},
+		{TagName: "v1.1.0-beta", Prerelease: true},
+		{TagName: "v0.9.0-beta", Prerelease: true},
+	}
+
+	u := New(Config{
+		Owner:      "test",
+		Repo:       "test",
+		Channel:    ChannelBeta,
+		HTTPClient: releaseListClient(t, releases),
+	})
+
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v1.1.0-beta" {
+		t.Errorf("TagName = %q, want v1.1.0-beta", release.TagName)
+	}
+}
+
+func TestFetchLatestRelease_BetaPromotesFinalOverSamePrerelease(t *testing.T) {
+	releases := []Release{
+		{TagName: "v1.2.0-beta.1", Prerelease: true},
+		{TagName: "v1.2.0", Prerelease: false},
+	}
+
+	u := New(Config{
+		Owner:      "test",
+		Repo:       "test",
+		Channel:    ChannelBeta,
+		HTTPClient: releaseListClient(t, releases),
+	})
+
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v1.2.0" {
+		t.Errorf("TagName = %q, want v1.2.0", release.TagName)
+	}
+}
+
+func TestFetchLatestRelease_PaginatesBeforeSelectingHighest(t *testing.T) {
+	firstPage := make([]Release, githubReleasesPerPage)
+	for i := range firstPage {
+		firstPage[i] = Release{TagName: fmt.Sprintf("v1.0.%d-beta", i), Prerelease: true}
+	}
+
+	u := New(Config{
+		Owner:   "test",
+		Repo:    "test",
+		Channel: ChannelBeta,
+		HTTPClient: releaseListPagesClient(t, map[string][]Release{
+			"1": firstPage,
+			"2": []Release{{TagName: "v2.0.0-beta.10", Prerelease: true}},
+		}),
+	})
+
+	release, err := u.fetchLatestRelease(context.Background())
+	if err != nil {
+		t.Fatalf("fetchLatestRelease error: %v", err)
+	}
+	if release.TagName != "v2.0.0-beta.10" {
+		t.Errorf("TagName = %q, want v2.0.0-beta.10", release.TagName)
+	}
+}
+
+func TestValidateReleaseForChannelRejectsStablePrerelease(t *testing.T) {
+	u := New(Config{Channel: ChannelStable})
+	err := u.validateReleaseForChannel(&Release{TagName: "v1.2.3-beta", Prerelease: true})
+	if err == nil || !strings.Contains(err.Error(), "use --channel=beta") {
+		t.Fatalf("validateReleaseForChannel error = %v, want stable prerelease rejection", err)
 	}
 }
 
@@ -665,7 +853,8 @@ ghi789  SHA256SUMS.sig
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := readExpectedChecksum(checksumsPath, tt.assetName)
-			if (err != nil) != tt.wantErr {
+			gotErr := err != nil
+			if gotErr != tt.wantErr {
 				t.Errorf("readExpectedChecksum() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
@@ -720,7 +909,29 @@ func TestVerifyChecksum(t *testing.T) {
 	}
 }
 
+func TestVerifySignatureRequiresCosign(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Setenv("PATH", tmpDir)
+
+	checksumsPath := filepath.Join(tmpDir, "SHA256SUMS")
+	signaturePath := filepath.Join(tmpDir, "SHA256SUMS.sig")
+	if err := os.WriteFile(checksumsPath, []byte("checksums"), 0644); err != nil {
+		t.Fatalf("write checksums: %v", err)
+	}
+	if err := os.WriteFile(signaturePath, []byte("signature"), 0644); err != nil {
+		t.Fatalf("write signature: %v", err)
+	}
+
+	err := VerifySignature(context.Background(), checksumsPath, signaturePath, "v1.2.3", "owner", "repo")
+	if !errors.Is(err, ErrCosignUnavailable) {
+		t.Fatalf("VerifySignature error = %v, want ErrCosignUnavailable", err)
+	}
+}
+
 func TestAtomicReplace(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("atomic replacement is disabled on Windows until a safe implementation exists")
+	}
 	tmpDir, err := os.MkdirTemp("", "caam-test-*")
 	if err != nil {
 		t.Fatal(err)
@@ -757,6 +968,9 @@ func TestAtomicReplace(t *testing.T) {
 }
 
 func TestAtomicReplace_CreatesDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("atomic replacement is disabled on Windows until a safe implementation exists")
+	}
 	tmpDir, err := os.MkdirTemp("", "caam-test-*")
 	if err != nil {
 		t.Fatal(err)

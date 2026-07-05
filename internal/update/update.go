@@ -6,6 +6,7 @@ package update
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,7 +30,10 @@ const (
 	maxGitHubReleaseResponseBytes = 4 << 20
 	checksumsAssetName            = "SHA256SUMS"
 	signatureAssetName            = "SHA256SUMS.sig"
+	githubReleasesPerPage         = 100
 )
+
+var ErrWindowsSelfUpdateUnsupported = errors.New("self-update is not supported on Windows until atomic replacement is implemented")
 
 // Channel represents an update channel.
 type Channel string
@@ -77,12 +81,16 @@ type ReleaseManifest struct {
 
 // UpdateResult represents the result of an update operation.
 type UpdateResult struct {
-	Updated      bool
-	FromVersion  string
-	ToVersion    string
-	ReleaseURL   string
-	BackupPath   string
-	DownloadSize int64
+	Updated         bool
+	UpdateAvailable bool
+	FromVersion     string
+	ToVersion       string
+	ReleaseURL      string
+	DownloadURL     string
+	BackupPath      string
+	DownloadSize    int64
+	ChecksumOK      bool
+	SignatureOK     bool
 }
 
 // CheckResult represents the result of a version check.
@@ -175,6 +183,9 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	result := &UpdateResult{
 		FromVersion: currentVersion,
 	}
+	if runtime.GOOS == "windows" {
+		return result, ErrWindowsSelfUpdateUnsupported
+	}
 
 	var release *Release
 	var err error
@@ -183,7 +194,11 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("fetch target release: %w", err)
 		}
+		if err := u.validateReleaseForChannel(release); err != nil {
+			return nil, err
+		}
 		result.ToVersion = strings.TrimPrefix(release.TagName, "v")
+		result.UpdateAvailable = compareVersions(currentVersion, result.ToVersion) < 0
 		result.ReleaseURL = release.HTMLURL
 	} else {
 		check, err := u.Check(ctx)
@@ -192,6 +207,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 		}
 
 		result.ToVersion = check.LatestVersion
+		result.UpdateAvailable = check.UpdateAvailable
 		result.ReleaseURL = check.Release.HTMLURL
 
 		if !check.UpdateAvailable && !u.config.Force {
@@ -203,26 +219,28 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	// Find the appropriate binary asset
 	assets, err := u.selectReleaseAssets(release)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
+	result.DownloadURL = assets.Binary.BrowserDownloadURL
 
 	// Download and verify
 	exePath := u.config.ExePath
 	if exePath == "" {
 		exePath, err = os.Executable()
 		if err != nil {
-			return nil, fmt.Errorf("get executable path: %w", err)
+			return result, fmt.Errorf("get executable path: %w", err)
 		}
 		exePath, err = filepath.EvalSymlinks(exePath)
 		if err != nil {
-			return nil, fmt.Errorf("resolve symlinks: %w", err)
+			return result, fmt.Errorf("resolve symlinks: %w", err)
 		}
 	}
 
-	// Create temp directory for download
-	tmpDir, err := os.MkdirTemp("", "caam-update-*")
+	// Stage downloads and the verified binary in the destination directory so
+	// final replacement can use a same-filesystem atomic rename.
+	tmpDir, err := os.MkdirTemp(filepath.Dir(exePath), ".caam-update-*")
 	if err != nil {
-		return nil, fmt.Errorf("create temp dir: %w", err)
+		return result, fmt.Errorf("create temp dir: %w", err)
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -232,27 +250,29 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	archivePath := filepath.Join(tmpDir, assets.Binary.Name)
 
 	if err := u.downloadFile(ctx, assets.Checksums.BrowserDownloadURL, checksumsPath); err != nil {
-		return nil, fmt.Errorf("download checksums: %w", err)
+		return result, fmt.Errorf("download checksums: %w", err)
 	}
 	if err := u.downloadFile(ctx, assets.Signature.BrowserDownloadURL, signaturePath); err != nil {
-		return nil, fmt.Errorf("download signature: %w", err)
+		return result, fmt.Errorf("download signature: %w", err)
 	}
 
 	// Verify signature
 	if err := VerifySignature(ctx, checksumsPath, signaturePath, release.TagName, u.config.Owner, u.config.Repo); err != nil {
-		return nil, fmt.Errorf("verify signature: %w", err)
+		return result, fmt.Errorf("verify signature: %w", err)
 	}
+	result.SignatureOK = true
 
 	// Download binary archive
 	if err := u.downloadFile(ctx, assets.Binary.BrowserDownloadURL, archivePath); err != nil {
-		return nil, fmt.Errorf("download binary: %w", err)
+		return result, fmt.Errorf("download binary: %w", err)
 	}
 	result.DownloadSize = assets.Binary.Size
 
 	// Verify checksum
 	if err := VerifyChecksum(archivePath, checksumsPath, assets.Binary.Name); err != nil {
-		return nil, fmt.Errorf("verify checksum: %w", err)
+		return result, fmt.Errorf("verify checksum: %w", err)
 	}
+	result.ChecksumOK = true
 
 	// Extract binary from archive
 	binaryPath := filepath.Join(tmpDir, "caam")
@@ -260,7 +280,7 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 		binaryPath = filepath.Join(tmpDir, "caam.exe")
 	}
 	if err := ExtractBinary(archivePath, binaryPath); err != nil {
-		return nil, fmt.Errorf("extract binary: %w", err)
+		return result, fmt.Errorf("extract binary: %w", err)
 	}
 
 	// Backup current binary
@@ -270,17 +290,17 @@ func (u *Updater) Update(ctx context.Context) (*UpdateResult, error) {
 	}
 	backupPath := filepath.Join(backupDir, fmt.Sprintf("caam.%s.backup", currentVersion))
 	if err := copyFile(exePath, backupPath); err != nil {
-		return nil, fmt.Errorf("backup current binary: %w", err)
+		return result, fmt.Errorf("backup current binary: %w", err)
 	}
 	result.BackupPath = backupPath
 
 	// Atomic replace
 	if err := atomicReplaceBinary(binaryPath, exePath); err != nil {
 		// Attempt rollback
-		if rbErr := copyFile(backupPath, exePath); rbErr != nil {
-			return nil, fmt.Errorf("replace failed (%v) and rollback failed (%v)", err, rbErr)
+		if rbErr := restoreBackupAtomically(backupPath, exePath); rbErr != nil {
+			return result, fmt.Errorf("replace failed (%v) and rollback failed (%v)", err, rbErr)
 		}
-		return nil, fmt.Errorf("replace failed (rolled back): %w", err)
+		return result, fmt.Errorf("replace failed (rolled back): %w", err)
 	}
 
 	result.Updated = true
@@ -328,38 +348,54 @@ func assetNameMatches(name, expected string) bool {
 
 // fetchLatestRelease fetches the latest release based on channel.
 func (u *Updater) fetchLatestRelease(ctx context.Context) (*Release, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/releases", GitHubAPIBase, u.config.Owner, u.config.Repo)
+	var selected *Release
+	for page := 1; ; page++ {
+		url := fmt.Sprintf("%s/repos/%s/%s/releases?per_page=%d&page=%d", GitHubAPIBase, u.config.Owner, u.config.Repo, githubReleasesPerPage, page)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-
-	resp, err := u.config.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
-	}
-
-	var releases []Release
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxGitHubReleaseResponseBytes)).Decode(&releases); err != nil {
-		return nil, fmt.Errorf("decode releases: %w", err)
-	}
-
-	// Filter based on channel
-	for _, release := range releases {
-		if release.Draft {
-			continue
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
 		}
-		if u.config.Channel == ChannelStable && release.Prerelease {
-			continue
+		req.Header.Set("Accept", "application/vnd.github+json")
+
+		resp, err := u.config.HTTPClient.Do(req)
+		if err != nil {
+			return nil, err
 		}
-		return &release, nil
+
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("GitHub API returned %d", resp.StatusCode)
+		}
+
+		var releases []Release
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxGitHubReleaseResponseBytes)).Decode(&releases); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("decode releases: %w", err)
+		}
+		if err := resp.Body.Close(); err != nil {
+			return nil, fmt.Errorf("close releases response: %w", err)
+		}
+
+		for _, release := range releases {
+			if release.Draft {
+				continue
+			}
+			if u.config.Channel == ChannelStable && release.Prerelease {
+				continue
+			}
+			if selected == nil || compareVersions(release.TagName, selected.TagName) > 0 {
+				releaseCopy := release
+				selected = &releaseCopy
+			}
+		}
+
+		if len(releases) < githubReleasesPerPage {
+			break
+		}
+	}
+	if selected != nil {
+		return selected, nil
 	}
 
 	return nil, fmt.Errorf("no releases found for channel %s", u.config.Channel)
@@ -397,6 +433,16 @@ func (u *Updater) fetchRelease(ctx context.Context, tag string) (*Release, error
 	}
 
 	return &release, nil
+}
+
+func (u *Updater) validateReleaseForChannel(release *Release) error {
+	if release.Draft {
+		return fmt.Errorf("release %s is a draft", release.TagName)
+	}
+	if u.config.Channel == ChannelStable && release.Prerelease {
+		return fmt.Errorf("release %s is a prerelease; use --channel=beta to install it", release.TagName)
+	}
+	return nil
 }
 
 // binaryAssetName returns the exact expected asset name for the release and current platform.
@@ -468,6 +514,26 @@ func copyFile(src, dst string) error {
 	return err
 }
 
+func restoreBackupAtomically(backupPath, exePath string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(exePath), ".caam-rollback-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := copyFile(backupPath, tmpPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := AtomicReplace(tmpPath, exePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 // compareVersions compares two semver-ish versions.
 // Returns -1 if a < b, 0 if a == b, 1 if a > b.
 func compareVersions(a, b string) int {
@@ -484,23 +550,27 @@ func compareVersions(a, b string) int {
 		return 1
 	}
 
-	partsA := strings.Split(a, ".")
-	partsB := strings.Split(b, ".")
+	coreA, preA := splitPrerelease(a)
+	coreB, preB := splitPrerelease(b)
+	partsA := strings.Split(coreA, ".")
+	partsB := strings.Split(coreB, ".")
 
 	for i := 0; i < len(partsA) && i < len(partsB); i++ {
-		// Handle pre-release suffixes (e.g., "1.0.0-beta")
-		cleanA := strings.Split(partsA[i], "-")[0]
-		cleanB := strings.Split(partsB[i], "-")[0]
-
-		var numA, numB int
-		fmt.Sscanf(cleanA, "%d", &numA)
-		fmt.Sscanf(cleanB, "%d", &numB)
-
-		if numA < numB {
-			return -1
-		}
-		if numA > numB {
+		numA, okA := normalizeNumericIdentifier(partsA[i])
+		numB, okB := normalizeNumericIdentifier(partsB[i])
+		switch {
+		case okA && okB:
+			if cmp := compareNumericStrings(numA, numB); cmp != 0 {
+				return cmp
+			}
+		case okA:
 			return 1
+		case okB:
+			return -1
+		default:
+			if cmp := strings.Compare(partsA[i], partsB[i]); cmp != 0 {
+				return cmp
+			}
 		}
 	}
 
@@ -511,5 +581,81 @@ func compareVersions(a, b string) int {
 		return 1
 	}
 
+	switch {
+	case preA == "" && preB != "":
+		return 1
+	case preA != "" && preB == "":
+		return -1
+	case preA != preB:
+		return comparePrerelease(preA, preB)
+	}
+
 	return 0
+}
+
+func splitPrerelease(v string) (core, prerelease string) {
+	v = strings.SplitN(v, "+", 2)[0]
+	parts := strings.SplitN(v, "-", 2)
+	if len(parts) == 1 {
+		return parts[0], ""
+	}
+	return parts[0], parts[1]
+}
+
+func comparePrerelease(a, b string) int {
+	partsA := strings.Split(a, ".")
+	partsB := strings.Split(b, ".")
+	for i := 0; i < len(partsA) && i < len(partsB); i++ {
+		if partsA[i] == partsB[i] {
+			continue
+		}
+		numA, okA := normalizeNumericIdentifier(partsA[i])
+		numB, okB := normalizeNumericIdentifier(partsB[i])
+		switch {
+		case okA && okB:
+			cmp := compareNumericStrings(numA, numB)
+			if cmp != 0 {
+				return cmp
+			}
+		case okA:
+			return -1
+		case okB:
+			return 1
+		default:
+			return strings.Compare(partsA[i], partsB[i])
+		}
+	}
+	if len(partsA) < len(partsB) {
+		return -1
+	}
+	if len(partsA) > len(partsB) {
+		return 1
+	}
+	return 0
+}
+
+func normalizeNumericIdentifier(s string) (string, bool) {
+	if s == "" {
+		return "", false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	s = strings.TrimLeft(s, "0")
+	if s == "" {
+		return "0", true
+	}
+	return s, true
+}
+
+func compareNumericStrings(a, b string) int {
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return strings.Compare(a, b)
 }

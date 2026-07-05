@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,11 +19,16 @@ type UpdateOutput struct {
 	Action          string `json:"action"` // "check", "update"
 	CurrentVersion  string `json:"current_version"`
 	LatestVersion   string `json:"latest_version,omitempty"`
-	UpdateAvailable bool   `json:"update_available,omitempty"`
-	Updated         bool   `json:"updated,omitempty"`
+	VersionFrom     string `json:"version_from,omitempty"`
+	VersionTo       string `json:"version_to,omitempty"`
+	UpdateAvailable bool   `json:"update_available"`
+	Updated         bool   `json:"updated"`
 	BackupPath      string `json:"backup_path,omitempty"`
 	ReleaseURL      string `json:"release_url,omitempty"`
+	DownloadURL     string `json:"download_url,omitempty"`
 	DownloadSize    int64  `json:"download_size,omitempty"`
+	ChecksumOK      *bool  `json:"checksum_ok,omitempty"`
+	SignatureOK     *bool  `json:"signature_ok,omitempty"`
 	Channel         string `json:"channel"`
 	Error           string `json:"error,omitempty"`
 }
@@ -79,6 +84,10 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	targetVersion, _ := cmd.Flags().GetString("version")
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	force, _ := cmd.Flags().GetBool("force")
+	action := "update"
+	if checkOnly {
+		action = "check"
+	}
 
 	// Build update config
 	config := update.DefaultConfig()
@@ -89,7 +98,11 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	case "beta":
 		config.Channel = update.ChannelBeta
 	default:
-		return fmt.Errorf("invalid channel: %s (use 'stable' or 'beta')", channel)
+		return emitUpdateValidationError(cmd, jsonOutput, UpdateOutput{
+			Action:         action,
+			CurrentVersion: version.Short(),
+			Channel:        channel,
+		}, fmt.Errorf("invalid channel: %s (use 'stable' or 'beta')", channel))
 	}
 
 	if targetVersion != "" {
@@ -98,22 +111,45 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 	config.Force = force
 
 	if checkOnly && targetVersion != "" {
-		return fmt.Errorf("--check cannot be combined with --version; use 'caam update --version %s' to install that release", targetVersion)
+		return emitUpdateValidationError(cmd, jsonOutput, UpdateOutput{
+			Action:         action,
+			CurrentVersion: version.Short(),
+			LatestVersion:  targetVersion,
+			Channel:        channel,
+		}, fmt.Errorf("--check cannot be combined with --version; use 'caam update --version %s' to install that release", targetVersion))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	updater := update.New(config)
+	out := cmd.OutOrStdout()
 
+	var err error
 	if checkOnly {
-		return runUpdateCheck(ctx, updater, channel, jsonOutput)
+		err = runUpdateCheck(ctx, updater, channel, jsonOutput, out)
+	} else {
+		err = runUpdateInstall(ctx, updater, channel, jsonOutput, force, targetVersion, out)
 	}
 
-	return runUpdateInstall(ctx, updater, channel, jsonOutput, force, targetVersion)
+	if err != nil && jsonOutput {
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+	}
+	return err
 }
 
-func runUpdateCheck(ctx context.Context, updater updateChecker, channel string, jsonOutput bool) error {
+func emitUpdateValidationError(cmd *cobra.Command, jsonOutput bool, output UpdateOutput, err error) error {
+	if jsonOutput {
+		output.Error = err.Error()
+		_ = printJSON(cmd.OutOrStdout(), output)
+		cmd.SilenceErrors = true
+		cmd.SilenceUsage = true
+	}
+	return err
+}
+
+func runUpdateCheck(ctx context.Context, updater updateChecker, channel string, jsonOutput bool, out io.Writer) error {
 	result, err := updater.Check(ctx)
 
 	output := UpdateOutput{
@@ -125,7 +161,7 @@ func runUpdateCheck(ctx context.Context, updater updateChecker, channel string, 
 	if err != nil {
 		output.Error = err.Error()
 		if jsonOutput {
-			return printJSON(output)
+			_ = printJSON(out, output)
 		}
 		return fmt.Errorf("check for updates: %w", err)
 	}
@@ -137,29 +173,29 @@ func runUpdateCheck(ctx context.Context, updater updateChecker, channel string, 
 	}
 
 	if jsonOutput {
-		return printJSON(output)
+		return printJSON(out, output)
 	}
 
-	fmt.Printf("Current version: %s\n", output.CurrentVersion)
-	fmt.Printf("Latest version:  %s\n", output.LatestVersion)
-	fmt.Printf("Channel:         %s\n", channel)
+	fmt.Fprintf(out, "Current version: %s\n", output.CurrentVersion)
+	fmt.Fprintf(out, "Latest version:  %s\n", output.LatestVersion)
+	fmt.Fprintf(out, "Channel:         %s\n", channel)
 
 	if result.UpdateAvailable {
-		fmt.Println("\nUpdate available! Run 'caam update' to install.")
+		fmt.Fprintln(out, "\nUpdate available! Run 'caam update' to install.")
 		if result.Release != nil {
-			fmt.Printf("Release notes: %s\n", result.Release.HTMLURL)
+			fmt.Fprintf(out, "Release notes: %s\n", result.Release.HTMLURL)
 		}
 	} else {
-		fmt.Println("\nYou're running the latest version.")
+		fmt.Fprintln(out, "\nYou're running the latest version.")
 	}
 
 	return nil
 }
 
-func runUpdateInstall(ctx context.Context, updater updateInstaller, channel string, jsonOutput bool, force bool, targetVersion string) error {
+func runUpdateInstall(ctx context.Context, updater updateInstaller, channel string, jsonOutput bool, force bool, targetVersion string, out io.Writer) error {
 	if targetVersion != "" {
 		if !jsonOutput {
-			fmt.Printf("Updating caam from %s to %s...\n", version.Short(), targetVersion)
+			fmt.Fprintf(out, "Updating caam from %s to %s...\n", version.Short(), targetVersion)
 		}
 
 		result, err := updater.Update(ctx)
@@ -169,25 +205,18 @@ func runUpdateInstall(ctx context.Context, updater updateInstaller, channel stri
 			LatestVersion:  targetVersion,
 			Channel:        channel,
 		}
-		if result != nil {
-			output.CurrentVersion = result.FromVersion
-			output.LatestVersion = result.ToVersion
-			output.Updated = result.Updated
-			output.BackupPath = result.BackupPath
-			output.ReleaseURL = result.ReleaseURL
-			output.DownloadSize = result.DownloadSize
-		}
+		applyUpdateResult(&output, result)
 		if err != nil {
 			output.Error = err.Error()
 			if jsonOutput {
-				return printJSON(output)
+				_ = printJSON(out, output)
 			}
 			return fmt.Errorf("update: %w", err)
 		}
 		if jsonOutput {
-			return printJSON(output)
+			return printJSON(out, output)
 		}
-		printUpdateResult(result)
+		printUpdateResult(out, result)
 		return nil
 	}
 
@@ -201,7 +230,7 @@ func runUpdateInstall(ctx context.Context, updater updateInstaller, channel stri
 			Error:          err.Error(),
 		}
 		if jsonOutput {
-			return printJSON(output)
+			_ = printJSON(out, output)
 		}
 		return fmt.Errorf("check for updates: %w", err)
 	}
@@ -216,65 +245,86 @@ func runUpdateInstall(ctx context.Context, updater updateInstaller, channel stri
 			Channel:         channel,
 		}
 		if jsonOutput {
-			return printJSON(output)
+			return printJSON(out, output)
 		}
-		fmt.Printf("Already at latest version (%s). Use --force to reinstall.\n", check.LatestVersion)
+		fmt.Fprintf(out, "Already at latest version (%s). Use --force to reinstall.\n", check.LatestVersion)
 		return nil
 	}
 
 	if !jsonOutput {
-		fmt.Printf("Updating caam from %s to %s...\n", check.CurrentVersion, check.LatestVersion)
+		fmt.Fprintf(out, "Updating caam from %s to %s...\n", check.CurrentVersion, check.LatestVersion)
 	}
 
 	result, err := updater.Update(ctx)
 
 	output := UpdateOutput{
-		Action:         "update",
-		CurrentVersion: check.CurrentVersion,
-		LatestVersion:  check.LatestVersion,
-		Channel:        channel,
+		Action:          "update",
+		CurrentVersion:  check.CurrentVersion,
+		LatestVersion:   check.LatestVersion,
+		UpdateAvailable: check.UpdateAvailable,
+		Channel:         channel,
 	}
 
 	if err != nil {
+		applyUpdateResult(&output, result)
 		output.Error = err.Error()
 		if jsonOutput {
-			return printJSON(output)
+			_ = printJSON(out, output)
 		}
 		return fmt.Errorf("update: %w", err)
 	}
 
-	output.Updated = result.Updated
-	output.BackupPath = result.BackupPath
-	output.ReleaseURL = result.ReleaseURL
-	output.DownloadSize = result.DownloadSize
+	applyUpdateResult(&output, result)
 
 	if jsonOutput {
-		return printJSON(output)
+		return printJSON(out, output)
 	}
 
 	if result.Updated {
-		printUpdateResult(result)
+		printUpdateResult(out, result)
 	} else {
-		fmt.Println("No update performed.")
+		fmt.Fprintln(out, "No update performed.")
 	}
 
 	return nil
 }
 
-func printUpdateResult(result *update.UpdateResult) {
-	if result != nil && result.Updated {
-		fmt.Println("\n✓ Update successful!")
-		fmt.Printf("  From:   %s\n", result.FromVersion)
-		fmt.Printf("  To:     %s\n", result.ToVersion)
-		fmt.Printf("  Backup: %s\n", result.BackupPath)
-		fmt.Println("\nRun 'caam version' to verify the update.")
+func applyUpdateResult(output *UpdateOutput, result *update.UpdateResult) {
+	if result == nil {
 		return
 	}
-	fmt.Println("No update performed.")
+	if result.FromVersion != "" {
+		output.CurrentVersion = result.FromVersion
+		output.VersionFrom = result.FromVersion
+	}
+	if result.ToVersion != "" {
+		output.LatestVersion = result.ToVersion
+		output.VersionTo = result.ToVersion
+	}
+	output.UpdateAvailable = result.UpdateAvailable
+	output.Updated = result.Updated
+	output.BackupPath = result.BackupPath
+	output.ReleaseURL = result.ReleaseURL
+	output.DownloadURL = result.DownloadURL
+	output.DownloadSize = result.DownloadSize
+	output.ChecksumOK = &result.ChecksumOK
+	output.SignatureOK = &result.SignatureOK
 }
 
-func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
+func printUpdateResult(out io.Writer, result *update.UpdateResult) {
+	if result != nil && result.Updated {
+		fmt.Fprintln(out, "\n✓ Update successful!")
+		fmt.Fprintf(out, "  From:   %s\n", result.FromVersion)
+		fmt.Fprintf(out, "  To:     %s\n", result.ToVersion)
+		fmt.Fprintf(out, "  Backup: %s\n", result.BackupPath)
+		fmt.Fprintln(out, "\nRun 'caam version' to verify the update.")
+		return
+	}
+	fmt.Fprintln(out, "No update performed.")
+}
+
+func printJSON(out io.Writer, v any) error {
+	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
 }

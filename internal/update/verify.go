@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,14 +19,17 @@ import (
 	"time"
 )
 
+var (
+	ErrCosignUnavailable               = errors.New("cosign unavailable")
+	ErrWindowsAtomicReplaceUnsupported = errors.New("atomic replacement is not supported on Windows")
+)
+
 // VerifySignature verifies the cosign signature on the checksums file.
 // It requires cosign to be installed on the system.
 func VerifySignature(ctx context.Context, checksumsPath, signaturePath, tag, owner, repo string) error {
 	// Check if cosign is available
 	if _, err := exec.LookPath("cosign"); err != nil {
-		// If cosign is not installed, skip signature verification with a warning
-		// This allows updates to work even without cosign, but logs the skip
-		return nil // Consider logging: "cosign not found, skipping signature verification"
+		return fmt.Errorf("%w: install cosign to verify release signatures: %v", ErrCosignUnavailable, err)
 	}
 
 	// Build the expected identity for the OIDC certificate
@@ -173,7 +177,7 @@ func extractFromTarGz(archivePath, destPath string) error {
 
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -181,15 +185,18 @@ func extractFromTarGz(archivePath, destPath string) error {
 		}
 
 		// Look for the binary (might be at root or in a subdirectory)
-		if filepath.Base(header.Name) == binaryName && header.Typeflag == tar.TypeReg {
+		if strings.Compare(filepath.Base(header.Name), binaryName) == 0 && header.Typeflag == tar.TypeReg {
 			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 			if err != nil {
 				return err
 			}
-			defer out.Close()
 
 			if _, err := io.Copy(out, tr); err != nil {
+				_ = out.Close()
 				return fmt.Errorf("extract binary: %w", err)
+			}
+			if err := out.Close(); err != nil {
+				return fmt.Errorf("close extracted binary: %w", err)
 			}
 			return nil
 		}
@@ -212,21 +219,29 @@ func extractFromZip(archivePath, destPath string) error {
 	}
 
 	for _, f := range r.File {
-		if filepath.Base(f.Name) == binaryName && !f.FileInfo().IsDir() {
+		if strings.Compare(filepath.Base(f.Name), binaryName) == 0 && !f.FileInfo().IsDir() {
 			rc, err := f.Open()
 			if err != nil {
 				return err
 			}
-			defer rc.Close()
 
 			out, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
 			if err != nil {
+				_ = rc.Close()
 				return err
 			}
-			defer out.Close()
 
 			if _, err := io.Copy(out, rc); err != nil {
+				_ = out.Close()
+				_ = rc.Close()
 				return fmt.Errorf("extract binary: %w", err)
+			}
+			if err := out.Close(); err != nil {
+				_ = rc.Close()
+				return fmt.Errorf("close extracted binary: %w", err)
+			}
+			if err := rc.Close(); err != nil {
+				return fmt.Errorf("close zip entry: %w", err)
 			}
 			return nil
 		}
@@ -238,6 +253,10 @@ func extractFromZip(archivePath, destPath string) error {
 // AtomicReplace atomically replaces the target file with the source file.
 // On Unix, this uses rename which is atomic. On Windows, we need a different approach.
 func AtomicReplace(src, dst string) error {
+	if runtime.GOOS == "windows" {
+		return ErrWindowsAtomicReplaceUnsupported
+	}
+
 	// Ensure the destination directory exists
 	destDir := filepath.Dir(dst)
 	if err := os.MkdirAll(destDir, 0755); err != nil {
@@ -250,54 +269,42 @@ func AtomicReplace(src, dst string) error {
 		return err
 	}
 
-	// On Windows, we can't rename over an existing file directly
-	// So we rename the old file first, then rename the new one
-	if runtime.GOOS == "windows" {
-		return atomicReplaceWindows(src, dst, srcInfo)
+	if err := os.Chmod(src, srcInfo.Mode()); err != nil {
+		return fmt.Errorf("set source permissions: %w", err)
+	}
+	if err := syncFile(src); err != nil {
+		return fmt.Errorf("sync source: %w", err)
 	}
 
-	// On Unix, rename is atomic
+	// On Unix, rename is atomic only within the same filesystem. Callers should
+	// stage src in the destination directory; a cross-device rename is a hard
+	// failure because copying over the live binary is not atomic.
 	if err := os.Rename(src, dst); err != nil {
-		// If rename fails (cross-device), fall back to copy
-		if err := copyFile(src, dst); err != nil {
-			return err
-		}
-		if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
-			return fmt.Errorf("set permissions: %w", err)
-		}
+		return fmt.Errorf("rename replacement into place: %w", err)
+	}
+	if err := syncDir(destDir); err != nil {
+		return fmt.Errorf("sync destination directory: %w", err)
 	}
 
 	return nil
 }
 
-// atomicReplaceWindows handles atomic replacement on Windows.
-func atomicReplaceWindows(src, dst string, srcInfo os.FileInfo) error {
-	// Rename old file to .old
-	oldPath := dst + ".old"
-	_ = os.Remove(oldPath) // Remove any existing .old file
-
-	if _, err := os.Stat(dst); err == nil {
-		if err := os.Rename(dst, oldPath); err != nil {
-			return fmt.Errorf("rename old file: %w", err)
-		}
-	}
-
-	// Copy new file to destination
-	if err := copyFile(src, dst); err != nil {
-		// Restore old file on failure
-		_ = os.Rename(oldPath, dst)
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
 		return err
 	}
+	defer f.Close()
+	return f.Sync()
+}
 
-	// Set permissions
-	if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
-		return fmt.Errorf("set permissions: %w", err)
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
 	}
-
-	// Remove old file
-	_ = os.Remove(oldPath)
-
-	return nil
+	defer d.Close()
+	return d.Sync()
 }
 
 // Rollback restores a previous version from backup.
@@ -319,7 +326,8 @@ func CleanupOldBackups(backupDir string, maxAge time.Duration) error {
 	cutoff := time.Now().Add(-maxAge)
 
 	for _, entry := range entries {
-		if !strings.HasPrefix(entry.Name(), "caam.") || !strings.HasSuffix(entry.Name(), ".backup") {
+		name := filepath.Base(entry.Name())
+		if !strings.HasPrefix(name, "caam.") || !strings.HasSuffix(name, ".backup") {
 			continue
 		}
 
@@ -329,7 +337,7 @@ func CleanupOldBackups(backupDir string, maxAge time.Duration) error {
 		}
 
 		if info.ModTime().Before(cutoff) {
-			path := filepath.Join(backupDir, entry.Name())
+			path := filepath.Join(backupDir, name)
 			_ = os.Remove(path)
 		}
 	}

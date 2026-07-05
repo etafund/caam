@@ -4,6 +4,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -133,15 +134,20 @@ func TestSubcommandRegistration(t *testing.T) {
 func TestRunUpdateInstallTargetVersionSkipsLatestCheck(t *testing.T) {
 	updater := &fakeUpdateInstaller{
 		updateResult: &update.UpdateResult{
-			Updated:     true,
-			FromVersion: "0.1.0",
-			ToVersion:   "1.2.3",
-			ReleaseURL:  "https://example.com/v1.2.3",
-			BackupPath:  "/tmp/caam.backup",
+			Updated:         true,
+			UpdateAvailable: true,
+			FromVersion:     "0.1.0",
+			ToVersion:       "1.2.3",
+			ReleaseURL:      "https://example.com/v1.2.3",
+			DownloadURL:     "https://example.com/caam_1.2.3_linux_amd64.tar.gz",
+			BackupPath:      "/tmp/caam.backup",
+			ChecksumOK:      true,
+			SignatureOK:     true,
 		},
 	}
 
-	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "1.2.3")
+	var out bytes.Buffer
+	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "1.2.3", &out)
 	if err != nil {
 		t.Fatalf("runUpdateInstall error: %v", err)
 	}
@@ -150,6 +156,122 @@ func TestRunUpdateInstallTargetVersionSkipsLatestCheck(t *testing.T) {
 	}
 	if updater.updateCalls != 1 {
 		t.Fatalf("Update calls = %d, want 1", updater.updateCalls)
+	}
+
+	var output UpdateOutput
+	if err := json.Unmarshal(out.Bytes(), &output); err != nil {
+		t.Fatalf("decode JSON output: %v\n%s", err, out.String())
+	}
+	if output.VersionFrom != "0.1.0" || output.VersionTo != "1.2.3" {
+		t.Fatalf("version fields = %q -> %q, want 0.1.0 -> 1.2.3", output.VersionFrom, output.VersionTo)
+	}
+	if output.DownloadURL != updater.updateResult.DownloadURL {
+		t.Fatalf("download_url = %q, want %q", output.DownloadURL, updater.updateResult.DownloadURL)
+	}
+	if !output.UpdateAvailable {
+		t.Fatal("update_available = false, want true for forward target-version install")
+	}
+	if output.ChecksumOK == nil || !*output.ChecksumOK {
+		t.Fatalf("checksum_ok = %v, want true", output.ChecksumOK)
+	}
+	if output.SignatureOK == nil || !*output.SignatureOK {
+		t.Fatalf("signature_ok = %v, want true", output.SignatureOK)
+	}
+}
+
+func TestRunUpdateInstallJSONErrorReturnsError(t *testing.T) {
+	updater := &fakeUpdateInstaller{
+		updateResult: &update.UpdateResult{
+			FromVersion: "0.1.0",
+			ToVersion:   "1.2.3",
+			DownloadURL: "https://example.com/caam_1.2.3_linux_amd64.tar.gz",
+			ChecksumOK:  true,
+			SignatureOK: false,
+		},
+		updateErr: os.ErrPermission,
+	}
+
+	var out bytes.Buffer
+	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "1.2.3", &out)
+	if err == nil {
+		t.Fatal("runUpdateInstall returned nil error for JSON update failure")
+	}
+
+	var output UpdateOutput
+	if decErr := json.Unmarshal(out.Bytes(), &output); decErr != nil {
+		t.Fatalf("decode JSON output: %v\n%s", decErr, out.String())
+	}
+	if output.Error == "" {
+		t.Fatalf("JSON output error is empty: %+v", output)
+	}
+	if output.SignatureOK == nil || *output.SignatureOK {
+		t.Fatalf("signature_ok = %v, want false", output.SignatureOK)
+	}
+}
+
+func TestRunUpdateInstallJSONErrorPreservesTargetVersion(t *testing.T) {
+	updater := &fakeUpdateInstaller{
+		updateResult: &update.UpdateResult{
+			FromVersion: "0.1.0",
+		},
+		updateErr: update.ErrWindowsSelfUpdateUnsupported,
+	}
+
+	var out bytes.Buffer
+	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "1.2.3", &out)
+	if err == nil {
+		t.Fatal("runUpdateInstall returned nil error for JSON update failure")
+	}
+
+	var output UpdateOutput
+	if decErr := json.Unmarshal(out.Bytes(), &output); decErr != nil {
+		t.Fatalf("decode JSON output: %v\n%s", decErr, out.String())
+	}
+	if output.CurrentVersion != "0.1.0" {
+		t.Fatalf("current_version = %q, want 0.1.0", output.CurrentVersion)
+	}
+	if output.LatestVersion != "1.2.3" {
+		t.Fatalf("latest_version = %q, want requested target 1.2.3", output.LatestVersion)
+	}
+}
+
+func TestRunUpdateInstallJSONUpdateAvailable(t *testing.T) {
+	updater := &fakeUpdateInstaller{
+		checkResult: &update.CheckResult{
+			CurrentVersion:  "0.1.0",
+			LatestVersion:   "1.2.3",
+			UpdateAvailable: true,
+			Release:         &update.Release{HTMLURL: "https://example.com/v1.2.3"},
+		},
+		updateResult: &update.UpdateResult{
+			Updated:         true,
+			UpdateAvailable: true,
+			FromVersion:     "0.1.0",
+			ToVersion:       "1.2.3",
+			ReleaseURL:      "https://example.com/v1.2.3",
+			DownloadURL:     "https://example.com/caam_1.2.3_linux_amd64.tar.gz",
+			BackupPath:      "/tmp/caam.backup",
+			ChecksumOK:      true,
+			SignatureOK:     true,
+			DownloadSize:    1024,
+		},
+	}
+
+	var out bytes.Buffer
+	err := runUpdateInstall(context.Background(), updater, "stable", true, false, "", &out)
+	if err != nil {
+		t.Fatalf("runUpdateInstall error: %v", err)
+	}
+
+	var output UpdateOutput
+	if decErr := json.Unmarshal(out.Bytes(), &output); decErr != nil {
+		t.Fatalf("decode JSON output: %v\n%s", decErr, out.String())
+	}
+	if !output.UpdateAvailable {
+		t.Fatalf("update_available = false, want true")
+	}
+	if !output.Updated {
+		t.Fatalf("updated = false, want true")
 	}
 }
 
@@ -164,6 +286,58 @@ func TestRunUpdateRejectsCheckWithVersion(t *testing.T) {
 	err := runUpdate(cmd, nil)
 	if err == nil || !strings.Contains(err.Error(), "--check cannot be combined with --version") {
 		t.Fatalf("runUpdate error = %v, want --check/--version rejection", err)
+	}
+}
+
+func TestRunUpdateValidationErrorsEmitJSON(t *testing.T) {
+	tests := []struct {
+		name         string
+		check        bool
+		channel      string
+		version      string
+		wantContains string
+	}{
+		{
+			name:         "invalid channel",
+			channel:      "nightly",
+			wantContains: "invalid channel",
+		},
+		{
+			name:         "check with version",
+			check:        true,
+			channel:      "stable",
+			version:      "1.2.3",
+			wantContains: "--check cannot be combined with --version",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := &cobra.Command{}
+			cmd.Flags().Bool("check", tt.check, "")
+			cmd.Flags().String("channel", tt.channel, "")
+			cmd.Flags().String("version", tt.version, "")
+			cmd.Flags().Bool("json", true, "")
+			cmd.Flags().Bool("force", false, "")
+
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			err := runUpdate(cmd, nil)
+			if err == nil || !strings.Contains(err.Error(), tt.wantContains) {
+				t.Fatalf("runUpdate error = %v, want %q", err, tt.wantContains)
+			}
+			if !cmd.SilenceErrors || !cmd.SilenceUsage {
+				t.Fatalf("SilenceErrors/SilenceUsage = %v/%v, want true/true", cmd.SilenceErrors, cmd.SilenceUsage)
+			}
+
+			var output UpdateOutput
+			if decErr := json.Unmarshal(out.Bytes(), &output); decErr != nil {
+				t.Fatalf("decode JSON output: %v\n%s", decErr, out.String())
+			}
+			if !strings.Contains(output.Error, tt.wantContains) {
+				t.Fatalf("JSON error = %q, want %q", output.Error, tt.wantContains)
+			}
+		})
 	}
 }
 
