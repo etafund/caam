@@ -98,6 +98,82 @@ func TestLoadAgentConfigSingle(t *testing.T) {
 	}
 }
 
+func TestLoadAgentConfigSingleUsesCoordinatorTokenEnvFallback(t *testing.T) {
+	t.Setenv("CAAM_COORDINATOR_TOKEN", "env-secret")
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "agent.json")
+
+	data := []byte(`{
+  "coordinator_url": "http://localhost:7890"
+}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	useMulti, cfg, _, err := loadAgentConfig(path)
+	if err != nil {
+		t.Fatalf("loadAgentConfig error: %v", err)
+	}
+	if useMulti {
+		t.Fatal("expected single-agent config")
+	}
+	if cfg.CoordinatorToken != "env-secret" {
+		t.Fatalf("CoordinatorToken = %q, want env-secret", cfg.CoordinatorToken)
+	}
+}
+
+func TestLoadAgentConfigSinglePrefersConfigTokenOverEnv(t *testing.T) {
+	t.Setenv("CAAM_COORDINATOR_TOKEN", "env-secret")
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "agent.json")
+
+	data := []byte(`{
+  "coordinator_url": "http://localhost:7890",
+  "coordinator_token": "config-secret"
+}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, cfg, _, err := loadAgentConfig(path)
+	if err != nil {
+		t.Fatalf("loadAgentConfig error: %v", err)
+	}
+	if cfg.CoordinatorToken != "config-secret" {
+		t.Fatalf("CoordinatorToken = %q, want config-secret", cfg.CoordinatorToken)
+	}
+}
+
+func TestLoadAgentConfigMultiUsesCoordinatorTokenEnvFallback(t *testing.T) {
+	t.Setenv("CAAM_COORDINATOR_TOKEN", "env-secret")
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "agent.json")
+
+	data := []byte(`{
+  "coordinators": [
+    {"name": "needs-env", "url": "http://100.64.0.1:7890"},
+    {"name": "explicit", "url": "http://100.64.0.2:7890", "token": "config-secret"}
+  ]
+}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	useMulti, _, multiCfg, err := loadAgentConfig(path)
+	if err != nil {
+		t.Fatalf("loadAgentConfig error: %v", err)
+	}
+	if !useMulti {
+		t.Fatal("expected multi-agent config")
+	}
+	if multiCfg.Coordinators[0].Token != "env-secret" {
+		t.Fatalf("first coordinator token = %q, want env-secret", multiCfg.Coordinators[0].Token)
+	}
+	if multiCfg.Coordinators[1].Token != "config-secret" {
+		t.Fatalf("second coordinator token = %q, want config-secret", multiCfg.Coordinators[1].Token)
+	}
+}
+
 func TestLoadConfiguredCoordinatorEndpointsFromExplicitConfig(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "agent.json")
@@ -121,6 +197,24 @@ func TestLoadConfiguredCoordinatorEndpointsFromExplicitConfig(t *testing.T) {
 	}
 	if endpoints[0].Name != "csd" || endpoints[0].URL != "http://100.64.0.1:7890" || endpoints[0].Token != "abc123" {
 		t.Fatalf("endpoint = %+v, want normalized csd endpoint", endpoints[0])
+	}
+}
+
+func TestNormalizeCoordinatorEndpointsUsesCoordinatorTokenEnvFallback(t *testing.T) {
+	t.Setenv("CAAM_COORDINATOR_TOKEN", "env-secret")
+
+	endpoints := normalizeCoordinatorEndpoints([]*agent.CoordinatorEndpoint{
+		{Name: "needs-env", URL: "http://100.64.0.1:7890/"},
+		{Name: "explicit", URL: "http://100.64.0.2:7890/", Token: "config-secret"},
+	})
+	if len(endpoints) != 2 {
+		t.Fatalf("endpoint count = %d, want 2", len(endpoints))
+	}
+	if endpoints[0].Token != "env-secret" {
+		t.Fatalf("first endpoint token = %q, want env-secret", endpoints[0].Token)
+	}
+	if endpoints[1].Token != "config-secret" {
+		t.Fatalf("second endpoint token = %q, want config-secret", endpoints[1].Token)
 	}
 }
 

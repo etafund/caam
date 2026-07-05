@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -349,13 +350,14 @@ func TestMultiAgentDuplicateRequestPrevention(t *testing.T) {
 	agent := NewMulti(config)
 
 	// Simulate marking a request as processing
-	agent.procMu.Lock()
-	agent.processing["request-123"] = true
-	agent.procMu.Unlock()
+	processingKey, started := agent.markProcessing(config.Coordinators[0], "request-123")
+	if !started {
+		t.Fatal("expected request to be marked as processing")
+	}
 
 	// Check that it's in the map
 	agent.procMu.Lock()
-	processing := agent.processing["request-123"]
+	processing := agent.processing[processingKey]
 	agent.procMu.Unlock()
 
 	if !processing {
@@ -363,13 +365,11 @@ func TestMultiAgentDuplicateRequestPrevention(t *testing.T) {
 	}
 
 	// Simulate completion (removing from map)
-	agent.procMu.Lock()
-	delete(agent.processing, "request-123")
-	agent.procMu.Unlock()
+	agent.clearProcessing(processingKey)
 
 	// Should no longer be processing
 	agent.procMu.Lock()
-	processing = agent.processing["request-123"]
+	processing = agent.processing[processingKey]
 	agent.procMu.Unlock()
 
 	if processing {
@@ -387,7 +387,7 @@ func TestMultiAgentCheckCoordinatorDeduplication(t *testing.T) {
 			// Return same request ID every time
 			json.NewEncoder(w).Encode([]map[string]interface{}{
 				{
-					"id":         "dup-request-456",
+					"request_id": "dup-request-456",
 					"pane_id":    1,
 					"url":        "https://example.com/oauth",
 					"created_at": time.Now(),
@@ -405,9 +405,11 @@ func TestMultiAgentCheckCoordinatorDeduplication(t *testing.T) {
 	agent := NewMulti(config)
 
 	// Pre-mark the request as processing
-	agent.procMu.Lock()
-	agent.processing["dup-request-456"] = true
-	agent.procMu.Unlock()
+	processingKey, started := agent.markProcessing(config.Coordinators[0], "dup-request-456")
+	if !started {
+		t.Fatal("expected request to be marked as processing")
+	}
+	defer agent.clearProcessing(processingKey)
 
 	ctx := context.Background()
 
@@ -426,5 +428,73 @@ func TestMultiAgentCheckCoordinatorDeduplication(t *testing.T) {
 	healthy, _, _ := config.Coordinators[0].GetHealth()
 	if !healthy {
 		t.Error("expected coordinator to be healthy after poll")
+	}
+}
+
+func TestMultiAgentDeduplicationScopedByCoordinator(t *testing.T) {
+	agent := NewMulti(DefaultMultiConfig())
+	coord1 := &CoordinatorEndpoint{Name: "coord1", URL: "http://coord-a/"}
+	coord2 := &CoordinatorEndpoint{Name: "coord2", URL: "http://coord-b"}
+
+	const requestID = "shared-request"
+
+	key1, started := agent.markProcessing(coord1, requestID)
+	if !started {
+		t.Fatal("expected first coordinator request to start")
+	}
+
+	if _, started := agent.markProcessing(coord1, requestID); started {
+		t.Fatal("expected same coordinator request to be deduped")
+	}
+
+	key2, started := agent.markProcessing(coord2, requestID)
+	if !started {
+		t.Fatal("expected different coordinator with same request ID to start")
+	}
+	if key1 == key2 {
+		t.Fatal("expected coordinator-scoped processing keys to differ")
+	}
+
+	agent.clearProcessing(key1)
+	key1Restarted, started := agent.markProcessing(coord1, requestID)
+	if !started {
+		t.Fatal("expected request to start again after clearing processing key")
+	}
+
+	agent.clearProcessing(key1Restarted)
+	agent.clearProcessing(key2)
+}
+
+func TestMultiAgentSendAuthCompleteUsesOriginalRequestID(t *testing.T) {
+	gotRequestID := make(chan string, 1)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth/complete" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1024)).Decode(&body); err != nil {
+			t.Errorf("decode auth complete body: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		gotRequestID <- body["request_id"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	agent := NewMulti(DefaultMultiConfig())
+	coord := &CoordinatorEndpoint{Name: "coord1", URL: ts.URL}
+
+	agent.sendAuthComplete(context.Background(), coord, "shared-request", "code", "account@example.com", "")
+
+	select {
+	case got := <-gotRequestID:
+		if got != "shared-request" {
+			t.Fatalf("request_id = %q, want shared-request", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for auth complete request")
 	}
 }

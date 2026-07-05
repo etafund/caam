@@ -25,6 +25,33 @@ func TestDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestPendingAuthRequestIDPrefersRequestID(t *testing.T) {
+	req := pendingAuthRequest{
+		ID:        "legacy-id",
+		RequestID: "documented-id",
+	}
+	if got := req.requestID(); got != "documented-id" {
+		t.Fatalf("requestID() = %q, want documented-id", got)
+	}
+}
+
+func TestPendingAuthRequestIDFallsBackToLegacyID(t *testing.T) {
+	req := pendingAuthRequest{ID: "legacy-id"}
+	if got := req.requestID(); got != "legacy-id" {
+		t.Fatalf("requestID() = %q, want legacy-id", got)
+	}
+}
+
+func TestPendingAuthRequestIDTrimsWhitespace(t *testing.T) {
+	req := pendingAuthRequest{
+		ID:        " legacy-id ",
+		RequestID: " documented-id ",
+	}
+	if got := req.requestID(); got != "documented-id" {
+		t.Fatalf("requestID() = %q, want documented-id", got)
+	}
+}
+
 func TestAgentSelectLRU(t *testing.T) {
 	agent := &Agent{
 		config: Config{

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -76,6 +77,21 @@ type AccountUsage struct {
 	LastUsed   time.Time `json:"last_used"`
 	UseCount   int       `json:"use_count"`
 	LastResult string    `json:"last_result"` // success, failed
+}
+
+type pendingAuthRequest struct {
+	ID        string    `json:"id"`
+	RequestID string    `json:"request_id"`
+	PaneID    int       `json:"pane_id"`
+	URL       string    `json:"url"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (p pendingAuthRequest) requestID() string {
+	if requestID := strings.TrimSpace(p.RequestID); requestID != "" {
+		return requestID
+	}
+	return strings.TrimSpace(p.ID)
 }
 
 // Agent handles OAuth completion for the coordinator.
@@ -276,20 +292,19 @@ func (a *Agent) checkPendingRequests(ctx context.Context) {
 		return
 	}
 
-	var pending []struct {
-		ID        string    `json:"id"`
-		PaneID    int       `json:"pane_id"`
-		URL       string    `json:"url"`
-		CreatedAt time.Time `json:"created_at"`
-	}
-
+	var pending []pendingAuthRequest
 	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
 		a.logger.Debug("failed to decode pending requests", "error", err)
 		return
 	}
 
 	for _, p := range pending {
-		a.processAuthRequest(ctx, p.ID, p.URL)
+		requestID := p.requestID()
+		if requestID == "" {
+			a.logger.Debug("pending auth request missing request_id")
+			continue
+		}
+		a.processAuthRequest(ctx, requestID, p.URL)
 	}
 }
 

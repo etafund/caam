@@ -109,7 +109,7 @@ func runAgent(cmd *cobra.Command, args []string) error {
 	config := agent.DefaultConfig()
 	config.Port = agentPort
 	config.CoordinatorURL = agentCoordinator
-	config.CoordinatorToken = agentCoordinatorToken
+	config.CoordinatorToken = coordinatorTokenWithEnv(agentCoordinatorToken)
 	config.PollInterval = 2 * time.Second
 	config.ChromeUserDataDir = agentChromeProfile
 	config.Headless = agentHeadless
@@ -351,7 +351,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 			cfg.AccountStrategy = strategy
 		}
 		cfg.Accounts = raw.Accounts
-		cfg.Coordinators = raw.Coordinators
+		cfg.Coordinators = applyCoordinatorTokenFallback(raw.Coordinators)
 		return true, agent.Config{}, cfg, nil
 	}
 
@@ -373,7 +373,7 @@ func loadAgentConfig(path string) (bool, agent.Config, agent.MultiConfig, error)
 	}
 	cfg.Accounts = raw.Accounts
 	cfg.CoordinatorURL = firstNonEmpty(raw.CoordinatorURL, raw.Coordinator)
-	cfg.CoordinatorToken = raw.CoordinatorToken
+	cfg.CoordinatorToken = coordinatorTokenWithEnv(raw.CoordinatorToken)
 
 	return false, cfg, agent.MultiConfig{}, nil
 }
@@ -446,10 +446,33 @@ func normalizeCoordinatorEndpoints(endpoints []*agent.CoordinatorEndpoint) []*ag
 			Name:        name,
 			URL:         strings.TrimRight(strings.TrimSpace(endpoint.URL), "/"),
 			DisplayName: strings.TrimSpace(endpoint.DisplayName),
-			Token:       strings.TrimSpace(endpoint.Token),
+			Token:       coordinatorTokenWithEnv(endpoint.Token),
 		})
 	}
 	return normalized
+}
+
+func applyCoordinatorTokenFallback(endpoints []*agent.CoordinatorEndpoint) []*agent.CoordinatorEndpoint {
+	normalized := make([]*agent.CoordinatorEndpoint, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		if endpoint == nil {
+			continue
+		}
+		normalized = append(normalized, &agent.CoordinatorEndpoint{
+			Name:        endpoint.Name,
+			URL:         endpoint.URL,
+			DisplayName: endpoint.DisplayName,
+			Token:       coordinatorTokenWithEnv(endpoint.Token),
+		})
+	}
+	return normalized
+}
+
+func coordinatorTokenWithEnv(token string) string {
+	if token = strings.TrimSpace(token); token != "" {
+		return token
+	}
+	return strings.TrimSpace(os.Getenv("CAAM_COORDINATOR_TOKEN"))
 }
 
 func parseStrategy(value string) (agent.AccountStrategy, error) {

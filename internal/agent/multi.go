@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,6 +24,11 @@ type CoordinatorEndpoint struct {
 	IsHealthy   bool      `json:"-"`
 	LastError   string    `json:"-"`
 	mu          sync.RWMutex
+}
+
+type processingKey struct {
+	Coordinator string
+	RequestID   string
 }
 
 // SetHealth updates the health status thread-safely.
@@ -92,7 +98,7 @@ type MultiAgent struct {
 	running      bool
 
 	// Track which requests we're already processing
-	processing map[string]bool
+	processing map[processingKey]bool
 	procMu     sync.Mutex
 
 	// Callbacks
@@ -118,7 +124,7 @@ func NewMulti(config MultiConfig) *MultiAgent {
 		usagePath:    usagePath,
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
-		processing:   make(map[string]bool),
+		processing:   make(map[processingKey]bool),
 	}
 
 	// Load existing usage data
@@ -300,13 +306,7 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 
 	coord.SetHealth(true, "")
 
-	var pending []struct {
-		ID        string    `json:"id"`
-		PaneID    int       `json:"pane_id"`
-		URL       string    `json:"url"`
-		CreatedAt time.Time `json:"created_at"`
-	}
-
+	var pending []pendingAuthRequest
 	if err := json.NewDecoder(resp.Body).Decode(&pending); err != nil {
 		coord.SetHealth(false, err.Error())
 		a.logger.Debug("failed to decode pending requests",
@@ -316,25 +316,61 @@ func (a *MultiAgent) checkCoordinator(ctx context.Context, coord *CoordinatorEnd
 	}
 
 	for _, p := range pending {
-		// Avoid processing same request multiple times
-		a.procMu.Lock()
-		if a.processing[p.ID] {
-			a.procMu.Unlock()
+		requestID := p.requestID()
+		if requestID == "" {
+			a.logger.Debug("pending auth request missing request_id",
+				"coordinator", coord.Name)
 			continue
 		}
-		a.processing[p.ID] = true
-		a.procMu.Unlock()
+
+		key, started := a.markProcessing(coord, requestID)
+		if !started {
+			continue
+		}
 
 		// Process in goroutine to not block other coordinators
-		go func(requestID, authURL string) {
+		go func(requestID, authURL string, key processingKey) {
+			defer a.clearProcessing(key)
 			a.processAuthRequest(ctx, coord, requestID, authURL)
-
-			// Mark as no longer processing after completion
-			a.procMu.Lock()
-			delete(a.processing, requestID)
-			a.procMu.Unlock()
-		}(p.ID, p.URL)
+		}(requestID, p.URL, key)
 	}
+}
+
+func (a *MultiAgent) markProcessing(coord *CoordinatorEndpoint, requestID string) (processingKey, bool) {
+	key := makeProcessingKey(coord, requestID)
+	a.procMu.Lock()
+	defer a.procMu.Unlock()
+	if a.processing[key] {
+		return key, false
+	}
+	a.processing[key] = true
+	return key, true
+}
+
+func (a *MultiAgent) clearProcessing(key processingKey) {
+	a.procMu.Lock()
+	defer a.procMu.Unlock()
+	delete(a.processing, key)
+}
+
+func makeProcessingKey(coord *CoordinatorEndpoint, requestID string) processingKey {
+	return processingKey{
+		Coordinator: coordinatorProcessingID(coord),
+		RequestID:   strings.TrimSpace(requestID),
+	}
+}
+
+func coordinatorProcessingID(coord *CoordinatorEndpoint) string {
+	if coord == nil {
+		return "coord:<nil>"
+	}
+	if url := strings.TrimRight(strings.TrimSpace(coord.URL), "/"); url != "" {
+		return "url:" + url
+	}
+	if name := strings.TrimSpace(coord.Name); name != "" {
+		return "name:" + name
+	}
+	return fmt.Sprintf("ptr:%p", coord)
 }
 
 // processAuthRequest handles a single auth request from a coordinator.
