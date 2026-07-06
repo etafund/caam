@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -101,12 +100,7 @@ This is useful for first-run experience to discover and import existing credenti
 		report := runAuthDetection(providersToCheck)
 
 		if jsonOutput {
-			data, err := json.MarshalIndent(report, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Println(string(data))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), report)
 		}
 
 		printAuthDetectReport(report)
@@ -507,11 +501,9 @@ func runAuthImport(cmd *cobra.Command, args []string) error {
 }
 
 func outputImportResult(result AuthImportResult) error {
-	data, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
+	if err := encodeIndentedJSON(os.Stdout, result); err != nil {
 		return err
 	}
-	fmt.Println(string(data))
 	if !result.Success {
 		return fmt.Errorf("%s", result.Error)
 	}

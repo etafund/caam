@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -198,9 +197,7 @@ func runCooldownList(cmd *cobra.Command, args []string) error {
 				Notes:         ev.Notes,
 			})
 		}
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	if len(events) == 0 {

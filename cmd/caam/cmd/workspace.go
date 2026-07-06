@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -232,12 +231,7 @@ func runWorkspaceList(cmd *cobra.Command, args []string) error {
 				Profiles: cfg.GetWorkspace(name),
 			})
 		}
-		data, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			return fmt.Errorf("marshal json: %w", err)
-		}
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	if len(workspaces) == 0 {

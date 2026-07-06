@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -320,9 +319,7 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				output.Error = err.Error()
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(output)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), output)
 			// Emit the JSON error envelope on stdout but still exit non-zero
 			// (so automation checking $? isn't misled), and silence cobra so it
 			// doesn't also print the human error after the JSON.
@@ -413,9 +410,7 @@ func runShallowProfileCreate(cmd *cobra.Command, args []string) error {
 	}
 	if jsonOut {
 		output.Success = true
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Created shallow profile %q\n", name)
@@ -471,9 +466,7 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 	// otherwise it returns the bare error for the human path.
 	emitErr := func(err error) error {
 		if jsonOut {
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(shallowListOutput{Error: err.Error()})
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), shallowListOutput{Error: err.Error()})
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
 			return err
@@ -510,9 +503,7 @@ func runShallowProfileList(cmd *cobra.Command, _ []string) error {
 		}
 		// Stable order for deterministic output.
 		sort.Slice(out.Profiles, func(i, j int) bool { return out.Profiles[i].Name < out.Profiles[j].Name })
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
+		return encodeIndentedJSON(cmd.OutOrStdout(), out)
 	}
 
 	if len(profiles) == 0 {
@@ -586,9 +577,7 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				out.Error = err.Error()
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(out)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), out)
 			if err != nil {
 				cmd.SilenceErrors = true
 				cmd.SilenceUsage = true
@@ -627,9 +616,7 @@ func runShallowProfileDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOut {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(shallowDeleteOutput{Name: name, Success: true})
+		return encodeIndentedJSON(cmd.OutOrStdout(), shallowDeleteOutput{Name: name, Success: true})
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Deleted shallow profile %q\n", name)
 	return nil
@@ -734,9 +721,7 @@ func runShallowProfileRepair(cmd *cobra.Command, args []string) error {
 
 	emitErr := func(err error) error {
 		if jsonOut {
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(shallowRepairOutput{Success: false})
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), shallowRepairOutput{Success: false})
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
 			return err
@@ -782,9 +767,7 @@ func runShallowProfileRepair(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOut {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(out)
+		_ = encodeIndentedJSON(cmd.OutOrStdout(), out)
 		if !out.Success {
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
@@ -868,9 +851,7 @@ func runShallowProfileRename(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				out.Error = err.Error()
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(out)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), out)
 			if err != nil {
 				cmd.SilenceErrors = true
 				cmd.SilenceUsage = true
@@ -904,9 +885,7 @@ func runShallowProfileRename(cmd *cobra.Command, args []string) error {
 		}
 		if jsonOut {
 			out.Success = true
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			return enc.Encode(out)
+			return encodeIndentedJSON(cmd.OutOrStdout(), out)
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "Would rename shallow profile %q -> %q\n", oldName, newName)
 		fmt.Fprintf(cmd.OutOrStdout(), "  %s -> %s\n", oldPath, newPath)
@@ -920,9 +899,7 @@ func runShallowProfileRename(cmd *cobra.Command, args []string) error {
 	out.OldPath, out.NewPath = res.OldPath, res.NewPath
 	if jsonOut {
 		out.Success = true
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
+		return encodeIndentedJSON(cmd.OutOrStdout(), out)
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "Renamed shallow profile %q -> %q\n", oldName, newName)
 	fmt.Fprintf(cmd.OutOrStdout(), "  %s -> %s\n", res.OldPath, res.NewPath)
@@ -995,9 +972,7 @@ func runShallowProfileDoctor(cmd *cobra.Command, args []string) error {
 
 	emitErr := func(err error) error {
 		if jsonOut {
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(shallowDoctorOutput{Profiles: []shallowDoctorResult{}, Healthy: false})
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), shallowDoctorOutput{Profiles: []shallowDoctorResult{}, Healthy: false})
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
 			return err
@@ -1038,9 +1013,7 @@ func runShallowProfileDoctor(cmd *cobra.Command, args []string) error {
 	allHealthy := unhealthy == 0
 
 	if jsonOut {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(shallowDoctorOutput{Profiles: results, Healthy: allHealthy})
+		_ = encodeIndentedJSON(cmd.OutOrStdout(), shallowDoctorOutput{Profiles: results, Healthy: allHealthy})
 		if !allHealthy {
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
@@ -1158,9 +1131,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 				Success bool   `json:"success"`
 				Error   string `json:"error"`
 			}{Success: false, Error: err.Error()}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(out)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), out)
 			cmd.SilenceErrors = true
 			cmd.SilenceUsage = true
 			return err
@@ -1233,9 +1204,7 @@ func runShallowSpawn(cmd *cobra.Command, args []string) error {
 				Set:            set,
 				Unset:          unset,
 			}
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			return enc.Encode(out)
+			return encodeIndentedJSON(cmd.OutOrStdout(), out)
 		}
 		// Render the same set/unset transform used by the exec path, so a shell
 		// wrapper built from --print-env reproduces the child environment.

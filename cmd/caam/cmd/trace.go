@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -508,9 +507,7 @@ func runTrace(cmd *cobra.Command, args []string) error {
 
 	// Output
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
+		return encodeIndentedJSON(os.Stdout, report)
 	}
 
 	printTraceReport(report, verbose)

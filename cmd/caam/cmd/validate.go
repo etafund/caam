@@ -2,9 +2,9 @@
 package cmd
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -248,12 +248,7 @@ func formatExpiryTime(t time.Time) string {
 }
 
 func outputJSON(results []ValidationOutput) error {
-	data, err := json.MarshalIndent(results, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal JSON: %w", err)
-	}
-	fmt.Println(string(data))
-	return nil
+	return encodeIndentedJSON(os.Stdout, results)
 }
 
 func outputHuman(results []ValidationOutput) error {

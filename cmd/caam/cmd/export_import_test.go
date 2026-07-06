@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +126,35 @@ func TestImportCommandArgs(t *testing.T) {
 	err = importCmd.Args(nil, []string{"archive.tar.gz", "extra"})
 	if err == nil {
 		t.Error("Expected error for 2 args")
+	}
+}
+
+func TestBundleImportJSONInvalidMode(t *testing.T) {
+	stdout, _, err := captureOutput(t, createTestCmd(), []string{"bundle", "import", "missing.zip", "--mode", "invalid", "--json"})
+	if err == nil {
+		t.Fatal("expected invalid mode to fail")
+	}
+
+	var got struct {
+		Success    bool   `json:"success"`
+		BundlePath string `json:"bundle_path"`
+		Mode       string `json:"mode"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &got); err != nil {
+		t.Fatalf("invalid JSON output: %v; raw=%q", err, stdout)
+	}
+	if got.Success {
+		t.Fatal("expected success=false")
+	}
+	if got.BundlePath != "missing.zip" {
+		t.Fatalf("bundle_path = %q, want missing.zip", got.BundlePath)
+	}
+	if got.Mode != "invalid" {
+		t.Fatalf("mode = %q, want invalid", got.Mode)
+	}
+	if !strings.Contains(got.Error, "invalid mode") {
+		t.Fatalf("error = %q, want invalid mode", got.Error)
 	}
 }
 

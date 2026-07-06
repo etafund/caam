@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -97,9 +96,7 @@ func runSchema(cmd *cobra.Command, args []string) error {
 		})
 	}
 
-	enc := json.NewEncoder(cmd.OutOrStdout())
-	enc.SetIndent("", "  ")
-	return enc.Encode(output)
+	return encodeIndentedJSON(cmd.OutOrStdout(), output)
 }
 
 func commandAliases(command string) []string {

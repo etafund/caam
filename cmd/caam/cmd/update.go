@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"time"
@@ -324,7 +323,5 @@ func printUpdateResult(out io.Writer, result *update.UpdateResult) {
 }
 
 func printJSON(out io.Writer, v any) error {
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
+	return encodeIndentedJSON(out, v)
 }

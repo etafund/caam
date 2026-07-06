@@ -2,7 +2,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -59,12 +58,7 @@ Examples:
 		}
 
 		if jsonOutput {
-			data, err := json.MarshalIndent(report, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Println(string(data))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), report)
 		}
 
 		printSessionsReport(report)

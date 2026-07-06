@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -174,9 +173,7 @@ func renderEventsJSON(w io.Writer, events []caamdb.Event) error {
 		}
 	}
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encodeIndentedJSON(w, output)
 }
 
 func renderEventList(w io.Writer, events []caamdb.Event) error {

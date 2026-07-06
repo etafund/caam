@@ -37,7 +37,11 @@ func newJSONEnvelope(outputFormat string, data any) jsonEnvelope {
 }
 
 func encodeJSONEnvelope(w io.Writer, outputFormat string, data any) error {
+	return encodeIndentedJSON(w, newJSONEnvelope(outputFormat, data))
+}
+
+func encodeIndentedJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(newJSONEnvelope(outputFormat, data))
+	return enc.Encode(v)
 }

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -448,9 +447,7 @@ func buildPrecheckResult(
 }
 
 func precheckOutputJSON(w io.Writer, result *PrecheckResult) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(result)
+	return encodeIndentedJSON(w, result)
 }
 
 func precheckOutputBrief(w io.Writer, result *PrecheckResult) error {

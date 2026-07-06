@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
@@ -138,9 +138,7 @@ func runRename(cmd *cobra.Command, args []string) error {
 			if jsonOutput {
 				result["deleted"] = false
 				result["delete_skipped"] = "user declined"
-				data, _ := json.MarshalIndent(result, "", "  ")
-				fmt.Println(string(data))
-				return nil
+				return encodeIndentedJSON(os.Stdout, result)
 			}
 			fmt.Println("Skipped deletion. Old profile preserved.")
 			fmt.Printf("\nProfile copied: %s/%s -> %s/%s\n", tool, oldName, tool, newName)
@@ -161,9 +159,7 @@ func runRename(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOutput {
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	if deleteOld {

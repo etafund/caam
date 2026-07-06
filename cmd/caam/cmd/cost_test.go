@@ -350,6 +350,16 @@ func TestRenderTokenCostTable_Empty(t *testing.T) {
 	}
 }
 
+func TestRenderTokenCostAnalysis_JSONEmptyArray(t *testing.T) {
+	var buf bytes.Buffer
+	if err := renderTokenCostAnalysis(&buf, "json", nil); err != nil {
+		t.Fatalf("renderTokenCostAnalysis() error = %v", err)
+	}
+	if got, want := buf.String(), "[]\n"; got != want {
+		t.Fatalf("renderTokenCostAnalysis() = %q, want %q", got, want)
+	}
+}
+
 func TestRenderTokenCostTable_WithData(t *testing.T) {
 	analyses := []TokenCostAnalysis{
 		{

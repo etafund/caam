@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -302,9 +301,7 @@ func runDetect(cmd *cobra.Command, args []string) error {
 	report := runDetection(cmd.Context(), specs, verbose)
 
 	if jsonOutput {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(report)
+		return encodeIndentedJSON(os.Stdout, report)
 	}
 
 	printDetectReport(report, verbose)

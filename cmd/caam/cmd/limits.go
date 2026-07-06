@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -179,12 +178,7 @@ func renderLimits(w io.Writer, format string, results []usage.ProfileUsage) erro
 
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(results, "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, results)
 
 	case "table", "":
 		if len(results) == 0 {
@@ -285,15 +279,9 @@ func renderBestProfile(w io.Writer, format string, results []usage.ProfileUsage,
 	switch format {
 	case "json":
 		if len(available) == 0 {
-			fmt.Fprintln(w, "null")
-			return nil
+			return encodeIndentedJSON(w, nil)
 		}
-		data, err := json.MarshalIndent(available[0], "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, available[0])
 
 	case "table", "":
 		if len(available) == 0 {
@@ -379,12 +367,7 @@ func renderRecommendations(w io.Writer, format string, results []usage.ProfileUs
 
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(recs, "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, recs)
 
 	case "table", "":
 		if len(recs) == 0 {
@@ -517,12 +500,7 @@ func renderForecast(w io.Writer, format string, results []usage.ProfileUsage) er
 
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(forecasts, "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, forecasts)
 
 	case "table", "":
 		if len(forecasts) == 0 {

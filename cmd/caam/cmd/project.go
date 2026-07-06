@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -118,12 +117,7 @@ var projectListCmd = &cobra.Command{
 					Providers: assoc,
 				})
 			}
-			jsonData, err := json.MarshalIndent(output, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), string(jsonData))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), output)
 		}
 
 		if len(data.Associations) == 0 {
@@ -231,12 +225,7 @@ var projectShowCmd = &cobra.Command{
 				}
 				out.Providers = append(out.Providers, rec)
 			}
-			data, err := json.MarshalIndent(out, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), string(data))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), out)
 		}
 
 		if len(providers) == 0 {

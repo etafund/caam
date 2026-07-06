@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -194,12 +193,7 @@ func renderUsageSummary(w io.Writer, format string, since time.Time, rows []usag
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(rows, "", "  ")
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, rows)
 	case "csv":
 		cw := csv.NewWriter(w)
 		_ = cw.Write([]string{"provider", "profile", "sessions", "active_hours"})
@@ -238,12 +232,7 @@ func renderUsageDetailed(w io.Writer, format, provider, profile string, since ti
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(rows, "", "  ")
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, rows)
 	case "csv":
 		cw := csv.NewWriter(w)
 		_ = cw.Write([]string{"timestamp", "duration_hours"})

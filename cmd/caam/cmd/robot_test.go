@@ -47,6 +47,9 @@ func TestRobotDocs_AllTopics(t *testing.T) {
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &envelope); err != nil {
 		t.Fatalf("invalid JSON output: %v", err)
 	}
+	if !strings.Contains(out, "\n  \"success\"") {
+		t.Fatalf("expected normal robot JSON output to be indented, got %q", out)
+	}
 
 	if !envelope.Success {
 		t.Fatal("expected success=true")
@@ -165,6 +168,9 @@ func TestRobotDocs_Ndjson(t *testing.T) {
 	line := strings.TrimSpace(out)
 	if line == "" {
 		t.Fatalf("expected non-empty output")
+	}
+	if strings.Contains(line, "\n") {
+		t.Fatalf("expected NDJSON fragment to stay single-line, got %q", line)
 	}
 
 	var envelope struct {

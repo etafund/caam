@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -221,9 +220,7 @@ func runTagList(cmd *cobra.Command, args []string) error {
 		if output.Tags == nil {
 			output.Tags = []string{}
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(os.Stdout, output)
 	}
 
 	if len(prof.Tags) == 0 {
@@ -300,9 +297,7 @@ func runTagAll(cmd *cobra.Command, args []string) error {
 		if output.Tags == nil {
 			output.Tags = []string{}
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(os.Stdout, output)
 	}
 
 	if len(tags) == 0 {

@@ -3,7 +3,6 @@ package cmd
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -1185,9 +1184,7 @@ func runSyncStatusJSON(state *sync.SyncState, out io.Writer) error {
 		output.HistoryCount = len(state.History.Entries)
 	}
 
-	enc := json.NewEncoder(out)
-	enc.SetIndent("", "  ")
-	return enc.Encode(output)
+	return encodeIndentedJSON(out, output)
 }
 
 // runSyncQueueProcess processes pending queue entries.

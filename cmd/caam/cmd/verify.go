@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -141,12 +140,7 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	output.Recommendations = generateRecommendations(output)
 
 	if jsonOutput {
-		data, err := json.MarshalIndent(output, "", "  ")
-		if err != nil {
-			return err
-		}
-		fmt.Fprintln(cmd.OutOrStdout(), string(data))
-		return nil
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	printVerifyOutput(cmd.OutOrStdout(), output)

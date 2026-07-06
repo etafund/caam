@@ -111,12 +111,7 @@ Flags:
 		report := runDoctorChecks(fix, validate, autoInstall, skipConfirm)
 
 		if jsonOutput {
-			data, err := json.MarshalIndent(report, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Println(string(data))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), report)
 		}
 
 		printDoctorReport(report, validate)

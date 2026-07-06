@@ -3,7 +3,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -140,9 +139,7 @@ func writeEnvOutput(w io.Writer, tool, name string, envVars map[string]string, o
 		} else {
 			out.Env = envVars
 		}
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(out)
+		return encodeIndentedJSON(w, out)
 	}
 
 	for _, k := range keys {

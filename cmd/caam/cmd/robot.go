@@ -356,8 +356,7 @@ Use --provider to filter to a specific provider.`,
 // robotOutput writes a RobotOutput to stdout.
 func robotOutput(cmd *cobra.Command, output RobotOutput) error {
 	output.Timestamp = time.Now().UTC().Format(time.RFC3339)
-	enc := json.NewEncoder(cmd.OutOrStdout())
-	return enc.Encode(output)
+	return encodeIndentedJSON(cmd.OutOrStdout(), output)
 }
 
 // robotError creates an error output.

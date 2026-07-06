@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"encoding/csv"
-	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -325,9 +324,7 @@ func renderCostSummaryJSON(w io.Writer, summaries []caamdb.CostSummary, since ti
 		output.Since = since.UTC().Format(time.RFC3339)
 	}
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encodeIndentedJSON(w, output)
 }
 
 func renderCostSummary(w io.Writer, summaries []caamdb.CostSummary, since time.Time) error {
@@ -389,9 +386,7 @@ func renderSessionsJSON(w io.Writer, sessions []caamdb.WrapSession) error {
 		Count:    len(items),
 	}
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encodeIndentedJSON(w, output)
 }
 
 func renderSessions(w io.Writer, sessions []caamdb.WrapSession) error {
@@ -428,9 +423,7 @@ func renderRatesJSON(w io.Writer, rates []caamdb.CostRate) error {
 
 	output := ratesOutput{Rates: items}
 
-	encoder := json.NewEncoder(w)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encodeIndentedJSON(w, output)
 }
 
 func renderRates(w io.Writer, rates []caamdb.CostRate) error {
@@ -578,7 +571,7 @@ func runCostTokens(cmd *cobra.Command, args []string) error {
 
 	if len(analyses) == 0 {
 		if format == "json" {
-			fmt.Fprintln(out, "[]")
+			return encodeIndentedJSON(out, []TokenCostAnalysis{})
 		} else {
 			fmt.Fprintln(out, "No log data found for the specified period.")
 		}
@@ -676,12 +669,10 @@ func renderTokenCostAnalysis(w io.Writer, format string, analyses []TokenCostAna
 
 	switch format {
 	case "json":
-		data, err := json.MarshalIndent(analyses, "", "  ")
-		if err != nil {
-			return err
+		if analyses == nil {
+			analyses = []TokenCostAnalysis{}
 		}
-		fmt.Fprintln(w, string(data))
-		return nil
+		return encodeIndentedJSON(w, analyses)
 
 	case "csv":
 		return renderTokenCostCSV(w, analyses)

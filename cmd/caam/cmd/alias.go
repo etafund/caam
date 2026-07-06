@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 
@@ -100,17 +99,14 @@ func runAlias(cmd *cobra.Command, args []string) error {
 func listAliases(cfg *config.Config, jsonOutput bool) error {
 	if len(cfg.Aliases) == 0 {
 		if jsonOutput {
-			fmt.Println("{}")
-			return nil
+			return encodeIndentedJSON(os.Stdout, map[string]any{})
 		}
 		fmt.Println("No aliases configured.")
 		return nil
 	}
 
 	if jsonOutput {
-		data, _ := json.MarshalIndent(cfg.Aliases, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, cfg.Aliases)
 	}
 
 	fmt.Println("Configured aliases:")
@@ -137,9 +133,7 @@ func removeAlias(cfg *config.Config, alias string, jsonOutput bool) error {
 			"removed": alias,
 			"success": true,
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	fmt.Printf("Removed alias: %s\n", alias)
@@ -155,9 +149,7 @@ func showProfileAliases(cfg *config.Config, tool, profile string, jsonOutput boo
 			"profile": profile,
 			"aliases": aliases,
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	if len(aliases) == 0 {
@@ -186,9 +178,7 @@ func addAlias(cfg *config.Config, tool, profile, alias string, jsonOutput bool) 
 				"alias":   alias,
 				"status":  "already_exists",
 			}
-			data, _ := json.MarshalIndent(result, "", "  ")
-			fmt.Println(string(data))
-			return nil
+			return encodeIndentedJSON(os.Stdout, result)
 		}
 		fmt.Printf("Alias %q already exists for %s/%s\n", alias, tool, profile)
 		return nil
@@ -206,9 +196,7 @@ func addAlias(cfg *config.Config, tool, profile, alias string, jsonOutput bool) 
 			"alias":   alias,
 			"status":  "created",
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	fmt.Printf("Added alias: %s -> %s/%s\n", alias, tool, profile)
@@ -274,9 +262,7 @@ func runFavorite(cmd *cobra.Command, args []string) error {
 				"tool":   tool,
 				"status": "cleared",
 			}
-			data, _ := json.MarshalIndent(result, "", "  ")
-			fmt.Println(string(data))
-			return nil
+			return encodeIndentedJSON(os.Stdout, result)
 		}
 		fmt.Printf("Cleared favorites for %s\n", tool)
 		return nil
@@ -295,17 +281,14 @@ func runFavorite(cmd *cobra.Command, args []string) error {
 func listFavorites(cfg *config.Config, jsonOutput bool) error {
 	if len(cfg.Favorites) == 0 {
 		if jsonOutput {
-			fmt.Println("{}")
-			return nil
+			return encodeIndentedJSON(os.Stdout, map[string]any{})
 		}
 		fmt.Println("No favorites configured.")
 		return nil
 	}
 
 	if jsonOutput {
-		data, _ := json.MarshalIndent(cfg.Favorites, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, cfg.Favorites)
 	}
 
 	fmt.Println("Configured favorites:")
@@ -326,9 +309,7 @@ func showFavorites(cfg *config.Config, tool string, jsonOutput bool) error {
 			"tool":      tool,
 			"favorites": favorites,
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	if len(favorites) == 0 {
@@ -380,9 +361,7 @@ func setFavorites(cfg *config.Config, tool string, profiles []string, jsonOutput
 			"favorites": profiles,
 			"status":    "updated",
 		}
-		data, _ := json.MarshalIndent(result, "", "  ")
-		fmt.Println(string(data))
-		return nil
+		return encodeIndentedJSON(os.Stdout, result)
 	}
 
 	fmt.Printf("Set favorites for %s:\n", tool)

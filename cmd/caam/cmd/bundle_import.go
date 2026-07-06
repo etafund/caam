@@ -79,14 +79,41 @@ func init() {
 	bundleImportCmd.Flags().Bool("json", false, "Output result as JSON")
 }
 
+type bundleImportOutput struct {
+	Success    bool                 `json:"success"`
+	DryRun     bool                 `json:"dry_run"`
+	BundlePath string               `json:"bundle_path"`
+	Mode       string               `json:"mode"`
+	Result     *bundle.ImportResult `json:"result,omitempty"`
+	Error      string               `json:"error,omitempty"`
+}
+
 func runBundleImport(cmd *cobra.Command, args []string) error {
 	bundlePath := args[0]
+	jsonOut, _ := cmd.Flags().GetBool("json")
 
 	// Build import options from flags
 	opts := bundle.DefaultImportOptions()
+	output := bundleImportOutput{
+		BundlePath: bundlePath,
+		DryRun:     opts.DryRun,
+	}
+	emitJSONError := func(err error, result *bundle.ImportResult) error {
+		if jsonOut {
+			output.Success = false
+			output.DryRun = opts.DryRun
+			output.Result = result
+			output.Error = err.Error()
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), output)
+			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
+		}
+		return err
+	}
 
 	// Mode
 	modeStr, _ := cmd.Flags().GetString("mode")
+	output.Mode = strings.ToLower(modeStr)
 	switch strings.ToLower(modeStr) {
 	case "smart":
 		opts.Mode = bundle.ImportModeSmart
@@ -95,7 +122,7 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 	case "replace":
 		opts.Mode = bundle.ImportModeReplace
 	default:
-		return fmt.Errorf("invalid mode %q; use smart, merge, or replace", modeStr)
+		return emitJSONError(fmt.Errorf("invalid mode %q; use smart, merge, or replace", modeStr), nil)
 	}
 
 	// Password
@@ -104,17 +131,17 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 	// Check if encrypted and prompt for password if needed
 	encrypted, err := bundle.IsEncrypted(bundlePath)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("check encryption: %w", err)
+		return emitJSONError(fmt.Errorf("check encryption: %w", err), nil)
 	}
 
 	if encrypted && password == "" {
 		var err error
 		password, err = promptPassword("Enter decryption password: ")
 		if err != nil {
-			return fmt.Errorf("read password: %w", err)
+			return emitJSONError(fmt.Errorf("read password: %w", err), nil)
 		}
 		if password == "" {
-			return fmt.Errorf("password required for encrypted bundle")
+			return emitJSONError(fmt.Errorf("password required for encrypted bundle"), nil)
 		}
 	}
 	opts.Password = password
@@ -122,6 +149,7 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 	// Preview/control
 	opts.DryRun, _ = cmd.Flags().GetBool("dry-run")
 	opts.Force, _ = cmd.Flags().GetBool("force")
+	output.DryRun = opts.DryRun
 
 	// Optional content exclusion
 	opts.SkipConfig, _ = cmd.Flags().GetBool("skip-config")
@@ -151,11 +179,21 @@ func runBundleImport(cmd *cobra.Command, args []string) error {
 	// Perform import
 	result, err := importer.Import(opts)
 	if err != nil {
+		importErr := fmt.Errorf("import failed: %w", err)
+		if jsonOut {
+			return emitJSONError(importErr, result)
+		}
 		// If we have partial results, show them before the error
 		if result != nil && opts.DryRun {
 			printImportPreview(cmd, result)
 		}
-		return fmt.Errorf("import failed: %w", err)
+		return importErr
+	}
+
+	if jsonOut {
+		output.Success = true
+		output.Result = result
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	// Print results

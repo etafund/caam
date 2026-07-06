@@ -10,7 +10,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -674,9 +673,7 @@ func runBackup(cmd *cobra.Command, args []string) error {
 		if jsonOutput {
 			output.Success = false
 			output.Error = err.Error()
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(output)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), output)
 			// Keep the JSON error payload on stdout but exit non-zero so callers
 			// branching on exit status see the failure (README agent contract).
 			// Silence the Cobra usage dump and duplicate stderr error for runtime
@@ -709,9 +706,7 @@ func runBackup(cmd *cobra.Command, args []string) error {
 	output.Path = vault.ProfilePath(tool, profileName)
 
 	if jsonOutput {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	fmt.Printf("Backed up %s auth to profile '%s'\n", tool, profileName)
@@ -1210,8 +1205,8 @@ func runLs(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func encodeLsJSON(cmd *cobra.Command, output lsOutput) error {
-	return encodeJSONEnvelope(cmd.OutOrStdout(), jsonOutputFormatLS, output)
+func encodeLsJSON(_ *cobra.Command, output lsOutput) error {
+	return encodeJSONEnvelope(os.Stdout, jsonOutputFormatLS, output)
 }
 
 // deleteCmd removes a profile from the vault.
@@ -1324,12 +1319,7 @@ Examples:
 				}
 				records = append(records, rec)
 			}
-			data, err := json.MarshalIndent(records, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(cmd.OutOrStdout(), string(data))
-			return nil
+			return encodeIndentedJSON(cmd.OutOrStdout(), records)
 		}
 
 		for _, tool := range toolsToShow {
@@ -1833,9 +1823,7 @@ func runProfileShell(cmd *cobra.Command, args []string) error {
 	}
 
 	if jsonOut {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(plan)
+		return encodeIndentedJSON(cmd.OutOrStdout(), plan)
 	}
 	if printOut {
 		return writeProfileShellPrint(cmd.OutOrStdout(), tool, name, envVars, shellPath, execArgs)

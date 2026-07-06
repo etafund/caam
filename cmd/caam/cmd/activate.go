@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -130,9 +129,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 		if jsonOutput {
 			output.Success = false
 			output.Error = err.Error()
-			enc := json.NewEncoder(cmd.OutOrStdout())
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(output)
+			_ = encodeIndentedJSON(cmd.OutOrStdout(), output)
 			// The machine-readable error payload is already on stdout. Return the
 			// underlying error so the process exits non-zero (the README agent
 			// contract is "exit 0 = success"), but silence Cobra's usage dump and
@@ -449,9 +446,7 @@ func runActivate(cmd *cobra.Command, args []string) error {
 	output.Success = true
 
 	if jsonOutput {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(output)
+		return encodeIndentedJSON(cmd.OutOrStdout(), output)
 	}
 
 	fmt.Printf("Activated %s profile '%s'\n", tool, profileName)

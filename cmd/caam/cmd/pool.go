@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"text/tabwriter"
@@ -99,9 +98,7 @@ func runPoolStatus(cmd *cobra.Command, args []string) error {
 	summary := pool.Summary()
 
 	if asJSON {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(summary)
+		return encodeIndentedJSON(cmd.OutOrStdout(), summary)
 	}
 
 	fmt.Printf("Pool Summary:\n")
@@ -203,9 +200,7 @@ func runPoolList(cmd *cobra.Command, args []string) error {
 	}
 
 	if asJSON {
-		enc := json.NewEncoder(cmd.OutOrStdout())
-		enc.SetIndent("", "  ")
-		return enc.Encode(profiles)
+		return encodeIndentedJSON(cmd.OutOrStdout(), profiles)
 	}
 
 	if len(profiles) == 0 {
