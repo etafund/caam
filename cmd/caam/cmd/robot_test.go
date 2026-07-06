@@ -32,6 +32,14 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
+func newRobotHistoryCmdForTest() *cobra.Command {
+	cmd := &cobra.Command{}
+	cmd.Flags().Int("days", 7, "")
+	cmd.Flags().Int("limit", 50, "")
+	cmd.Flags().String("provider", "", "")
+	return cmd
+}
+
 func TestRobotDocs_AllTopics(t *testing.T) {
 	out, _, err := captureOutput(t, createTestCmd(), []string{"robot", "docs"})
 	if err != nil {
@@ -94,6 +102,135 @@ func TestRobotDocs_InvalidTopic(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "INVALID_TOPIC") {
 		t.Fatalf("expected INVALID_TOPIC error, got %v", err)
+	}
+}
+
+func TestRobotHistoryReturnsLoggedEvents(t *testing.T) {
+	_, cleanup := setupHistoryTestEnv(t)
+	defer cleanup()
+
+	db, err := caamdb.Open()
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+
+	events := []caamdb.Event{
+		{Type: caamdb.EventActivate, Provider: "codex", ProfileName: "work"},
+		{Type: caamdb.EventRefresh, Provider: "claude", ProfileName: "personal"},
+		{
+			Type:        caamdb.EventActivate,
+			Provider:    "claude",
+			ProfileName: "personal",
+			Details:     map[string]any{"reason": "rotation"},
+		},
+	}
+	for _, ev := range events {
+		if err := db.LogEvent(ev); err != nil {
+			t.Fatalf("LogEvent(%+v) error = %v", ev, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	cmd := newRobotHistoryCmdForTest()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	if err := runRobotHistory(cmd, nil); err != nil {
+		t.Fatalf("runRobotHistory() error = %v", err)
+	}
+
+	var resp struct {
+		Success bool             `json:"success"`
+		Command string           `json:"command"`
+		Data    RobotHistoryData `json:"data"`
+		Error   *RobotError      `json:"error"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("decode robot history output: %v\noutput: %s", err, buf.String())
+	}
+	if resp.Error != nil {
+		t.Fatalf("robot history returned error: %+v", resp.Error)
+	}
+	if !resp.Success {
+		t.Fatalf("robot history success=false, output: %s", buf.String())
+	}
+	if resp.Data.Count != len(events) {
+		t.Fatalf("robot history count = %d, want %d (events: %+v)",
+			resp.Data.Count, len(events), resp.Data.Events)
+	}
+
+	var foundRotation bool
+	for _, event := range resp.Data.Events {
+		if event.Provider == "" || event.Profile == "" || event.Event == "" {
+			t.Fatalf("event missing required fields: %+v", event)
+		}
+		if strings.Contains(event.Notes, "rotation") {
+			foundRotation = true
+		}
+	}
+	if !foundRotation {
+		t.Fatalf("expected details context to surface in notes, events: %+v", resp.Data.Events)
+	}
+}
+
+func TestRobotHistoryConsistentWithNonRobotHistory(t *testing.T) {
+	_, cleanup := setupHistoryTestEnv(t)
+	defer cleanup()
+
+	db, err := caamdb.Open()
+	if err != nil {
+		t.Fatalf("db.Open() error = %v", err)
+	}
+	inserted := []caamdb.Event{
+		{Type: caamdb.EventActivate, Provider: "codex", ProfileName: "work"},
+		{Type: caamdb.EventActivate, Provider: "gemini", ProfileName: "main"},
+		{Type: caamdb.EventError, Provider: "claude", ProfileName: "personal"},
+	}
+	for _, ev := range inserted {
+		if err := db.LogEvent(ev); err != nil {
+			t.Fatalf("LogEvent(%+v) error = %v", ev, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("db.Close() error = %v", err)
+	}
+
+	robotCmd := newRobotHistoryCmdForTest()
+	var robotBuf bytes.Buffer
+	robotCmd.SetOut(&robotBuf)
+	if err := runRobotHistory(robotCmd, nil); err != nil {
+		t.Fatalf("runRobotHistory() error = %v", err)
+	}
+	var robotResp struct {
+		Data RobotHistoryData `json:"data"`
+	}
+	if err := json.Unmarshal(robotBuf.Bytes(), &robotResp); err != nil {
+		t.Fatalf("decode robot history output: %v\noutput: %s", err, robotBuf.String())
+	}
+
+	nonRobotCmd := &cobra.Command{}
+	nonRobotCmd.Flags().IntP("limit", "n", 100, "")
+	nonRobotCmd.Flags().String("provider", "", "")
+	nonRobotCmd.Flags().String("profile", "", "")
+	nonRobotCmd.Flags().String("type", "", "")
+	nonRobotCmd.Flags().String("since", "", "")
+	nonRobotCmd.Flags().Bool("json", true, "")
+	var nonRobotBuf bytes.Buffer
+	nonRobotCmd.SetOut(&nonRobotBuf)
+	if err := runHistory(nonRobotCmd, nil); err != nil {
+		t.Fatalf("runHistory() error = %v", err)
+	}
+	var nonRobotResp historyOutput
+	if err := json.Unmarshal(nonRobotBuf.Bytes(), &nonRobotResp); err != nil {
+		t.Fatalf("decode non-robot history output: %v\noutput: %s", err, nonRobotBuf.String())
+	}
+
+	if robotResp.Data.Count != len(inserted) {
+		t.Fatalf("robot history count = %d, want %d", robotResp.Data.Count, len(inserted))
+	}
+	if robotResp.Data.Count != nonRobotResp.Count {
+		t.Fatalf("robot count %d != non-robot count %d", robotResp.Data.Count, nonRobotResp.Count)
 	}
 }
 

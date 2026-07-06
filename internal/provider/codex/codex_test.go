@@ -82,6 +82,74 @@ func TestEnsureFileCredentialStoreIdempotentSingleQuotedFile(t *testing.T) {
 	}
 }
 
+func TestEnsureFileCredentialStoreInsertsTopLevelBeforeTables(t *testing.T) {
+	const settingLine = `cli_auth_credentials_store = "file"`
+
+	firstTableIndex := func(s string) int {
+		offset := 0
+		for _, line := range strings.Split(s, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "[") {
+				return offset
+			}
+			offset += len(line) + 1
+		}
+		return -1
+	}
+
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.toml")
+	in := "# my codex config\n\n[mcp_servers.tavily]\ncommand = \"npx\"\nargs = [\"-y\", \"tavily-mcp\"]\n"
+	if err := os.WriteFile(cfg, []byte(in), 0o600); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	if err := EnsureFileCredentialStore(dir); err != nil {
+		t.Fatalf("EnsureFileCredentialStore: %v", err)
+	}
+
+	data, err := os.ReadFile(cfg)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	got := string(data)
+	settingIndex := strings.Index(got, settingLine)
+	if settingIndex < 0 {
+		t.Fatalf("setting line not written:\n%s", got)
+	}
+	tableIndex := firstTableIndex(got)
+	if tableIndex < 0 {
+		t.Fatalf("MCP table lost:\n%s", got)
+	}
+	if settingIndex > tableIndex {
+		t.Fatalf("setting was nested under a table:\n%s", got)
+	}
+	if !strings.Contains(got, "# my codex config") {
+		t.Fatalf("leading comment lost:\n%s", got)
+	}
+	if !strings.Contains(got, "[mcp_servers.tavily]") || !strings.Contains(got, `command = "npx"`) {
+		t.Fatalf("MCP config not preserved:\n%s", got)
+	}
+
+	pollutedDir := t.TempDir()
+	pollutedCfg := filepath.Join(pollutedDir, "config.toml")
+	pollutedIn := "[mcp_servers.tavily]\ncommand = \"npx\"\ncli_auth_credentials_store = \"file\"\n"
+	if err := os.WriteFile(pollutedCfg, []byte(pollutedIn), 0o600); err != nil {
+		t.Fatalf("seed polluted config: %v", err)
+	}
+	if err := EnsureFileCredentialStore(pollutedDir); err != nil {
+		t.Fatalf("EnsureFileCredentialStore polluted config: %v", err)
+	}
+	pollutedData, err := os.ReadFile(pollutedCfg)
+	if err != nil {
+		t.Fatalf("read polluted config: %v", err)
+	}
+	pollutedOut := string(pollutedData)
+	pollutedSettingIndex := strings.Index(pollutedOut, settingLine)
+	pollutedTableIndex := firstTableIndex(pollutedOut)
+	if pollutedSettingIndex < 0 || pollutedTableIndex < 0 || pollutedSettingIndex > pollutedTableIndex {
+		t.Fatalf("polluted nested setting did not get root setting inserted:\n%s", pollutedOut)
+	}
+}
+
 // =============================================================================
 // Provider Factory Tests
 // =============================================================================

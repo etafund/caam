@@ -111,21 +111,42 @@ func EnsureFileCredentialStore(home string) error {
 		return fmt.Errorf("read config.toml: %w", err)
 	}
 
-	if match := codexCredentialsStoreRe.Find(data); match != nil {
-		// Already set to "file" (either quote style) → no rewrite needed.
-		if m := string(match); strings.Contains(m, `"file"`) || strings.Contains(m, `'file'`) {
+	lines := strings.Split(string(data), "\n")
+	rootEnd := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			rootEnd = i
+			break
+		}
+	}
+	for i := 0; i < rootEnd; i++ {
+		match := codexCredentialsStoreRe.FindString(lines[i])
+		if match == "" {
+			continue
+		}
+		// Already set to "file" (either quote style) in root scope.
+		if strings.Contains(match, `"file"`) || strings.Contains(match, `'file'`) {
 			return nil
 		}
-		updated := codexCredentialsStoreRe.ReplaceAll(data, []byte(settingLine))
-		return atomicWriteFile(configPath, updated, 0600)
+		lines[i] = codexCredentialsStoreRe.ReplaceAllString(lines[i], settingLine)
+		return atomicWriteFile(configPath, []byte(strings.Join(lines, "\n")), 0600)
 	}
 
-	text := string(data)
-	if !strings.HasSuffix(text, "\n") {
-		text += "\n"
+	insertAt := 0
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			insertAt = i + 1
+			continue
+		}
+		break
 	}
-	text += settingLine + "\n"
-	return atomicWriteFile(configPath, []byte(text), 0600)
+
+	newLines := make([]string, 0, len(lines)+1)
+	newLines = append(newLines, lines[:insertAt]...)
+	newLines = append(newLines, settingLine)
+	newLines = append(newLines, lines[insertAt:]...)
+	return atomicWriteFile(configPath, []byte(strings.Join(newLines, "\n")), 0600)
 }
 
 // AuthFiles returns the auth file specifications for Codex.
