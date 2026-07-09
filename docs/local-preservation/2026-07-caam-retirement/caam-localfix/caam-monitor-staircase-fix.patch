@@ -1,0 +1,213 @@
+diff --git a/cmd/caam/cmd/monitor.go b/cmd/caam/cmd/monitor.go
+index cf5703b..69e808a 100644
+--- a/cmd/caam/cmd/monitor.go
++++ b/cmd/caam/cmd/monitor.go
+@@ -166,12 +166,24 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
+ 	// makes subsequent shell output stair-step until `stty sane`.
+ 	var inputCh <-chan byte
+ 	restoreTerminal := func() {}
++	rawActive := false
+ 	if format == "table" && term.IsTerminal(int(os.Stdin.Fd())) {
+-		inputCh, restoreTerminal = setupKeyboardInput()
++		inputCh, restoreTerminal, rawActive = setupKeyboardInput()
+ 	}
+ 	// Safety net in case of an unexpected return path.
+ 	defer restoreTerminal()
+ 
++	// While the keyboard input loop holds the terminal in raw mode, the kernel's
++	// OPOST/ONLCR output post-processing is disabled, so a bare '\n' no longer
++	// implies a carriage return. The renderers emit '\n'-terminated lines, so
++	// without translation every table line starts where the previous one ended
++	// and the whole table stair-steps diagonally across the screen. Translate
++	// '\n' -> '\r\n' on the render path for as long as raw mode is active.
++	renderOut := out
++	if rawActive {
++		renderOut = crlfWriter{w: out}
++	}
++
+ 	// stop restores the terminal first (so the final message and the shell
+ 	// prompt render with normal output processing) and prints "Monitor stopped."
+ 	stop := func() {
+@@ -186,9 +198,9 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
+ 
+ 	// Clear screen and show initial output for table mode
+ 	if format == "table" {
+-		clearScreen(out)
++		clearScreen(renderOut)
+ 	}
+-	renderAndShow(mon, renderer, out, format)
++	renderAndShow(mon, renderer, renderOut, format)
+ 
+ 	for {
+ 		select {
+@@ -203,7 +215,7 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
+ 					fmt.Fprintf(os.Stderr, "Refresh error: %v\n", err)
+ 				}
+ 			}
+-			renderAndShow(mon, renderer, out, format)
++			renderAndShow(mon, renderer, renderOut, format)
+ 
+ 		case key := <-inputCh:
+ 			switch key {
+@@ -214,12 +226,34 @@ func runLiveMonitor(ctx context.Context, mon *monitor.Monitor, renderer monitor.
+ 				if err := mon.Refresh(ctx); err != nil {
+ 					fmt.Fprintf(os.Stderr, "Refresh error: %v\n", err)
+ 				}
+-				renderAndShow(mon, renderer, out, format)
++				renderAndShow(mon, renderer, renderOut, format)
+ 			}
+ 		}
+ 	}
+ }
+ 
++// crlfWriter translates each bare '\n' (one not already preceded by '\r') into
++// '\r\n'. It wraps the monitor's output while the terminal is in raw mode, where
++// the kernel no longer performs OPOST/ONLCR translation; without it the table's
++// '\n'-terminated lines stair-step diagonally down the screen.
++type crlfWriter struct{ w io.Writer }
++
++func (c crlfWriter) Write(p []byte) (int, error) {
++	buf := make([]byte, 0, len(p)+8)
++	var prev byte
++	for _, b := range p {
++		if b == '\n' && prev != '\r' {
++			buf = append(buf, '\r')
++		}
++		buf = append(buf, b)
++		prev = b
++	}
++	if _, err := c.w.Write(buf); err != nil {
++		return 0, err
++	}
++	return len(p), nil
++}
++
+ func renderAndShow(mon *monitor.Monitor, renderer monitor.Renderer, out io.Writer, format string) {
+ 	state := mon.GetState()
+ 	output := renderer.Render(state)
+@@ -244,15 +278,16 @@ func clearScreen(out io.Writer) {
+ // cleanup on every exit path: the reader goroutine blocks indefinitely in
+ // os.Stdin.Read, so a deferred restore inside the goroutine would not run when
+ // the monitor loop returns (issue #33). cleanup is safe to call more than once.
+-func setupKeyboardInput() (<-chan byte, func()) {
++func setupKeyboardInput() (<-chan byte, func(), bool) {
+ 	ch := make(chan byte, 1)
+ 
+ 	// Try to put terminal in raw mode for key input
+ 	fd := int(os.Stdin.Fd())
+ 	oldState, err := term.MakeRaw(fd)
+ 	if err != nil {
+-		// Could not enter raw mode; nothing to restore.
+-		return ch, func() {}
++		// Could not enter raw mode; nothing to restore, and OPOST is still on,
++		// so no '\n' -> '\r\n' translation is needed on the render path.
++		return ch, func() {}, false
+ 	}
+ 
+ 	var once sync.Once
+@@ -278,5 +313,5 @@ func setupKeyboardInput() (<-chan byte, func()) {
+ 		}
+ 	}()
+ 
+-	return ch, cleanup
++	return ch, cleanup, true
+ }
+diff --git a/internal/monitor/alerts.go b/internal/monitor/alerts.go
+index d63f0b3..b9e662d 100644
+--- a/internal/monitor/alerts.go
++++ b/internal/monitor/alerts.go
+@@ -2,6 +2,7 @@ package monitor
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/Dicklesworthstone/coding_agent_account_manager/internal/usage"
+@@ -64,6 +65,45 @@ func evaluateAlert(info *usage.UsageInfo, now time.Time) *Alert {
+ 	}
+ }
+ 
++// usageUnavailable returns a short, human-readable reason when usage could not
++// be fetched for a profile, or "" when real usage data is present. It exists so
++// the table can explain why a logged-in account shows no usage (e.g. an expired
++// access token that needs re-login) instead of rendering a misleading "0%" bar.
++func usageUnavailable(info *usage.UsageInfo) string {
++	if info == nil {
++		return "no usage data"
++	}
++	// Real data present (a usage window, or credit balance) -> show the number.
++	if info.MostConstrainedWindow() != nil || info.Credits != nil {
++		return ""
++	}
++	if info.Error != "" {
++		// ASCII only: writeLine pads the table by byte length, so a multi-byte
++		// rune here would shift the right border and break box alignment.
++		return "no usage: " + shortUsageError(info.Error)
++	}
++	return ""
++}
++
++// shortUsageError condenses common usage-fetch errors into a brief hint that
++// fits in the table without wrapping.
++func shortUsageError(err string) string {
++	e := strings.ToLower(err)
++	switch {
++	case strings.Contains(e, "unauthorized"), strings.Contains(e, "token expired"),
++		strings.Contains(e, "expired or invalid"), strings.Contains(e, "401"):
++		return "auth expired (re-login)"
++	case strings.Contains(e, "missing access token"), strings.Contains(e, "not logged in"):
++		return "not logged in"
++	case strings.Contains(e, "not yet supported"), strings.Contains(e, "unsupported"):
++		return "usage not supported"
++	}
++	if len(err) > 40 {
++		return err[:37] + "..."
++	}
++	return err
++}
++
+ func usagePercent(info *usage.UsageInfo) float64 {
+ 	if info == nil {
+ 		return 0
+diff --git a/internal/monitor/render_table.go b/internal/monitor/render_table.go
+index c6ca3b4..e34cb7b 100644
+--- a/internal/monitor/render_table.go
++++ b/internal/monitor/render_table.go
+@@ -52,20 +52,28 @@ func (r *TableRenderer) Render(state *MonitorState) string {
+ 				writeLine(&b, innerWidth, provHeader)
+ 			}
+ 
+-			percent := usagePercent(p.Usage)
+ 			indicator := ""
+ 			if r.ShowEmoji {
+ 				indicator = fmt.Sprintf("[%s] ", healthEmoji(p.Health))
+ 			}
+-			bar := progressBar(percent, 20)
+-			percentStr := fmt.Sprintf("%3.0f%%", percent)
+ 
+-			status := p.PoolStatus.String()
+-			if p.InCooldown && p.CooldownUntil != nil {
+-				status = fmt.Sprintf("cooldown %s", formatCooldown(p.CooldownUntil, now))
++			var line string
++			if reason := usageUnavailable(p.Usage); reason != "" {
++				// The fetch failed (e.g. expired token) — show why instead of a
++				// misleading 0% bar, so logged-in accounts don't look idle.
++				line = fmt.Sprintf("  %s%-20s %s", indicator, truncate(p.ProfileName, 20), reason)
++			} else {
++				percent := usagePercent(p.Usage)
++				bar := progressBar(percent, 20)
++				percentStr := fmt.Sprintf("%3.0f%%", percent)
++
++				status := p.PoolStatus.String()
++				if p.InCooldown && p.CooldownUntil != nil {
++					status = fmt.Sprintf("cooldown %s", formatCooldown(p.CooldownUntil, now))
++				}
++
++				line = fmt.Sprintf("  %s%-20s %s %s | %s", indicator, truncate(p.ProfileName, 20), bar, percentStr, status)
+ 			}
+-
+-			line := fmt.Sprintf("  %s%-20s %s %s | %s", indicator, truncate(p.ProfileName, 20), bar, percentStr, status)
+ 			writeLine(&b, innerWidth, line)
+ 		}
+ 	}

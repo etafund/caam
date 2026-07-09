@@ -1,0 +1,122 @@
+diff --git a/cmd/caam/cmd/root.go b/cmd/caam/cmd/root.go
+index 7db35a1..858a7b0 100644
+--- a/cmd/caam/cmd/root.go
++++ b/cmd/caam/cmd/root.go
+@@ -11,6 +11,7 @@ package cmd
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -187,6 +188,21 @@ func Execute() error {
+ 	return rootCmd.Execute()
+ }
+ 
++// ExitCode maps an error returned by Execute to a process exit code. When the
++// wrapped tool (caam exec/run) exits non-zero, its real exit code is propagated
++// so callers branching on exit status see the tool's result rather than a
++// flattened 1. All other errors map to 1.
++func ExitCode(err error) int {
++	if err == nil {
++		return 0
++	}
++	var exitErr *exec.ExitCodeError
++	if errors.As(err, &exitErr) && exitErr.Code != 0 {
++		return exitErr.Code
++	}
++	return 1
++}
++
+ // shouldShowWarnings returns true if the current command should display token warnings.
+ // Some commands are excluded because they're:
+ // - Quick info commands (version, paths)
+@@ -1928,15 +1944,74 @@ Examples:
+ 		ctx := context.Background()
+ 		noLock, _ := cmd.Flags().GetBool("no-lock")
+ 
+-		return runner.Run(ctx, exec.RunOptions{
++		runErr := runner.Run(ctx, exec.RunOptions{
+ 			Profile:  prof,
+ 			Provider: prov,
+ 			Args:     toolArgs,
+ 			NoLock:   noLock,
+ 		})
++
++		// A non-zero exit from the wrapped tool is a runtime failure of that
++		// tool, not a misuse of caam. Suppress the Cobra usage block and the
++		// duplicate generic "Error: exit code N" line so the tool's own output
++		// is the only error the user sees (mirrors the backup command).
++		var exitErr *exec.ExitCodeError
++		if errors.As(runErr, &exitErr) {
++			cmd.SilenceUsage = true
++			cmd.SilenceErrors = true
++
++			// The most common reason an interactive AI CLI dies immediately is
++			// that stdin is not a terminal (piped, redirected, or launched from
++			// an agent/CI/background job). `caam exec <tool> <profile> -- <args>`
++			// runs the tool in its default *interactive* mode, which needs a TTY.
++			// Point the user at the tool's non-interactive form instead.
++			if !term.IsTerminal(int(os.Stdin.Fd())) {
++				fmt.Fprintf(os.Stderr,
++					"\ncaam: %q exited %d. stdin is not a terminal (TTY), so the tool's\n"+
++						"interactive session cannot start here. To run non-interactively, use the\n"+
++						"tool's non-interactive form, for example:\n\n  %s\n",
++					tool, exitErr.Code, nonInteractiveExecExample(tool, name, toolArgs))
++			}
++		}
++		return runErr
+ 	},
+ }
+ 
++// nonInteractiveExecExample returns an example `caam exec` invocation that runs
++// the given tool non-interactively, reusing the user's profile and arguments.
++// It is shown as a hint when an interactive session fails because stdin is not
++// a TTY. The mapping is best-effort; unknown tools get a generic placeholder.
++func nonInteractiveExecExample(tool, profileName string, toolArgs []string) string {
++	args := strings.Join(quoteArgsForHint(toolArgs), " ")
++	switch tool {
++	case "codex":
++		// codex runs non-interactively via the `exec` subcommand.
++		if len(toolArgs) > 0 && (toolArgs[0] == "exec" || toolArgs[0] == "e") {
++			return strings.TrimRight(fmt.Sprintf("caam exec codex %s -- %s", profileName, args), " ")
++		}
++		return strings.TrimRight(fmt.Sprintf("caam exec codex %s -- exec %s", profileName, args), " ")
++	case "claude", "gemini":
++		// claude/gemini run non-interactively via the -p/--print flag.
++		return strings.TrimRight(fmt.Sprintf("caam exec %s %s -- -p %s", tool, profileName, args), " ")
++	default:
++		return strings.TrimRight(fmt.Sprintf("caam exec %s %s -- <non-interactive flag> %s", tool, profileName, args), " ")
++	}
++}
++
++// quoteArgsForHint double-quotes any argument containing whitespace so the
++// rendered hint is copy-pasteable.
++func quoteArgsForHint(args []string) []string {
++	out := make([]string, len(args))
++	for i, a := range args {
++		if strings.ContainsAny(a, " \t") {
++			out[i] = fmt.Sprintf("%q", a)
++		} else {
++			out[i] = a
++		}
++	}
++	return out
++}
++
+ func init() {
+ 	execCmd.Flags().Bool("no-lock", false, "don't lock the profile during execution")
+ }
+diff --git a/cmd/caam/main.go b/cmd/caam/main.go
+index af89475..53e68e1 100644
+--- a/cmd/caam/main.go
++++ b/cmd/caam/main.go
+@@ -9,6 +9,6 @@ import (
+ 
+ func main() {
+ 	if err := cmd.Execute(); err != nil {
+-		os.Exit(1)
++		os.Exit(cmd.ExitCode(err))
+ 	}
+ }

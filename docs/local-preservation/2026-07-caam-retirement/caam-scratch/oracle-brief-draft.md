@@ -1,0 +1,18 @@
+You are an adversarial technical reviewer. I have filed a set of 8 implementation tickets ("beads") for the Go CLI project `caam` (Coding Agent Account Manager, at /data/projects/caam). A swarm of cold agents (no prior context) will implement these tickets one at a time. Your job is to find every flaw that would cause a cold implementer to build the wrong thing, break the build, or ship a regression — BEFORE they start.
+
+## Background
+`caam monitor` misreported healthy Claude/Codex accounts as auth-expired / rate-limited. Root cause (confirmed by live probing + code trace): the monitor reads OAuth access tokens straight from cached VAULT profile copies (internal/monitor/monitor.go:288-316) and never refreshes them; those copies go stale (verified 4-9.5h past expiry on disk) so the usage API returns real 401s that get remapped to "auth expired (re-login)". The "429" rows are a self-inflicted concurrent-burst artifact (internal/usage/multi.go:55-108, no throttling). The "| unknown | [WARN]" on successful rows is a third, shared bug: a nil *authpool.AuthPool injected at cmd/caam/cmd/monitor.go:116 makes PoolStatus default to Unknown for every profile. Deliverable 2 minimally extends the table renderer to show 5H + weekly windows plus per-model usage (Codex GPT-5.3-Codex-Spark is confirmed available via the wham/usage `additional_rate_limits[]` array; a Claude "Fable" bucket is NOT exposed today, so it is captured tolerantly and gracefully omitted).
+
+## The bead set to review
+Attached as `oracle-caam-monitor-beads-input.md` (full text of all 8 beads: 2 epics + 6 children, with root-cause summary, dependency model, and per-bead spec/acceptance/tests). AGENTS.md is attached for repo conventions.
+
+## What I need from you — be specific and adversarial
+For EACH concern, cite the exact bead id and, where relevant, the file:line it claims. Focus on:
+1. **Wrong or unverifiable claims**: file:line references that don't match the real code; API-shape assumptions (Claude oauth/usage fields; Codex wham/usage `additional_rate_limits[]`; the `json:"opus"` vs `seven_day_opus` tag bug) that are wrong or under-specified.
+2. **Spec errors that break the build or behavior**: the refresh-on-401 loop (could it infinite-loop, hammer the token endpoint, or clobber live credentials?); the request-pacing change (does it deadlock, break context cancellation, or serialize too aggressively?); the renderer changes (byte-width padding / box alignment / ASCII-only pitfalls; the day-aware duration format possibly breaking existing cooldown tests).
+3. **Dependency / sequencing mistakes**: is `display-detail-line` correctly blocked by both `display-model-windows` and `monitor-pool-status-noise`? Is anything that should block, not blocking (or vice versa)? Is the "pool-status-noise must ship with the auth fix" coupling adequately enforced, given it's only P2 with no hard dep forcing co-delivery?
+4. **Missing edge cases / acceptance-criteria gaps** a cold agent would get wrong (e.g. graceful-omission of absent per-model data; --no-emoji alignment; width-40 truncation; refresh-token-reuse handling).
+5. **Security / safety**: any path where a token value could leak into logs, or the monitor could write to live ~/.claude / ~/.codex.
+6. **Scope creep vs the user's hard constraint** of "minimal lift — extend the existing feature, no redesign, no separate TUI."
+
+Return a prioritized list of concrete findings (critical / important / minor), each with: bead id, the problem, and a specific suggested fix or the exact question a cold implementer must resolve first. If a bead is solid, say so briefly. Do not restate the beads back to me.

@@ -1,0 +1,163 @@
+2026-06-19T16:06:51-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0bdd715 (0bdd715) built on 2026-06-19T23:04:52Z with go1.24.4'
+2026-06-19T16:06:51-07:00 OK: installed caam is not the no-fix release; fix present. nothing to do.
+2026-06-19T16:07:27-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-19T16:07:27-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+Note: switching to 'origin/main'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 0bdd715 fix(codex): prevent refresh-token-rotation account bricking on switch (Fixes #19)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=0bdd715 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=0bdd715 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-19T23:07:27Z" -o caam ./cmd/caam
+2026-06-19T16:07:28-07:00 REAPPLIED: caam 0bdd715 (0bdd715) built on 2026-06-19T23:07:27Z with go1.24.4
+2026-06-20T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0bdd715 (0bdd715) built on 2026-06-19T23:07:27Z with go1.24.4'
+2026-06-20T05:00:02-07:00 OK: installed caam is not the no-fix release; fix present. nothing to do.
+2026-06-21T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-21T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   0bdd715..e366025  main       -> origin/main
+Previous HEAD position was 0bdd715 fix(codex): prevent refresh-token-rotation account bricking on switch (Fixes #19)
+HEAD is now at e366025 fix(cli): align `config get` with `config show` and `status` with `ls` (Fixes #20)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=e366025 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=e366025 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-21T12:00:02Z" -o caam ./cmd/caam
+2026-06-21T05:00:05-07:00 REAPPLIED: caam e366025 (e366025) built on 2026-06-21T12:00:02Z with go1.24.4
+2026-06-22T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-22T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at e366025 fix(cli): align `config get` with `config show` and `status` with `ls` (Fixes #20)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=e366025 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=e366025 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-22T12:00:02Z" -o caam ./cmd/caam
+2026-06-22T05:00:04-07:00 REAPPLIED: caam e366025 (e366025) built on 2026-06-22T12:00:02Z with go1.24.4
+2026-06-23T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-23T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   e366025..69cf0ce  main       -> origin/main
+Previous HEAD position was e366025 fix(cli): align `config get` with `config show` and `status` with `ls` (Fixes #20)
+HEAD is now at 69cf0ce fix(codex): warn when a codex app-server daemon caches stale auth after switch (Closes #21)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=69cf0ce -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=69cf0ce -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-23T12:00:02Z" -o caam ./cmd/caam
+2026-06-23T05:00:07-07:00 REAPPLIED: caam 69cf0ce (69cf0ce) built on 2026-06-23T12:00:02Z with go1.24.4
+2026-06-24T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-24T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-24T12:00:02Z" -o caam ./cmd/caam
+2026-06-24T05:00:05-07:00 REAPPLIED: caam 39855b1 (39855b1) built on 2026-06-24T12:00:02Z with go1.24.4
+2026-06-26T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-26T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-26T12:00:01Z" -o caam ./cmd/caam
+2026-06-26T05:00:03-07:00 REAPPLIED: caam 39855b1 (39855b1) built on 2026-06-26T12:00:01Z with go1.24.4
+2026-06-27T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-27T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-27T12:00:02Z" -o caam ./cmd/caam
+2026-06-27T05:00:03-07:00 DEFER: a caam process is running; will re-apply on the next run.
+2026-06-28T03:14:13-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-28T03:14:13-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-28T10:14:13Z" -o caam ./cmd/caam
+2026-06-28T03:14:15-07:00 DEFER: a caam process is running; will re-apply on the next run.
+2026-06-28T03:14:16-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-28T03:14:16-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-28T10:14:17Z" -o caam ./cmd/caam
+2026-06-28T03:14:18-07:00 DEFER: a caam process is running; will re-apply on the next run.
+2026-06-28T03:14:30-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-28T03:14:30-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-28T10:14:30Z" -o caam ./cmd/caam
+2026-06-28T03:14:31-07:00 REAPPLIED: caam 39855b1 (39855b1) built on 2026-06-28T10:14:30Z with go1.24.4
+2026-06-28T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-28T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-28T12:00:02Z" -o caam ./cmd/caam
+2026-06-28T05:00:04-07:00 REAPPLIED: caam 39855b1 (39855b1) built on 2026-06-28T12:00:02Z with go1.24.4
+2026-06-29T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-29T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=39855b1 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-29T12:00:02Z" -o caam ./cmd/caam
+2026-06-29T05:00:04-07:00 REAPPLIED: caam 39855b1 (39855b1) built on 2026-06-29T12:00:02Z with go1.24.4
+2026-06-30T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-06-30T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   39855b1..fce8c03  main       -> origin/main
+Previous HEAD position was 39855b1 fix(project,docs): project get alias + JSON; fix README drift and download links (Closes #25, Closes #26)
+HEAD is now at fce8c03 feat(shallow): provider-aware shallow profiles for codex and agy (Closes #34, Closes #35)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=fce8c03 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=fce8c03 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-06-30T12:00:02Z" -o caam ./cmd/caam
+2026-06-30T05:00:04-07:00 REAPPLIED: caam fce8c03 (fce8c03) built on 2026-06-30T12:00:02Z with go1.24.4
+2026-07-01T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-07-01T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at fce8c03 feat(shallow): provider-aware shallow profiles for codex and agy (Closes #34, Closes #35)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=fce8c03 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=fce8c03 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-07-01T12:00:02Z" -o caam ./cmd/caam
+2026-07-01T05:00:04-07:00 REAPPLIED: caam fce8c03 (fce8c03) built on 2026-07-01T12:00:02Z with go1.24.4
+2026-07-02T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-07-02T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   fce8c03..0d723e0  main       -> origin/main
+Previous HEAD position was fce8c03 feat(shallow): provider-aware shallow profiles for codex and agy (Closes #34, Closes #35)
+HEAD is now at 0d723e0 docs(shallow): document Codex/Antigravity provider support in README (Closes #39)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=0d723e0 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=0d723e0 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-07-02T12:00:02Z" -o caam ./cmd/caam
+2026-07-02T05:00:04-07:00 REAPPLIED: caam 0d723e0 (0d723e0) built on 2026-07-02T12:00:02Z with go1.24.4
+2026-07-03T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-07-03T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   0d723e0..16000b2  main       -> origin/main
+Previous HEAD position was 0d723e0 docs(shallow): document Codex/Antigravity provider support in README (Closes #39)
+HEAD is now at 16000b2 feat(shallow): add --reload-daemon to shallow-spawn for codex (Closes #45)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=16000b2 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=16000b2 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-07-03T12:00:02Z" -o caam ./cmd/caam
+2026-07-03T05:00:05-07:00 REAPPLIED: caam 16000b2 (16000b2) built on 2026-07-03T12:00:02Z with go1.24.4
+2026-07-04T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-07-04T05:00:02-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+HEAD is now at 16000b2 feat(shallow): add --reload-daemon to shallow-spawn for codex (Closes #45)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=16000b2 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=16000b2 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-07-04T12:00:02Z" -o caam ./cmd/caam
+2026-07-04T05:00:04-07:00 REAPPLIED: caam 16000b2 (16000b2) built on 2026-07-04T12:00:02Z with go1.24.4
+2026-07-05T05:00:02-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam v0.1.11-51-gacd8c7a-dirty (acd8c7a) built on 2026-07-05T11:49:01Z with go1.24.4'
+2026-07-05T05:00:02-07:00 OK: installed caam is not the no-fix release; fix present. nothing to do.
+2026-07-06T05:00:01-07:00 check: latest_release='v0.1.11' base=v0.1.11 installed='caam 0.1.11 (7c604c4) built on 2026-04-25T01:00:46Z with go1.26.2'
+2026-07-06T05:00:01-07:00 REAPPLY: installed caam is the no-fix v0.1.11 release (7c604c4); rebuilding official main.
+From https://github.com/Dicklesworthstone/coding_agent_account_manager
+ * branch            main       -> FETCH_HEAD
+   16000b2..304e037  main       -> origin/main
+Previous HEAD position was 16000b2 feat(shallow): add --reload-daemon to shallow-spawn for codex (Closes #45)
+HEAD is now at 304e037 fix(codex): insert cli_auth_credentials_store as a top-level key, not under a table (#46 follow-up)
+go build -ldflags "-s -w -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Version=304e037 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Commit=304e037 -X github.com/Dicklesworthstone/coding_agent_account_manager/internal/version.Date=2026-07-06T12:00:01Z" -o caam ./cmd/caam
+2026-07-06T05:00:04-07:00 REAPPLIED: caam 304e037 (304e037) built on 2026-07-06T12:00:01Z with go1.24.4
+2026-07-07T05:00:02-07:00 check: latest_release='v0.1.12' base=v0.1.11 installed='caam 0.1.12 (1d9225c) built on 2026-07-06T23:57:47Z with go1.26.4'
+2026-07-07T05:00:02-07:00 RETIRE: caam release v0.1.12 > v0.1.11; leaving acfs's mainstream binary in place.
